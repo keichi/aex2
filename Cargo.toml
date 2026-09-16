@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/aex-core",
     "crates/aex-proto",
+    "crates/aex-wire",
     "crates/aex-server",
     "crates/aex-client",
     "tests/rust",
@@ -19,6 +20,7 @@ aex-client = { path = "crates/aex-client" }
 aex-server = { path = "crates/aex-server" }
 aex-core = { path = "crates/aex-core" }
 aex-proto = { path = "crates/aex-proto" }
+aex-wire = { path = "crates/aex-wire" }
 
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
@@ -36,6 +38,7 @@ tonic-prost-build = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+proptest = "1"
 tempfile = "3"
 
 [profile.release]

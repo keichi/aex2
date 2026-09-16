@@ -1,0 +1,14 @@
+[package]
+name = "aex-wire"
+description = "AEX2 data plane wire format, shared by the server and the client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+aex-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
