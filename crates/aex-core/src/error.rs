@@ -71,6 +71,16 @@ pub enum AexError {
     #[error("malformed npy file: {0}")]
     MalformedNpy(String),
 
+    /// A selection numpy would reject too: an index off the end, more indices
+    /// than the array has axes, a zero step.
+    #[error("invalid selection: {0}")]
+    BadSelection(String),
+
+    /// A selection this release cannot resolve, such as one whose bytes are not
+    /// one contiguous run of the source.
+    #[error("unsupported selection: {0}")]
+    UnsupportedSelection(String),
+
     /// No item at this path in the file.
     #[error("no such item: {0}")]
     NotFound(String),
@@ -94,6 +104,8 @@ impl AexError {
         match self {
             AexError::UnsupportedDType(_)
             | AexError::UnsupportedNpy(_)
+            | AexError::BadSelection(_)
+            | AexError::UnsupportedSelection(_)
             | AexError::NotFound(_)
             | AexError::NotAGroup(_)
             | AexError::OutOfRange { .. } => ErrorClass::Request,
@@ -161,6 +173,15 @@ mod tests {
         );
         assert_eq!(
             AexError::UnsupportedNpy("x".into()).class(),
+            ErrorClass::Request
+        );
+        // A selection a client could fix by asking for something else.
+        assert_eq!(
+            AexError::BadSelection("x".into()).class(),
+            ErrorClass::Request
+        );
+        assert_eq!(
+            AexError::UnsupportedSelection("x".into()).class(),
             ErrorClass::Request
         );
         assert_eq!(

@@ -4,13 +4,16 @@
 //! implemented: HDF5, netCDF4 and Zarr all present a hierarchy of groups and
 //! datasets, and all of them can serve a range of a logical byte stream.
 //!
-//! As of M1 a dataset exposes only its metadata. Selection resolution and
-//! `read_range` arrive in M2, together with the data plane that calls them.
+//! A dataset answers two questions: what a selection resolves to, and what the
+//! bytes of a range of that selection are. Everything the data plane needs is
+//! one of those two, which is what keeps a new backend a small piece of work.
 
 use std::sync::Arc;
 
 use crate::dtype::DType;
 use crate::error::Result;
+use crate::quality::QualitySpec;
+use crate::selection::{Index, SelectionLayout};
 
 /// An open file, seen as a hierarchy.
 ///
@@ -61,6 +64,28 @@ pub trait ArrayDataset: Send + Sync {
     fn ndim(&self) -> usize {
         self.shape().len()
     }
+
+    /// Resolve a selection into a logical byte stream.
+    ///
+    /// The default is right for any backend whose logical byte stream is the
+    /// array flattened in C order; only `read_range` has to know how the bytes
+    /// are actually stored.
+    fn layout(&self, indices: &[Index], quality: &QualitySpec) -> Result<SelectionLayout> {
+        SelectionLayout::resolve(self.shape(), self.dtype(), indices, quality)
+    }
+
+    /// Write `[offset, offset + dst.len())` of the layout's logical byte stream
+    /// into `dst`.
+    ///
+    /// The caller owns the buffer: the data plane keeps one per connection and
+    /// reuses it, so a transfer allocates nothing. Whether the backend serves
+    /// this with a `pread`, a decompression or a remote read is its own
+    /// business, and stays invisible to the send path.
+    ///
+    /// `&self` rather than `&mut self` because every connection thread reads
+    /// the same dataset at once. A backend needing state does so with interior
+    /// mutability.
+    fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()>;
 }
 
 /// Strip the leading and trailing slashes of a path.

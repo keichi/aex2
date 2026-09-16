@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crate::backend::{normalize_path, ArrayDataset, ArrayFile, Item};
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
+use crate::selection::{LayoutKind, SelectionLayout};
 
 /// Name of the one dataset in a `.npy`, as v1 exposed it.
 pub const DATASET_NAME: &str = "array";
@@ -27,10 +28,10 @@ pub const DATASET_NAME: &str = "array";
 ///
 /// The data is `data_len` bytes of the array flattened in C order: the simplest
 /// form of a logical byte stream, which is the coordinate system
-/// [`NpyDataset::read_range`] takes its offsets in.
+/// [`NpyDataset::read_bytes_at`] takes its offsets in.
 ///
-/// `read_range` needs only `&self` because `pread` carries no shared file
-/// position, so many connection threads can read one file at once.
+/// Reading needs only `&self` because `pread` carries no shared file position,
+/// so many connection threads can read one file at once.
 #[derive(Debug)]
 pub struct NpyDataset {
     /// Read with `pread`, never mapped.
@@ -151,11 +152,11 @@ impl NpyDataset {
         self.file_len
     }
 
-    /// Read `[offset, offset + dst.len())` of the logical byte stream into `dst`.
+    /// Read `[offset, offset + dst.len())` of the array's own bytes into `dst`.
     ///
-    /// The caller owns the buffer by design: the data plane allocates one buffer
-    /// per connection and reuses it, so a transfer allocates nothing.
-    pub fn read_range(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
+    /// Offsets are counted from the first element of the array, not from the
+    /// start of the file, so the header is invisible to every caller.
+    pub fn read_bytes_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
         let len = dst.len() as u64;
         let out_of_range = || AexError::OutOfRange {
             offset,
@@ -190,6 +191,17 @@ impl ArrayDataset for NpyDataset {
 
     fn shape(&self) -> &[u64] {
         &self.shape
+    }
+
+    /// A `.npy` is the array flattened in C order, so a contiguous selection is
+    /// a range of the file and needs one `pread`.
+    fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()> {
+        layout.check_range(offset, dst.len() as u64)?;
+        match layout.kind {
+            LayoutKind::Contiguous { src_offset, .. } => {
+                self.read_bytes_at(src_offset + offset, dst)
+            }
+        }
     }
 }
 
@@ -426,7 +438,7 @@ mod tests {
         assert_eq!(npy.num_elements(), 0);
         assert_eq!(npy.data_len(), 0);
         // Reading an empty range succeeds.
-        npy.read_range(0, &mut []).expect("empty read");
+        npy.read_bytes_at(0, &mut []).expect("empty read");
     }
 
     #[test]
@@ -444,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn read_range_returns_the_exact_bytes_at_every_offset() {
+    fn read_bytes_at_returns_the_exact_bytes_at_every_offset() {
         let builder = NpyBuilder::new("<f4", &[16, 8]).filled_payload(4);
         let expected = builder.payload.clone();
         let npy = open_bytes(&builder.build()).expect("open");
@@ -452,14 +464,14 @@ mod tests {
 
         // The whole stream.
         let mut whole = vec![0u8; expected.len()];
-        npy.read_range(0, &mut whole).expect("read whole");
+        npy.read_bytes_at(0, &mut whole).expect("read whole");
         assert_eq!(whole, expected);
 
         // Sweep partial ranges. Parallel chunk receive depends on a logical
         // offset being usable directly as a position in the output buffer.
         for &(offset, len) in &[(0u64, 1usize), (1, 3), (7, 32), (100, 412), (511, 1)] {
             let mut buf = vec![0u8; len];
-            npy.read_range(offset, &mut buf).expect("read part");
+            npy.read_bytes_at(offset, &mut buf).expect("read part");
             assert_eq!(
                 buf,
                 &expected[offset as usize..offset as usize + len],
@@ -471,26 +483,57 @@ mod tests {
         let tail_len = 13;
         let tail_off = npy.data_len() - tail_len as u64;
         let mut tail = vec![0u8; tail_len];
-        npy.read_range(tail_off, &mut tail).expect("read tail");
+        npy.read_bytes_at(tail_off, &mut tail).expect("read tail");
         assert_eq!(tail, &expected[tail_off as usize..]);
     }
 
     #[test]
-    fn read_range_rejects_ranges_past_the_end() {
+    fn read_bytes_at_rejects_ranges_past_the_end() {
         let bytes = NpyBuilder::new("<i8", &[10]).filled_payload(8).build();
         let npy = open_bytes(&bytes).expect("open");
         assert_eq!(npy.data_len(), 80);
 
         let mut buf = vec![0u8; 8];
         // One byte past the end.
-        let err = npy.read_range(73, &mut buf).unwrap_err();
+        let err = npy.read_bytes_at(73, &mut buf).unwrap_err();
         assert!(matches!(err, AexError::OutOfRange { .. }), "{err}");
         // Entirely out of range.
-        assert!(npy.read_range(80, &mut buf).is_err());
+        assert!(npy.read_bytes_at(80, &mut buf).is_err());
         // Offset plus length overflows u64.
-        assert!(npy.read_range(u64::MAX, &mut buf).is_err());
+        assert!(npy.read_bytes_at(u64::MAX, &mut buf).is_err());
         // Exactly at the boundary is fine.
-        npy.read_range(72, &mut buf).expect("exact tail");
+        npy.read_bytes_at(72, &mut buf).expect("exact tail");
+    }
+
+    #[test]
+    fn a_contiguous_selection_reads_the_bytes_it_names() {
+        use crate::quality::QualitySpec;
+        use crate::selection::Index;
+
+        let builder = NpyBuilder::new("<f4", &[8, 4]).filled_payload(4);
+        let expected = builder.payload.clone();
+        let npy = open_bytes(&builder.build()).expect("open");
+
+        // arr[2:5] is rows 2, 3 and 4: 48 bytes from byte 32.
+        let layout = npy
+            .layout(&[Index::range(2, 5)], &QualitySpec::exact())
+            .expect("layout");
+        assert_eq!(layout.out_shape, vec![3, 4]);
+        assert_eq!(layout.total_bytes, 48);
+
+        let mut whole = vec![0u8; 48];
+        npy.read_range(&layout, 0, &mut whole).expect("read");
+        assert_eq!(whole, &expected[32..80]);
+
+        // A range of the selection lands at the same place, which is what lets
+        // a chunk be fetched on its own.
+        let mut middle = vec![0u8; 16];
+        npy.read_range(&layout, 8, &mut middle).expect("read part");
+        assert_eq!(middle, &expected[40..56]);
+
+        // Past the end of the selection, though the file goes on.
+        let err = npy.read_range(&layout, 40, &mut [0u8; 16]).unwrap_err();
+        assert!(matches!(err, AexError::OutOfRange { .. }), "{err}");
     }
 
     #[test]
@@ -659,7 +702,7 @@ mod tests {
                     let offset = t * chunk;
                     for _ in 0..50 {
                         let mut buf = vec![0u8; chunk as usize];
-                        npy.read_range(offset, &mut buf).expect("read");
+                        npy.read_bytes_at(offset, &mut buf).expect("read");
                         assert_eq!(
                             buf,
                             &expected[offset as usize..(offset + chunk) as usize],

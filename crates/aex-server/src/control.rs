@@ -275,6 +275,15 @@ mod tests {
         fn shape(&self) -> &[u64] {
             &self.shape
         }
+        fn read_range(
+            &self,
+            _layout: &aex_core::SelectionLayout,
+            _offset: u64,
+            _dst: &mut [u8],
+        ) -> aex_core::Result<()> {
+            // These tests only convert metadata; nothing reads from one.
+            unimplemented!("a fake dataset has no bytes")
+        }
     }
 
     #[test]
