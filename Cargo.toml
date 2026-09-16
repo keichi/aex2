@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/aex-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+repository = "https://github.com/keichi/aex2"
+
+[workspace.dependencies]
+npyz = "0.9"
+thiserror = "2"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

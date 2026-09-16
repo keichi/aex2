@@ -1,0 +1,16 @@
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+/dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Large .npy files generated for benchmarks
+/benchmarks/data/
+*.npy

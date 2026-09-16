@@ -1,0 +1,16 @@
+[package]
+name = "aex-core"
+description = "AEX2 core types: dtypes, errors, and array backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Keep default-features off: npyz's complex / half features are only needed by
+# its data-reading API, not by header parsing.
+npyz.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
