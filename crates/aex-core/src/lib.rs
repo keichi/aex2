@@ -17,6 +17,7 @@ pub mod selection;
 
 pub use backend::{ArrayDataset, ArrayFile, Item};
 pub use backends::npy::{NpyDataset, NpyFile};
+pub use backends::null::{NullDataset, NullFile};
 pub use dtype::{DType, ALL_DTYPES};
 pub use error::{AexError, ErrorClass, Result};
 pub use quality::{Codec, Encoding, QualitySpec};

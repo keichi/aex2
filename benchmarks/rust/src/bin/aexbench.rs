@@ -7,19 +7,40 @@ use std::time::Instant;
 
 use aex_bench::{cpu_seconds, report, Run};
 use aex_client::{Client, ClientConfig, Index};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// What the bytes of the fixture are.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Pattern {
+    /// float32 counting up from zero: what `mknpy` writes.
+    CountingF32,
+    /// The byte at position p is p as u8: what the synthetic backend serves.
+    Bytes,
+    /// Do not check. Only for a fixture whose content is not known.
+    None,
+}
 
 #[derive(Parser)]
 #[command(about = "Time reading a contiguous selection over AEX2")]
 struct Cli {
     /// Control plane endpoint, e.g. http://127.0.0.1:50051
     url: String,
-    /// File to open, relative to one of the server's data roots.
+    /// File to open, relative to one of the server's data roots. With
+    /// `--format null`, a synthetic dataset such as `uint8:4294967296`.
     file: String,
-    /// Bytes to read per run. The file is float32, so this is four times the
-    /// number of elements the selection covers.
+    /// Format to open it as. Empty lets the server infer it from the name.
+    #[arg(long, default_value = "")]
+    format: String,
+    /// Bytes to read per run.
     #[arg(long)]
     bytes: u64,
+    /// Size of one element, for turning `--bytes` into a selection.
+    #[arg(long, default_value_t = 4)]
+    itemsize: u64,
+    /// What the data should look like, so that a transfer which moved the
+    /// wrong bytes fails rather than posting a good number.
+    #[arg(long, value_enum, default_value_t = Pattern::CountingF32)]
+    pattern: Pattern,
     /// Bytes per fetch. 0 follows the server's recommendation.
     #[arg(long, default_value_t = 0)]
     chunk: u64,
@@ -39,9 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..ClientConfig::default()
         },
     )?;
-    let handle = client.open(&cli.file)?;
+    let handle = client.open_as(&cli.file, &cli.format)?;
 
-    let elements = cli.bytes / 4;
+    let elements = cli.bytes / cli.itemsize;
     let indices = [Index::range(0, elements as i64)];
     let mut dst = vec![0u8; cli.bytes as usize];
 
@@ -61,15 +82,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Cheap proof that the right bytes arrived, not merely the right number of
-    // them: the file counts up, so the ends say where they came from.
-    let value_at = |i: usize| f32::from_le_bytes(dst[i..i + 4].try_into().expect("4 bytes"));
-    assert_eq!(value_at(0), 0.0, "the transfer did not start at the start");
-    assert_eq!(
-        value_at(dst.len() - 4),
-        (elements - 1) as f32,
-        "the transfer did not end at the end"
-    );
+    // Proof that the right bytes arrived, not merely the right number of them.
+    // Outside the timing, so a fast transfer that moved the wrong data is a
+    // failure rather than a record.
+    match cli.pattern {
+        Pattern::CountingF32 => {
+            let value_at =
+                |i: usize| f32::from_le_bytes(dst[i..i + 4].try_into().expect("4 bytes"));
+            assert_eq!(value_at(0), 0.0, "the transfer did not start at the start");
+            assert_eq!(
+                value_at(dst.len() - 4),
+                (elements - 1) as f32,
+                "the transfer did not end at the end"
+            );
+        }
+        Pattern::Bytes => {
+            let wrong = dst.iter().enumerate().find(|(i, &b)| b != *i as u8);
+            assert_eq!(
+                wrong.map(|(i, _)| i),
+                None,
+                "a byte arrived from the wrong place"
+            );
+        }
+        Pattern::None => {}
+    }
 
     let label = cli.label.unwrap_or_else(|| cli.file.clone());
     report(&format!("aex {label} chunk={}", cli.chunk), &runs);

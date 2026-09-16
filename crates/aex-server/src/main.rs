@@ -27,6 +27,12 @@ struct Cli {
     /// configured roots rather than adding to them.
     #[arg(long = "root", value_name = "DIR")]
     roots: Vec<PathBuf>,
+
+    /// Offer the synthetic backend, which answers reads from a pattern rather
+    /// than from storage. For measuring the transfer path; it serves data that
+    /// was never stored anywhere.
+    #[arg(long)]
+    enable_null_backend: bool,
 }
 
 impl Cli {
@@ -44,6 +50,9 @@ impl Cli {
         }
         if !self.roots.is_empty() {
             config.paths.roots = self.roots.clone();
+        }
+        if self.enable_null_backend {
+            config.enable_null_backend = true;
         }
         Ok(config)
     }

@@ -45,10 +45,10 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 - `tcp.sndbuf` / `tcp.congestion` は設定を受け付けるがまだ適用しない
   (起動時に警告を出す)
 
-ローカル (同一ホスト) での転送性能の測定結果は
-[docs/benchmark-m2-local.md](docs/benchmark-m2-local.md) と
-[docs/benchmark-double-buffering.md](docs/benchmark-double-buffering.md) にある。
-メモリ上のデータで単一接続 12,048 MiB/s (iPerf3 の 62 %、メモリコピー能力の 77 %)、
+ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
+([M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
+[ストレージを外した場合](docs/benchmark-null-backend.md))。メモリ上のデータで単一接続
+12,048 MiB/s (iPerf3 の 62 %)、ストレージを経路から外すと 16,290 MiB/s (同 84 %)、
 ディスク上のデータでは `pread` の限界近く。
 
 ## 転送の流れ
@@ -140,6 +140,7 @@ client.disconnect()?;
 ```
 protos/aex.proto   コントロールプレーンの定義
 crates/aex-core/   共通型・選択の解決・バックエンド (tokio / tonic に依存しない)
+                   `.npy` と、転送経路の測定用の合成バックエンド
 crates/aex-wire/   データプレーンのワイヤ形式 (サーバとクライアントで共用)
 crates/aex-proto/  aex.proto から生成されるコードと型変換
 crates/aex-server/ サーバ (両プレーン)

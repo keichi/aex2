@@ -457,3 +457,53 @@ fn one_session_reads_many_selections_over_the_same_connection() {
         assert_eq!(array.data, expected[row * 2000..(row + 1) * 2000]);
     }
 }
+
+#[test]
+fn the_synthetic_backend_is_offered_only_when_it_was_asked_for() {
+    // It serves data that was never stored anywhere and takes no path under the
+    // data roots, so a server that was not told to offer it must not.
+    let server = TestServer::start();
+    let client = server.connect();
+    let err = client.open_as("uint8:1024", "null").unwrap_err();
+    assert_eq!(err.class(), Some(ErrorClass::Request), "{err}");
+    assert!(err.to_string().contains("enabled"), "{err}");
+}
+
+#[test]
+fn the_synthetic_backend_serves_the_pattern_it_promises() {
+    let server = TestServer::start_with(|config| config.enable_null_backend = true);
+    let client = server.connect();
+
+    // Large enough to go over the data plane rather than back with the plan.
+    let handle = client.open_as("uint8:1048576", "null").expect("open");
+    let array = client.read_selection(handle, "array", &[]).expect("read");
+    assert_eq!(array.shape, vec![1048576]);
+    assert!(!array.transfer.inline);
+
+    // The byte at position p is p as u8, so a chunk that landed in the wrong
+    // place is a mismatch rather than a plausible number.
+    let wrong = array.bytes.iter().enumerate().find(|(i, &b)| b != *i as u8);
+    assert_eq!(wrong.map(|(i, _)| i), None);
+
+    // A selection of it reads from where it starts, as any other dataset would.
+    let rows = client
+        .read_selection(handle, "array", &[Index::range(1000, 3000)])
+        .expect("read");
+    assert_eq!(rows.shape, vec![2000]);
+    let expected: Vec<u8> = (1000u64..3000).map(|p| p as u8).collect();
+    assert_eq!(rows.bytes, expected);
+
+    // And its metadata crosses the wire like anything else.
+    let handle = client.open_as("float32:100x200", "null").expect("open");
+    let aex_client::Item::Dataset(info) = client.get_item(handle, "array").expect("item") else {
+        panic!("expected a dataset");
+    };
+    assert_eq!(info.dtype, aex_core::DType::Float32);
+    assert_eq!(info.shape, vec![100, 200]);
+
+    // A specification that makes no sense is a bad request, not a crash.
+    assert_eq!(
+        client.open_as("not a dataset", "null").unwrap_err().class(),
+        Some(ErrorClass::Request)
+    );
+}

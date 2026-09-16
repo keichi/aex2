@@ -48,6 +48,13 @@ pub struct ServerConfig {
     /// the control plane on", which is right whenever the server cannot know
     /// how the client addresses it (NAT, container, several interfaces).
     pub data_advertise_host: String,
+    /// Whether to offer the synthetic backend, which answers reads from a
+    /// pattern rather than from storage.
+    ///
+    /// Off unless asked for. It serves data that was never stored anywhere and
+    /// takes no path under the data roots, so it is a measuring instrument for
+    /// the transfer path and has no business being reachable otherwise.
+    pub enable_null_backend: bool,
     pub limits: Limits,
     pub transfer: Transfer,
     pub tcp: Tcp,
@@ -111,6 +118,7 @@ impl Default for ServerConfig {
             control_addr: "0.0.0.0:50051".parse().expect("valid default address"),
             data_addr: "0.0.0.0:50052".parse().expect("valid default address"),
             data_advertise_host: String::new(),
+            enable_null_backend: false,
             limits: Limits::default(),
             transfer: Transfer::default(),
             tcp: Tcp::default(),
@@ -242,6 +250,7 @@ mod tests {
         assert_eq!(cfg.transfer.read_buffers, 3);
         assert_eq!(cfg.transfer.read_buffer_bytes, 512 * 1024);
         assert!(cfg.tcp.nodelay);
+        assert!(!cfg.enable_null_backend, "synthetic data is opt-in");
         cfg.validate().expect("the defaults must be valid");
     }
 

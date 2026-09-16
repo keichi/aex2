@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aex_core::{ArrayDataset, ArrayFile, Codec, Item, NpyFile, SelectionLayout};
+use aex_core::{ArrayDataset, ArrayFile, Codec, Item, NpyFile, NullFile, SelectionLayout};
 use aex_proto::aex_control_server::AexControl;
 use aex_proto::convert::{indices_from_proto, quality_from_proto, quality_to_proto};
 use aex_proto::{
@@ -31,6 +31,11 @@ use crate::transfer::TransferRegistry;
 
 /// The one format this release serves.
 const NPY_FORMAT: &str = "npy";
+
+/// Not a format: a dataset with no storage behind it, for measuring what the
+/// transfer costs when reading the data costs nothing. Served only when the
+/// server was started with it enabled.
+const NULL_FORMAT: &str = "null";
 
 pub struct ControlService {
     sessions: Arc<SessionRegistry>,
@@ -61,8 +66,28 @@ impl ControlService {
 
     fn open(&self, request: &OpenFileRequest) -> Result<u64> {
         let session = self.sessions.get(&request.session_id)?;
-        let path = self.paths.resolve(&request.path)?;
 
+        // The synthetic backend has no file, so it is settled before any path
+        // is resolved: there is nothing on disk for a root to contain.
+        if request.format.eq_ignore_ascii_case(NULL_FORMAT) {
+            if !self.config.enable_null_backend {
+                return Err(ServerError::BadRequest(format!(
+                    "this server does not offer the {NULL_FORMAT:?} backend; it is for \
+                     measuring the transfer path and has to be enabled deliberately"
+                )));
+            }
+            let file: Arc<dyn ArrayFile> = Arc::new(NullFile::from_spec(&request.path)?);
+            let handle = session.files().insert(file);
+            tracing::debug!(
+                session = %hex(session.id()),
+                handle,
+                spec = %request.path,
+                "opened a synthetic dataset"
+            );
+            return Ok(handle);
+        }
+
+        let path = self.paths.resolve(&request.path)?;
         let format = if request.format.is_empty() {
             format_from_extension(&path)?
         } else {
