@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    # Both OSes, to catch regressions in the OS-specific paths (pread, writev).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: test (debug)
+        run: cargo test --all-features
+      # Both profiles: overflow checks make debug and release behave differently.
+      - name: test (release)
+        run: cargo test --release --all-features
+
+  # NOTE: the Python layer (python/aex) and the extension module (crates/aex-py)
+  # arrive in M3. Enable these jobs then:
+  #   - maturin build && pip install
+  #   - pytest tests/python
+  #   - mypy python/aex
+  #   - ruff check
