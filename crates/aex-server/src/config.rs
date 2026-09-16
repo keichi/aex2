@@ -3,9 +3,10 @@
 //! Every knob has a default, so a server runs with nothing but `--root`. The
 //! TOML file mirrors the struct: `[server]`, `[server.limits]`, and so on.
 //!
-//! Transfer and TCP settings are read and validated here even though the data
-//! plane that uses them arrives in M2. Keeping the file format complete from
-//! the start means a deployment's config does not have to change under it.
+//! A few settings are read and validated before anything acts on them —
+//! `tcp.sndbuf` and `tcp.congestion` are, as of this release. Keeping the file
+//! format complete from the start means a deployment's config does not have to
+//! change under it, and the data plane warns about what it is not applying.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -117,7 +118,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_sessions: 64,
-            max_fancy_indices: 262_144,
+            max_fancy_indices: aex_proto::convert::DEFAULT_MAX_FANCY_INDICES,
             grpc_max_message_bytes: 4 * 1024 * 1024,
             max_streams_per_session: 32,
             max_transfers_per_session: 64,

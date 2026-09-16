@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "aex-core",
  "aex-proto",
+ "aex-wire",
  "thiserror",
  "tokio",
  "tonic",

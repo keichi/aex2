@@ -86,11 +86,27 @@ impl TestServer {
     }
 
     pub fn connect(&self) -> Client {
-        Client::connect(&self.url, ClientConfig::default()).expect("connect")
+        self.connect_with(ClientConfig::default())
+    }
+
+    pub fn connect_with(&self, config: ClientConfig) -> Client {
+        Client::connect(&self.url, config).expect("connect")
     }
 
     pub fn root(&self) -> &Path {
         self.root.path()
+    }
+
+    /// Write a `.npy` of `f32` counting up from zero, and return what is in it.
+    ///
+    /// Counting up makes every element say where it came from, so a selection
+    /// that lands one row off is a visible mismatch rather than a plausible
+    /// number.
+    pub fn write_counting_npy(&self, name: &str, shape: &[usize]) -> Vec<f32> {
+        self.write_npy(name, shape);
+        (0..shape.iter().product::<usize>())
+            .map(|i| i as f32)
+            .collect()
     }
 
     /// Write a `.npy` of `f32` counting up from zero.

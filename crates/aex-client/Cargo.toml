@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 aex-core.workspace = true
 aex-proto.workspace = true
+aex-wire.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tonic.workspace = true

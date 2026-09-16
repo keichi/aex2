@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use aex_client::{ClientConfig, Index};
 use aex_core::ErrorClass;
 use aex_wire::{
     read_frame_header, write_frame, FrameHeader, FrameType, Hello, Ready, HELLO_LEN, READY_LEN,
@@ -114,6 +115,7 @@ fn a_client_speaking_another_version_is_refused() {
 #[test]
 fn a_session_opens_no_more_connections_than_it_was_granted() {
     let server = TestServer::start_with(|config| config.limits.max_streams_per_session = 2);
+    // The client opens one of the two as it connects.
     let client = server.connect();
     let session = client.session();
     assert_eq!(session.granted_streams, 2);
@@ -122,37 +124,20 @@ fn a_session_opens_no_more_connections_than_it_was_granted() {
         session.token.clone().try_into().unwrap(),
     );
 
-    let mut open = Vec::new();
-    for _ in 0..2 {
-        let mut stream = dial(&server);
-        assert!(shake_hands(&mut stream, &hello).is_accepted());
-        open.push(stream);
-    }
+    let mut second = dial(&server);
+    assert!(shake_hands(&mut second, &hello).is_accepted());
 
     let ready = shake_hands(&mut dial(&server), &hello);
     // Temporary, not a refusal: it clears as the others close.
     assert_eq!(ready.status, ErrorClass::Transient);
 
-    // Closing one makes room again.
-    open.pop();
-    let mut stream = dial(&server);
-    let accepted = (0..100).any(|_| {
-        // The server notices the close on its own thread, so give it a moment.
+    // Closing one makes room again, once the server's thread notices.
+    drop(second);
+    let freed = (0..100).any(|_| {
         std::thread::sleep(Duration::from_millis(20));
-        TcpStream::connect(server.data_addr)
-            .map(|mut fresh| {
-                let ready = shake_hands(&mut fresh, &hello);
-                if ready.is_accepted() {
-                    stream = fresh;
-                    true
-                } else {
-                    false
-                }
-            })
-            .unwrap_or(false)
+        shake_hands(&mut dial(&server), &hello).is_accepted()
     });
-    assert!(accepted, "a closed connection must free its slot");
-    drop(stream);
+    assert!(freed, "a closed connection must free its slot");
 }
 
 #[test]
@@ -240,4 +225,235 @@ fn a_fetch_for_a_transfer_that_does_not_exist_is_reported_as_a_plan_error() {
         read_frame_header(&mut stream).expect("pong").frame_type,
         FrameType::Pong
     );
+}
+
+#[test]
+fn the_whole_array_comes_back() {
+    let server = TestServer::start();
+    // 800 KB, well past the inline limit, so this goes over the data plane.
+    let expected = server.write_counting_npy("ocean.npy", &[1000, 200]);
+
+    let client = server.connect();
+    let handle = client.open("ocean.npy").expect("open");
+    let array = client
+        .read_selection_as::<f32>(handle, "array", &[])
+        .expect("read");
+
+    assert_eq!(array.shape, vec![1000, 200]);
+    assert_eq!(array.data, expected);
+    assert!(!array.transfer.inline);
+    assert_eq!(array.transfer.bytes, 800_000);
+    assert_eq!(array.transfer.streams, 1);
+    assert_eq!(array.transfer.retries, 0);
+}
+
+#[test]
+fn a_small_selection_comes_back_with_its_plan() {
+    let server = TestServer::start();
+    let expected = server.write_counting_npy("small.npy", &[64]);
+
+    let client = server.connect();
+    let handle = client.open("small.npy").expect("open");
+    let array = client
+        .read_selection_as::<f32>(handle, "array", &[])
+        .expect("read");
+
+    assert_eq!(array.data, expected);
+    // One round trip, and the data plane is not touched at all: without this
+    // path a small read would cost two where v1 needed one.
+    assert!(array.transfer.inline);
+    assert_eq!(array.transfer.chunks, 0);
+    assert_eq!(array.transfer.streams, 0);
+}
+
+#[test]
+fn a_transfer_is_cut_into_chunks_by_the_client() {
+    let server = TestServer::start();
+    let expected = server.write_counting_npy("ocean.npy", &[1000, 200]);
+
+    // The server states a ceiling and a recommendation; how to cut the stream
+    // up is the client's decision, and this is it being made differently.
+    let client = server.connect_with(ClientConfig {
+        chunk_bytes: 64 * 1024,
+        ..ClientConfig::default()
+    });
+    let handle = client.open("ocean.npy").expect("open");
+    let array = client
+        .read_selection_as::<f32>(handle, "array", &[])
+        .expect("read");
+
+    assert_eq!(array.data, expected);
+    assert_eq!(array.transfer.chunks, 800_000u32.div_ceil(64 * 1024));
+    assert_eq!(array.transfer.bytes, 800_000);
+}
+
+#[test]
+fn a_fetch_larger_than_the_server_allows_is_cut_down_to_it() {
+    let server = TestServer::start_with(|config| {
+        config.transfer.default_chunk_bytes = 128 * 1024;
+        config.transfer.max_fetch_bytes = 128 * 1024;
+    });
+    let expected = server.write_counting_npy("ocean.npy", &[1000, 200]);
+
+    // A client asking for more than the server will serve has to notice; the
+    // ceiling comes back in the reply to Connect for exactly this reason.
+    let client = server.connect_with(ClientConfig {
+        chunk_bytes: 16 * 1024 * 1024,
+        ..ClientConfig::default()
+    });
+    assert_eq!(client.session().max_fetch_bytes, 128 * 1024);
+
+    let handle = client.open("ocean.npy").expect("open");
+    let array = client
+        .read_selection_as::<f32>(handle, "array", &[])
+        .expect("read");
+    assert_eq!(array.data, expected);
+    assert_eq!(array.transfer.chunks, 800_000u32.div_ceil(128 * 1024));
+}
+
+#[test]
+fn a_selection_comes_back_as_numpy_would_have_taken_it() {
+    let server = TestServer::start();
+    // Rows of 2000 f32, so one row is 8 KB and three rows are past the inline
+    // limit: the cases below run over both paths.
+    let expected = server.write_counting_npy("grid.npy", &[64, 2000]);
+    let row = 2000usize;
+
+    let client = server.connect();
+    let handle = client.open("grid.npy").expect("open");
+
+    let cases: Vec<(Vec<Index>, Vec<u64>, std::ops::Range<usize>)> = vec![
+        (vec![], vec![64, 2000], 0..64 * row),
+        (vec![Index::Single(0)], vec![2000], 0..row),
+        (vec![Index::Single(-1)], vec![2000], 63 * row..64 * row),
+        (
+            vec![Index::range(10, 40)],
+            vec![30, 2000],
+            10 * row..40 * row,
+        ),
+        (
+            vec![Index::Fancy(vec![8, 9, 10])],
+            vec![3, 2000],
+            8 * row..11 * row,
+        ),
+        (
+            vec![Index::Ellipsis, Index::NewAxis],
+            vec![64, 2000, 1],
+            0..64 * row,
+        ),
+        (
+            vec![Index::Single(2), Index::Single(3)],
+            vec![],
+            2 * row + 3..2 * row + 4,
+        ),
+        (vec![Index::range(5, 5)], vec![0, 2000], 0..0),
+    ];
+
+    for (indices, shape, range) in cases {
+        let array = client
+            .read_selection_as::<f32>(handle, "array", &indices)
+            .unwrap_or_else(|e| panic!("{indices:?}: {e}"));
+        assert_eq!(array.shape, shape, "{indices:?}");
+        assert_eq!(array.data, expected[range], "{indices:?}");
+    }
+}
+
+#[test]
+fn a_selection_this_release_cannot_serve_says_so() {
+    let server = TestServer::start();
+    server.write_counting_npy("grid.npy", &[64, 2000]);
+    let client = server.connect();
+    let handle = client.open("grid.npy").expect("open");
+
+    // Strided and fragmented layouts arrive with the parallel transfer path.
+    // Until then they are refused, rather than served wrongly.
+    for indices in [
+        vec![Index::full(), Index::range(0, 100)],
+        vec![Index::Slice {
+            start: None,
+            stop: None,
+            step: Some(2),
+        }],
+        vec![Index::Fancy(vec![1, 5, 9])],
+    ] {
+        let err = client
+            .read_selection(handle, "array", &indices)
+            .expect_err("not implemented yet");
+        assert_eq!(err.class(), Some(ErrorClass::Request), "{indices:?}: {err}");
+    }
+
+    // A selection numpy would refuse too.
+    let err = client
+        .read_selection(handle, "array", &[Index::Single(64)])
+        .unwrap_err();
+    assert_eq!(err.class(), Some(ErrorClass::Request), "{err}");
+}
+
+#[test]
+fn reading_into_a_buffer_writes_exactly_that_buffer() {
+    let server = TestServer::start();
+    let expected = server.write_counting_npy("ocean.npy", &[500, 200]);
+    let client = server.connect();
+    let handle = client.open("ocean.npy").expect("open");
+
+    let mut bytes = vec![0u8; expected.len() * 4];
+    let result = client
+        .read_selection_into(handle, "array", &[], &mut bytes)
+        .expect("read");
+    assert_eq!(result.bytes, bytes.len() as u64);
+
+    let values: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(values, expected);
+
+    // A buffer of the wrong size is the caller's mistake, and is caught before
+    // anything is sent.
+    let mut wrong = vec![0u8; 8];
+    let err = client
+        .read_selection_into(handle, "array", &[], &mut wrong)
+        .unwrap_err();
+    assert!(
+        matches!(err, aex_client::ClientError::BadRequest(_)),
+        "{err}"
+    );
+}
+
+#[test]
+fn reading_as_the_wrong_type_is_refused() {
+    let server = TestServer::start();
+    server.write_counting_npy("ocean.npy", &[500, 200]);
+    let client = server.connect();
+    let handle = client.open("ocean.npy").expect("open");
+
+    let err = client
+        .read_selection_as::<f64>(handle, "array", &[])
+        .unwrap_err();
+    assert!(
+        matches!(err, aex_client::ClientError::BadRequest(_)),
+        "{err}"
+    );
+
+    // The raw bytes are always available, whatever the dtype.
+    let array = client.read_selection(handle, "array", &[]).expect("read");
+    assert_eq!(array.dtype, aex_core::DType::Float32);
+    assert_eq!(array.bytes.len(), 500 * 200 * 4);
+}
+
+#[test]
+fn one_session_reads_many_selections_over_the_same_connection() {
+    let server = TestServer::start();
+    let expected = server.write_counting_npy("grid.npy", &[64, 2000]);
+    let client = server.connect();
+    let handle = client.open("grid.npy").expect("open");
+
+    // The connection carries no state between transfers, so the third read is
+    // the same as the first.
+    for row in [0usize, 7, 63] {
+        let array = client
+            .read_selection_as::<f32>(handle, "array", &[Index::Single(row as i64)])
+            .expect("read");
+        assert_eq!(array.data, expected[row * 2000..(row + 1) * 2000]);
+    }
 }

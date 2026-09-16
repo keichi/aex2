@@ -14,6 +14,13 @@ use aex_core::{AexError, DType, Encoding, Index, QualitySpec, Result};
 
 use crate::{index, Fancy, Slice};
 
+/// Expanded indices one fancy selection may have.
+///
+/// Both sides hold the same number so that the client can refuse an oversized
+/// selection before it costs a round trip. A server configured lower still
+/// refuses what is over its own limit.
+pub const DEFAULT_MAX_FANCY_INDICES: u64 = 262_144;
+
 /// Convert a selection for the wire.
 pub fn indices_to_proto(indices: &[Index]) -> Vec<crate::Index> {
     indices.iter().map(index_to_proto).collect()
@@ -72,6 +79,16 @@ pub fn index_from_proto(index: &crate::Index, max_fancy: u64) -> Result<Index> {
         index::Kind::Newaxis(_) => Index::NewAxis,
     };
     Ok(converted)
+}
+
+/// Refuse a selection too large to travel, before it is sent.
+pub fn check_fancy_limit(indices: &[Index], max_fancy: u64) -> Result<()> {
+    for index in indices {
+        if let Index::Fancy(list) = index {
+            check_fancy_len(list.len(), max_fancy)?;
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a fancy selection too large to travel.
@@ -204,6 +221,12 @@ mod tests {
         // the request would not fit a gRPC message, not because of the array.
         assert!(err.to_string().contains("split the selection"), "{err}");
         assert_eq!(err.class(), aex_core::ErrorClass::Request);
+
+        // The client checks the same limit before sending, so that an
+        // oversized selection does not cost a round trip to be refused.
+        let indices = [Index::Ellipsis, Index::Fancy((0..100).collect())];
+        check_fancy_limit(&indices, 100).expect("at the limit");
+        assert!(check_fancy_limit(&indices, 99).is_err());
     }
 
     #[test]

@@ -3,9 +3,9 @@
 //! Everything here can also be set from the environment, so that a benchmark
 //! sweep does not need a recompile between points.
 //!
-//! Only the settings M1 can act on are here. The transfer knobs — chunk size,
-//! credit, codec, receive buffer, retry count — join them with the data plane
-//! they belong to, rather than sitting unused and looking as if they work.
+//! Only settings the client can act on are here. Credit, the receive buffer
+//! size and the congestion control algorithm arrive with the parallel transfer
+//! path they belong to, rather than sitting unused and looking as if they work.
 
 use std::time::Duration;
 
@@ -24,6 +24,15 @@ pub struct ClientConfig {
     pub connect_timeout: Duration,
     /// Ceiling on one gRPC message. A fancy selection is the message that grows.
     pub max_message_bytes: usize,
+    /// How much of the logical byte stream one fetch asks for. 0 follows the
+    /// server's recommendation, which is the right answer unless a benchmark is
+    /// sweeping this.
+    pub chunk_bytes: u64,
+    /// How many times a chunk may be fetched again before the transfer fails.
+    pub max_retries: u32,
+    /// Whether to disable Nagle on the data connections. A fetch is 48 bytes
+    /// that a whole chunk is waiting on, so holding it back costs a round trip.
+    pub tcp_nodelay: bool,
 }
 
 impl Default for ClientConfig {
@@ -33,6 +42,9 @@ impl Default for ClientConfig {
             client_name: default_client_name(),
             connect_timeout: Duration::from_secs(10),
             max_message_bytes: 4 * 1024 * 1024,
+            chunk_bytes: 0,
+            max_retries: 3,
+            tcp_nodelay: true,
         }
     }
 }
@@ -61,7 +73,25 @@ impl ClientConfig {
         if let Some(bytes) = lookup("AEX_MAX_MESSAGE_BYTES").and_then(|v| v.parse().ok()) {
             self.max_message_bytes = bytes;
         }
+        if let Some(bytes) = lookup("AEX_CHUNK_BYTES").and_then(|v| v.parse().ok()) {
+            self.chunk_bytes = bytes;
+        }
+        if let Some(retries) = lookup("AEX_MAX_RETRIES").and_then(|v| v.parse().ok()) {
+            self.max_retries = retries;
+        }
+        if let Some(nodelay) = lookup("AEX_TCP_NODELAY").and_then(|v| parse_bool(&v)) {
+            self.tcp_nodelay = nodelay;
+        }
         self
+    }
+}
+
+/// Read a flag as a benchmark script is likely to write one.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -85,6 +115,11 @@ mod tests {
         assert_eq!(config.streams, DEFAULT_STREAMS);
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
         assert!(!config.client_name.is_empty());
+        // 0 means "whatever the server recommends", which is what an untuned
+        // client should be doing.
+        assert_eq!(config.chunk_bytes, 0);
+        assert_eq!(config.max_retries, 3);
+        assert!(config.tcp_nodelay);
     }
 
     #[test]
@@ -92,20 +127,27 @@ mod tests {
         let config = ClientConfig::default().with_env(|name| match name {
             "AEX_STREAMS" => Some("16".to_string()),
             "AEX_CONNECT_TIMEOUT_MS" => Some("250".to_string()),
+            "AEX_CHUNK_BYTES" => Some("262144".to_string()),
+            "AEX_TCP_NODELAY" => Some("off".to_string()),
             _ => None,
         });
         assert_eq!(config.streams, 16);
         assert_eq!(config.connect_timeout, Duration::from_millis(250));
+        assert_eq!(config.chunk_bytes, 256 * 1024);
+        assert!(!config.tcp_nodelay);
         // Untouched settings keep their defaults.
         assert_eq!(config.max_message_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.max_retries, 3);
     }
 
     #[test]
     fn an_unparseable_value_leaves_the_default() {
         let config = ClientConfig::default().with_env(|name| match name {
             "AEX_STREAMS" => Some("many".to_string()),
+            "AEX_TCP_NODELAY" => Some("perhaps".to_string()),
             _ => None,
         });
         assert_eq!(config.streams, DEFAULT_STREAMS);
+        assert!(config.tcp_nodelay);
     }
 }

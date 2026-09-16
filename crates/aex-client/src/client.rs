@@ -1,23 +1,34 @@
-//! The control plane client.
+//! The client.
 //!
 //! The API is blocking, with a tokio runtime kept inside. Callers are analysis
-//! code and, from M3, Python: neither wants to own a runtime, and the Python
+//! code and, later, Python: neither wants to own a runtime, and the Python
 //! bindings will release the GIL around exactly these blocking calls.
+//!
+//! Reading a selection costs one round trip when it is small enough to come
+//! back with its plan, and two when it is not. The second is the data plane,
+//! where the bytes go from the kernel into the caller's buffer without passing
+//! through protobuf or through a copy of this client's making — which is why
+//! [`Client::read_selection_into`] takes the buffer rather than returning one.
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
-use aex_core::DType;
+use aex_core::{DType, Index};
 use aex_proto::aex_control_client::AexControlClient;
+use aex_proto::convert::{check_fancy_limit, indices_to_proto, quality_to_proto};
 use aex_proto::{
     CloseFileRequest, ConnectRequest, DisconnectRequest, GetItemRequest, ListChildrenRequest,
-    OpenFileRequest,
+    OpenFileRequest, PrepareSelectionRequest,
 };
+use aex_wire::ScatterBuffer;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::config::ClientConfig;
 use crate::error::{ClientError, Result};
+use crate::pool::{ConnSettings, DataPool};
+use crate::transfer::{ArrayData, Element, Plan, TransferResult, TypedArray};
 
 /// The data plane frame version this client speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -75,6 +86,9 @@ pub struct SessionInfo {
     pub max_fetch_bytes: u64,
     pub supported_codecs: u32,
     pub supported_encodings: u32,
+    /// Ceiling on the expanded indices of one fancy selection, so that an
+    /// oversized one is refused here rather than after a round trip.
+    pub max_fancy_indices: u64,
 }
 
 impl std::fmt::Debug for SessionInfo {
@@ -91,6 +105,7 @@ impl std::fmt::Debug for SessionInfo {
             .field("max_fetch_bytes", &self.max_fetch_bytes)
             .field("supported_codecs", &self.supported_codecs)
             .field("supported_encodings", &self.supported_encodings)
+            .field("max_fancy_indices", &self.max_fancy_indices)
             .finish()
     }
 }
@@ -117,6 +132,7 @@ pub struct Client {
     // while the runtime that owns them is still alive.
     control: AexControlClient<Channel>,
     runtime: Arc<Runtime>,
+    pool: DataPool,
     session: SessionInfo,
     config: ClientConfig,
 }
@@ -125,6 +141,7 @@ impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
             .field("session", &self.session)
+            .field("pool", &self.pool)
             .field("config", &self.config)
             .finish()
     }
@@ -199,11 +216,27 @@ impl Client {
             max_fetch_bytes: reply.max_fetch_bytes,
             supported_codecs: reply.supported_codecs,
             supported_encodings: reply.supported_encodings,
+            // Not advertised: both sides hold the same default, and a server
+            // that lowers it still refuses what is over its own limit.
+            max_fancy_indices: aex_proto::convert::DEFAULT_MAX_FANCY_INDICES,
         };
+
+        // Opened now rather than at the first transfer, so that a data plane
+        // which cannot be reached is reported here, and so that the first large
+        // read does not pay for a handshake.
+        let pool = DataPool::connect(ConnSettings {
+            host: session.data_endpoint.0.clone(),
+            port: session.data_endpoint.1,
+            session_id: as_16_bytes(&session.id, "session id")?,
+            session_token: as_16_bytes(&session.token, "session token")?,
+            nodelay: config.tcp_nodelay,
+            connect_timeout: config.connect_timeout,
+        })?;
 
         Ok(Client {
             control,
             runtime,
+            pool,
             session,
             config,
         })
@@ -277,6 +310,205 @@ impl Client {
         reply.items.iter().map(item_from_proto).collect()
     }
 
+    /// Read a selection into a buffer the caller owns.
+    ///
+    /// `dst` has to be exactly the length of the selection, which the caller
+    /// learns from the metadata or from a previous read. Taking the buffer
+    /// rather than returning one is the point: it is what lets the bytes go
+    /// from the kernel into a numpy array with nothing in between.
+    pub fn read_selection_into(
+        &self,
+        handle: FileHandle,
+        name: &str,
+        indices: &[Index],
+        dst: &mut [u8],
+    ) -> Result<TransferResult> {
+        let plan = self.prepare(handle, name, indices)?;
+        if plan.total_bytes != dst.len() as u64 {
+            return Err(ClientError::BadRequest(format!(
+                "the selection is {} bytes and the buffer is {}",
+                plan.total_bytes,
+                dst.len()
+            )));
+        }
+        self.fill(plan, handle, name, indices, dst)
+    }
+
+    /// Read a selection, allocating for it.
+    ///
+    /// The bytes are the logical byte stream: C order, little-endian, exactly
+    /// as they travelled.
+    pub fn read_selection(
+        &self,
+        handle: FileHandle,
+        name: &str,
+        indices: &[Index],
+    ) -> Result<ArrayData> {
+        let plan = self.prepare(handle, name, indices)?;
+        let (dtype, shape) = (plan.dtype, plan.shape.clone());
+        let mut bytes = vec![0u8; plan.total_bytes as usize];
+        let transfer = self.fill(plan, handle, name, indices, &mut bytes)?;
+        Ok(ArrayData {
+            dtype,
+            shape,
+            bytes,
+            transfer,
+        })
+    }
+
+    /// Read a selection as elements, checking that the dtype is the one asked
+    /// for.
+    ///
+    /// Only for the types where every bit pattern is a value; see [`Element`].
+    pub fn read_selection_as<T: Element>(
+        &self,
+        handle: FileHandle,
+        name: &str,
+        indices: &[Index],
+    ) -> Result<TypedArray<T>> {
+        let plan = self.prepare(handle, name, indices)?;
+        if plan.dtype != T::DTYPE {
+            return Err(ClientError::BadRequest(format!(
+                "the selection is {} and was asked for as {}",
+                plan.dtype,
+                T::DTYPE
+            )));
+        }
+
+        let shape = plan.shape.clone();
+        let total_bytes = plan.total_bytes as usize;
+        let mut data = vec![T::default(); total_bytes / std::mem::size_of::<T>()];
+        // Element is sealed to the types where writing arbitrary bytes over an
+        // element is defined, and every target is little-endian, so the wire
+        // form and the in-memory form are the same bytes.
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, total_bytes) };
+        let transfer = self.fill(plan, handle, name, indices, dst)?;
+        Ok(TypedArray {
+            shape,
+            data,
+            transfer,
+        })
+    }
+
+    /// Ask the server to resolve a selection.
+    fn prepare(&self, handle: FileHandle, name: &str, indices: &[Index]) -> Result<Plan> {
+        // Checked here so that a selection too large to travel does not cost a
+        // round trip to be told so.
+        check_fancy_limit(indices, self.session.max_fancy_indices)
+            .map_err(|e| ClientError::BadRequest(e.to_string()))?;
+
+        let reply = self.call(|mut control| async move {
+            control
+                .prepare_selection(PrepareSelectionRequest {
+                    session_id: self.session.id.clone(),
+                    handle: handle.0,
+                    name: name.to_string(),
+                    indices: indices_to_proto(indices),
+                    // Lossless and uncompressed: nothing else is implemented on
+                    // either side yet, and the plan says what was applied.
+                    requested_quality: Some(quality_to_proto(&aex_core::QualitySpec::exact())),
+                    requested_codec: aex_core::Codec::Raw.as_u32(),
+                })
+                .await
+        })?;
+        Plan::from_proto(reply)
+    }
+
+    /// Fill `dst` from a plan, preparing again once if the plan has gone.
+    ///
+    /// A plan can be evicted while the client is still working through its
+    /// chunks. The client holds the selection, so it can just ask for another
+    /// one; twice in a row would mean something other than eviction.
+    fn fill(
+        &self,
+        plan: Plan,
+        handle: FileHandle,
+        name: &str,
+        indices: &[Index],
+        dst: &mut [u8],
+    ) -> Result<TransferResult> {
+        let started = Instant::now();
+
+        if plan.is_inline() {
+            dst.copy_from_slice(&plan.inline_data);
+            return Ok(TransferResult {
+                bytes: plan.total_bytes,
+                elapsed: started.elapsed(),
+                chunks: 0,
+                streams: 0,
+                retries: 0,
+                inline: true,
+            });
+        }
+
+        let mut plan = plan;
+        let mut retries = 0;
+        loop {
+            match self.run_transfer(&plan, dst) {
+                Ok((chunks, attempts)) => {
+                    return Ok(TransferResult {
+                        bytes: plan.total_bytes,
+                        elapsed: started.elapsed(),
+                        chunks,
+                        streams: self.pool.streams(),
+                        retries: retries + attempts,
+                        inline: false,
+                    })
+                }
+                Err(e) if e.needs_reprepare() && retries == 0 => {
+                    let fresh = self.prepare(handle, name, indices)?;
+                    if fresh.total_bytes != plan.total_bytes {
+                        // The file changed underneath the selection; the buffer
+                        // no longer fits what is being sent.
+                        return Err(ClientError::BadRequest(format!(
+                            "the selection was {} bytes and is now {}",
+                            plan.total_bytes, fresh.total_bytes
+                        )));
+                    }
+                    plan = fresh;
+                    retries += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Fetch every chunk of a plan. Returns the chunks and the retries.
+    fn run_transfer(&self, plan: &Plan, dst: &mut [u8]) -> Result<(u32, u32)> {
+        let chunk_bytes = self.chunk_bytes();
+        let scatter = ScatterBuffer::new(dst);
+        let mut chunks = 0;
+        let mut retries = 0;
+
+        for (offset, len) in plan.chunks(chunk_bytes) {
+            let mut slice = scatter.claim(offset, len)?;
+            retries += self.pool.fetch_into(
+                plan.request_id,
+                &plan.ticket,
+                offset,
+                &mut slice,
+                self.config.max_retries,
+            )?;
+            chunks += 1;
+        }
+        Ok((chunks, retries))
+    }
+
+    /// How much of the logical byte stream one fetch asks for.
+    ///
+    /// The client decides this, not the server: what makes a good chunk size —
+    /// how many connections there are, what the round trip and the bandwidth
+    /// are — is all known on this side. The server only states a ceiling.
+    fn chunk_bytes(&self) -> u64 {
+        let wanted = if self.config.chunk_bytes == 0 {
+            self.session.default_chunk_bytes
+        } else {
+            self.config.chunk_bytes
+        };
+        wanted.clamp(1, self.session.max_fetch_bytes.max(1))
+    }
+
     /// Release the session and everything it holds.
     pub fn disconnect(self) -> Result<()> {
         let session_id = self.session.id.clone();
@@ -331,6 +563,13 @@ fn item_from_proto(item: &aex_proto::Item) -> Result<(String, Item)> {
         }
     };
     Ok((item.name.clone(), converted))
+}
+
+/// Read a 16-byte identifier out of what the server sent.
+fn as_16_bytes(bytes: &[u8], what: &str) -> Result<[u8; 16]> {
+    bytes
+        .try_into()
+        .map_err(|_| ClientError::Protocol(format!("{what} is {} bytes, expected 16", bytes.len())))
 }
 
 /// Strip the brackets a URI puts around an IPv6 host.
@@ -446,6 +685,7 @@ mod tests {
             max_fetch_bytes: 16 << 20,
             supported_codecs: 1,
             supported_encodings: 1,
+            max_fancy_indices: 262_144,
         };
         let rendered = format!("{session:?}");
         assert!(rendered.contains("abababab"), "{rendered}");
