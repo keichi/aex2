@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 aex-core.workspace = true
 aex-proto.workspace = true
+aex-wire.workspace = true
 clap.workspace = true
 dashmap.workspace = true
 getrandom.workspace = true

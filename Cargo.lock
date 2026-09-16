@@ -39,6 +39,7 @@ version = "0.1.0"
 dependencies = [
  "aex-core",
  "aex-proto",
+ "aex-wire",
  "clap",
  "dashmap",
  "getrandom 0.4.3",

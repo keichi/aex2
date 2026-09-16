@@ -1,12 +1,21 @@
-//! Generated control plane types.
+//! Generated control plane types, and the conversions to the core ones.
 //!
-//! This crate holds nothing but the output of `tonic-prost-build`, so that
-//! running `protoc` is not part of building the server or the client logic.
+//! The generated code is kept in its own crate so that running `protoc` is not
+//! part of building the server or the client logic. [`convert`] sits alongside
+//! it because both sides of the control plane map the same types in opposite
+//! directions, and two copies of that mapping is how a client comes to send
+//! what a server reads as something else.
 
-// Generated code is not ours to lint.
-#![allow(clippy::all)]
+pub mod convert;
 
-tonic::include_proto!("aex.v2");
+pub use generated::*;
+
+/// Generated code is not ours to lint, so it is kept behind a module that can
+/// carry the exemption without it reaching the rest of the crate.
+#[allow(clippy::all)]
+mod generated {
+    tonic::include_proto!("aex.v2");
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,13 +1,20 @@
 //! The gRPC control plane.
 //!
-//! Sessions, files and metadata are served here. The transfer and compute RPCs
-//! are part of the settled protocol but arrive with the data plane in M2, and
-//! report themselves as unimplemented until then.
+//! It decides *what* to send: sessions, files, metadata, and the resolution of
+//! a selection into a transfer plan. The bulk data never passes through here.
+//!
+//! A selection small enough to fit the inline limit is answered with its data
+//! attached instead of a plan. Without that path, a small interactive read
+//! would cost two round trips where v1 needed one, and making a small read
+//! slower in order to make a large one faster is the wrong trade for a system
+//! whose main complaint about v1 is latency.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use aex_core::{ArrayDataset, ArrayFile, Item, NpyFile};
+use aex_core::{ArrayDataset, ArrayFile, Codec, Item, NpyFile, SelectionLayout};
 use aex_proto::aex_control_server::AexControl;
+use aex_proto::convert::{indices_from_proto, quality_from_proto, quality_to_proto};
 use aex_proto::{
     ApplyFunctionReply, ApplyFunctionRequest, CloseFileReply, CloseFileRequest, ConnectReply,
     ConnectRequest, DataEndpoint, Dataset, DisconnectReply, DisconnectRequest, GetItemRequest,
@@ -20,12 +27,14 @@ use crate::config::{ServerConfig, PROTOCOL_VERSION, SUPPORTED_CODECS, SUPPORTED_
 use crate::error::{Result, ServerError};
 use crate::paths::PathPolicy;
 use crate::session::SessionRegistry;
+use crate::transfer::TransferRegistry;
 
 /// The one format this release serves.
 const NPY_FORMAT: &str = "npy";
 
 pub struct ControlService {
     sessions: Arc<SessionRegistry>,
+    transfers: Arc<TransferRegistry>,
     paths: Arc<PathPolicy>,
     config: Arc<ServerConfig>,
 }
@@ -33,11 +42,13 @@ pub struct ControlService {
 impl ControlService {
     pub fn new(
         sessions: Arc<SessionRegistry>,
+        transfers: Arc<TransferRegistry>,
         paths: Arc<PathPolicy>,
         config: Arc<ServerConfig>,
     ) -> Self {
         ControlService {
             sessions,
+            transfers,
             paths,
             config,
         }
@@ -72,6 +83,67 @@ impl ControlService {
     fn file_of(&self, session_id: &[u8], handle: u64) -> Result<Arc<dyn ArrayFile>> {
         let session = self.sessions.get(session_id)?;
         session.files().get(handle)
+    }
+
+    /// Resolve a selection into a plan, or into the data itself when it is
+    /// small enough to travel inline.
+    fn prepare(&self, request: &PrepareSelectionRequest) -> Result<TransferPlan> {
+        let session = self.sessions.get(&request.session_id)?;
+        let file = session.files().get(request.handle)?;
+
+        let Item::Dataset(dataset) = file.get_item(&request.name).map_err(ServerError::from)?
+        else {
+            return Err(ServerError::BadRequest(format!(
+                "{:?} is a group; only a dataset can be transferred",
+                request.name
+            )));
+        };
+
+        let indices = indices_from_proto(&request.indices, self.config.limits.max_fancy_indices)?;
+        // What the client asked for, and what this server can actually do. The
+        // difference goes back in the plan rather than being an error, so that
+        // a newer client still gets its data.
+        let requested = quality_from_proto(request.requested_quality.as_ref());
+        let applied = requested.applied();
+        let codec = Codec::from_u32(request.requested_codec)
+            .filter(|codec| codec.is_supported())
+            .unwrap_or(Codec::Raw);
+
+        let layout = dataset.layout(&indices, &applied)?;
+
+        if layout.total_bytes <= self.config.transfer.inline_limit_bytes {
+            let mut inline_data = vec![0u8; layout.total_bytes as usize];
+            dataset.read_range(&layout, 0, &mut inline_data)?;
+            tracing::debug!(
+                session = %hex(session.id()),
+                bytes = layout.total_bytes,
+                "answered a selection inline"
+            );
+            // No request_id and no ticket: there is nothing left to fetch, and
+            // a zero request_id is how the client knows that.
+            return plan_reply(&layout, codec, &applied, 0, Vec::new(), 0, inline_data);
+        }
+
+        let entry = self
+            .transfers
+            .insert(*session.id(), dataset.clone(), layout)?;
+        let expires = unix_ms_from_now(self.transfers.ttl_secs());
+        tracing::debug!(
+            session = %hex(session.id()),
+            request_id = entry.request_id(),
+            bytes = entry.layout().total_bytes,
+            "prepared a transfer"
+        );
+
+        plan_reply(
+            entry.layout(),
+            codec,
+            &applied,
+            entry.request_id(),
+            entry.ticket().to_vec(),
+            expires,
+            Vec::new(),
+        )
     }
 }
 
@@ -126,8 +198,13 @@ impl AexControl for ControlService {
         request: Request<DisconnectRequest>,
     ) -> std::result::Result<Response<DisconnectReply>, Status> {
         let request = request.into_inner();
-        self.sessions.remove(&request.session_id)?;
-        tracing::info!(session = %hex(&request.session_id), "session closed");
+        let session_id = self.sessions.remove(&request.session_id)?;
+        let dropped = self.transfers.remove_session(&session_id);
+        tracing::info!(
+            session = %hex(&session_id),
+            transfers = dropped,
+            "session closed"
+        );
         Ok(Response::new(DisconnectReply {}))
     }
 
@@ -178,32 +255,70 @@ impl AexControl for ControlService {
 
     async fn prepare_selection(
         &self,
-        _request: Request<PrepareSelectionRequest>,
+        request: Request<PrepareSelectionRequest>,
     ) -> std::result::Result<Response<TransferPlan>, Status> {
-        Err(unimplemented_in_m1("PrepareSelection"))
+        Ok(Response::new(self.prepare(&request.into_inner())?))
     }
 
     async fn prepare_selections(
         &self,
         _request: Request<PrepareSelectionsRequest>,
     ) -> std::result::Result<Response<TransferPlanList>, Status> {
-        Err(unimplemented_in_m1("PrepareSelections"))
+        Err(not_implemented_yet("PrepareSelections", "gather"))
     }
 
     async fn apply_function(
         &self,
         _request: Request<ApplyFunctionRequest>,
     ) -> std::result::Result<Response<ApplyFunctionReply>, Status> {
-        Err(unimplemented_in_m1("ApplyFunction"))
+        Err(not_implemented_yet(
+            "ApplyFunction",
+            "server-side reductions",
+        ))
     }
 }
 
-/// Says which milestone the RPC is waiting on, so that a client hitting one
-/// during development is not left wondering whether it misdialled.
-fn unimplemented_in_m1(rpc: &str) -> Status {
+/// Says what the RPC is waiting on, so that a client hitting one during
+/// development is not left wondering whether it misdialled.
+fn not_implemented_yet(rpc: &str, what: &str) -> Status {
     Status::unimplemented(format!(
-        "{rpc} needs the data plane, which this server does not serve yet"
+        "{rpc} is part of {what}, which this server does not serve yet"
     ))
+}
+
+/// Assemble the reply, whichever way the selection is being answered.
+fn plan_reply(
+    layout: &SelectionLayout,
+    codec: Codec,
+    applied: &aex_core::QualitySpec,
+    request_id: u32,
+    ticket: Vec<u8>,
+    expires_unix_ms: u64,
+    inline_data: Vec<u8>,
+) -> Result<TransferPlan> {
+    Ok(TransferPlan {
+        request_id,
+        ticket,
+        dtype: layout.dtype.as_i32(),
+        shape: shape_to_proto(&layout.out_shape)?,
+        total_bytes: layout.total_bytes,
+        codec: codec.as_u32(),
+        applied_quality: Some(quality_to_proto(applied)),
+        expires_unix_ms,
+        inline_data,
+    })
+}
+
+/// Wall-clock milliseconds `secs` from now.
+///
+/// Only the client reads this, and only to tell a user how long it has. The
+/// server times its own plans on a monotonic clock.
+fn unix_ms_from_now(secs: u64) -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+        .saturating_add(secs.saturating_mul(1000))
 }
 
 /// The backend a file extension asks for.
@@ -229,26 +344,28 @@ fn item_to_proto(name: &str, item: &Item) -> Result<aex_proto::Item> {
 }
 
 fn dataset_to_proto(dataset: &dyn ArrayDataset) -> Result<Dataset> {
-    let shape = dataset
-        .shape()
+    let shape = shape_to_proto(dataset.shape())?;
+    Ok(Dataset {
+        dtype: dataset.dtype().as_i32(),
+        ndim: shape.len() as i32,
+        shape,
+    })
+}
+
+/// The wire carries shapes as int64, as numpy does. A header can declare a
+/// longer axis than that; such a file is not one we can describe, let alone
+/// serve.
+fn shape_to_proto(shape: &[u64]) -> Result<Vec<i64>> {
+    shape
         .iter()
         .map(|&n| {
-            // The wire carries shapes as int64, as numpy does. A header can
-            // declare a longer axis than that; such a file is not one we can
-            // describe, let alone serve.
             i64::try_from(n).map_err(|_| {
                 ServerError::Core(aex_core::AexError::MalformedNpy(format!(
                     "axis of {n} elements does not fit the int64 shape on the wire"
                 )))
             })
         })
-        .collect::<Result<Vec<i64>>>()?;
-
-    Ok(Dataset {
-        dtype: dataset.dtype().as_i32(),
-        ndim: shape.len() as i32,
-        shape,
-    })
+        .collect()
 }
 
 /// Hex for logs. Session ids are opaque, so they are shown as bytes.

@@ -26,6 +26,11 @@ pub enum ServerError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// An unknown or expired transfer plan. The client re-prepares on this,
+    /// and on nothing else, so it must not be conflated with a bad request.
+    #[error("{0}")]
+    NoSuchPlan(String),
+
     /// A path outside every configured root.
     #[error("{0}")]
     PathNotAllowed(String),
@@ -53,6 +58,7 @@ impl ServerError {
     pub fn class(&self) -> ErrorClass {
         match self {
             ServerError::Auth(_) => ErrorClass::Auth,
+            ServerError::NoSuchPlan(_) => ErrorClass::Plan,
             ServerError::BadRequest(_) | ServerError::PathNotAllowed(_) => ErrorClass::Request,
             ServerError::Exhausted(_) => ErrorClass::Transient,
             ServerError::Core(e) => e.class(),
@@ -104,6 +110,11 @@ mod tests {
     fn each_class_maps_to_the_code_the_client_expects() {
         let code = |err: ServerError| Status::from(err).code();
         assert_eq!(code(ServerError::Auth("x".into())), Code::Unauthenticated);
+        // A plan the client can reissue, and nothing else, gets this code.
+        assert_eq!(
+            code(ServerError::NoSuchPlan("x".into())),
+            Code::FailedPrecondition
+        );
         assert_eq!(
             code(ServerError::BadRequest("x".into())),
             Code::InvalidArgument

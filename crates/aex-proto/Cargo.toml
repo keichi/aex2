@@ -7,12 +7,10 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+aex-core.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
-
-[dev-dependencies]
-aex-core.workspace = true

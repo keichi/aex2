@@ -1,7 +1,7 @@
 //! The AEX2 server.
 //!
-//! As of M1 that is the gRPC control plane: sessions, files and metadata. The
-//! data plane listener joins it in M2, sharing the session registry.
+//! The gRPC control plane decides what to send; the data plane sends it. They
+//! meet at the transfer registry, which one writes and the other reads.
 //!
 //! [`ControlServer::bind`] takes the socket before serving so that a caller —
 //! an integration test, say — can ask for port 0 and still learn where to
@@ -12,6 +12,7 @@ pub mod control;
 pub mod error;
 pub mod paths;
 pub mod session;
+pub mod transfer;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -27,8 +28,10 @@ use crate::control::ControlService;
 pub use crate::error::{Result, ServerError};
 use crate::paths::PathPolicy;
 use crate::session::SessionRegistry;
+use crate::transfer::TransferRegistry;
 
-/// How often idle sessions are collected, as a fraction of the idle timeout.
+/// How often idle sessions and stale plans are collected, as a fraction of the
+/// idle timeout.
 ///
 /// Sweeping is only about releasing what a vanished client left behind: a
 /// request that names an expired session is refused whether or not a sweep has
@@ -39,6 +42,7 @@ const SWEEPS_PER_TIMEOUT: u32 = 4;
 pub struct ControlServer {
     listener: TcpListener,
     sessions: Arc<SessionRegistry>,
+    transfers: Arc<TransferRegistry>,
     service: ControlService,
     config: Arc<ServerConfig>,
 }
@@ -50,14 +54,30 @@ impl ControlServer {
         let paths = Arc::new(PathPolicy::new(&config.paths.roots)?);
         let config = Arc::new(config);
         let sessions = Arc::new(SessionRegistry::new(config.clone()));
+        let transfers = Arc::new(TransferRegistry::new(config.clone()));
         let listener = TcpListener::bind(config.control_addr).await?;
 
         Ok(ControlServer {
             listener,
-            service: ControlService::new(sessions.clone(), paths, config.clone()),
+            service: ControlService::new(
+                sessions.clone(),
+                transfers.clone(),
+                paths,
+                config.clone(),
+            ),
             sessions,
+            transfers,
             config,
         })
+    }
+
+    /// The registry the data plane serves fetches out of.
+    pub fn transfers(&self) -> &Arc<TransferRegistry> {
+        &self.transfers
+    }
+
+    pub fn sessions(&self) -> &Arc<SessionRegistry> {
+        &self.sessions
     }
 
     /// The address actually bound, which differs from the configured one when
@@ -83,12 +103,14 @@ impl ControlServer {
         let ControlServer {
             listener,
             sessions,
+            transfers,
             service,
             config,
         } = self;
 
-        let sweeper = tokio::spawn(sweep_sessions(
+        let sweeper = tokio::spawn(sweep(
             sessions,
+            transfers,
             Duration::from_secs(
                 (config.limits.session_idle_timeout_sec / SWEEPS_PER_TIMEOUT as u64).max(1),
             ),
@@ -108,16 +130,24 @@ impl ControlServer {
     }
 }
 
-/// Collect sessions no request has touched within the idle timeout.
-async fn sweep_sessions(sessions: Arc<SessionRegistry>, period: Duration) {
+/// Collect sessions no request has touched within the idle timeout, and the
+/// plans that have gone stale or whose session went with them.
+async fn sweep(sessions: Arc<SessionRegistry>, transfers: Arc<TransferRegistry>, period: Duration) {
     let mut ticker = tokio::time::interval(period);
     // The first tick fires immediately; nothing can have expired by then.
     ticker.tick().await;
     loop {
         ticker.tick().await;
         let dropped = sessions.sweep_expired();
-        if dropped > 0 {
-            tracing::info!(dropped, "collected idle sessions");
+        // After the sessions, so that a session dropped in this same pass takes
+        // its plans with it rather than leaving them for the next one.
+        let stale = transfers.sweep(|session| sessions.contains(session));
+        if dropped > 0 || stale > 0 {
+            tracing::info!(
+                sessions = dropped,
+                transfers = stale,
+                "collected what went idle"
+            );
         }
     }
 }

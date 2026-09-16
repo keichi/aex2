@@ -228,11 +228,20 @@ impl SessionRegistry {
         Ok(session)
     }
 
-    /// Drop a session and everything it holds.
-    pub fn remove(&self, id: &[u8]) -> Result<()> {
+    /// Whether a session is still live, without counting as activity.
+    ///
+    /// Used by the transfer sweep, which must not keep a session alive merely
+    /// by asking about it.
+    pub fn contains(&self, id: &SessionId) -> bool {
+        self.sessions.contains_key(id)
+    }
+
+    /// Drop a session and everything it holds. Returns its id, so that what
+    /// hangs off a session elsewhere can go with it.
+    pub fn remove(&self, id: &[u8]) -> Result<SessionId> {
         let session = self.get(id)?;
         self.sessions.remove(&session.id);
-        Ok(())
+        Ok(session.id)
     }
 
     /// Drop every session nobody has touched within the idle timeout.
@@ -257,11 +266,11 @@ impl SessionRegistry {
     }
 }
 
-/// Unguessable bytes for a session id or token.
+/// Unguessable bytes for a session id, a token or a transfer ticket.
 ///
 /// Straight from the OS: these are capabilities, and a seeded generator would
 /// make them predictable to anyone who can watch a few of them.
-fn random_bytes<const N: usize>() -> Result<[u8; N]> {
+pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes)?;
     Ok(bytes)
@@ -302,7 +311,7 @@ mod tests {
         assert_eq!(found.id(), session.id());
         assert_eq!(found.client_name(), "test");
 
-        reg.remove(session.id()).expect("remove");
+        assert_eq!(reg.remove(session.id()).expect("remove"), *session.id());
         assert!(reg.is_empty());
         assert!(matches!(reg.get(session.id()), Err(ServerError::Auth(_))));
     }
@@ -390,6 +399,9 @@ mod tests {
         assert_eq!(reg.len(), 1);
         assert!(reg.get_at(fresh.id(), timeout_ms + 1).is_ok());
         assert!(reg.get_at(old.id(), timeout_ms + 1).is_err());
+        // Asking whether a session is live must not count as using it.
+        assert!(reg.contains(fresh.id()));
+        assert!(!reg.contains(old.id()));
     }
 
     #[test]
