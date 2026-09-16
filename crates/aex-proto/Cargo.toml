@@ -1,0 +1,18 @@
+[package]
+name = "aex-proto"
+description = "AEX2 control plane: tonic/prost code generated from protos/aex.proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+aex-core.workspace = true

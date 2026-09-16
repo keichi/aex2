@@ -24,6 +24,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # protoc generates the control plane code; prost-build does not bundle it.
+      - name: install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy

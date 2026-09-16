@@ -1,0 +1,272 @@
+syntax = "proto3";
+
+package aex.v2;
+
+// AexControl is the control plane: it decides *what* to send. Sessions, file
+// handles, metadata, and the resolution of a selection into a transfer plan.
+// The bulk data itself never passes through here; it goes over the data plane's
+// raw TCP protocol, keyed by the request_id and ticket a TransferPlan carries.
+service AexControl {
+    // --- Sessions ---
+
+    // Establishes a session and returns the data plane endpoint and the token
+    // used to authenticate data connections.
+    rpc Connect(ConnectRequest) returns (ConnectReply);
+    // Drops the session: its files, its transfer plans and its data connections.
+    rpc Disconnect(DisconnectRequest) returns (DisconnectReply);
+
+    // --- Files and metadata ---
+
+    rpc OpenFile(OpenFileRequest) returns (OpenFileReply);
+    rpc CloseFile(CloseFileRequest) returns (CloseFileReply);
+    rpc GetItem(GetItemRequest) returns (Item);
+    rpc ListChildren(ListChildrenRequest) returns (ItemList);
+
+    // --- Transfers ---
+
+    // Resolves a selection and returns a plan for fetching it. A selection small
+    // enough to fit the inline limit comes back with its data attached, so that
+    // an interactive read costs one round trip rather than two.
+    rpc PrepareSelection(PrepareSelectionRequest) returns (TransferPlan);
+    // Resolves several selections in one round trip. This is what makes gather
+    // cheaper than N separate reads.
+    rpc PrepareSelections(PrepareSelectionsRequest) returns (TransferPlanList);
+    // There is no RPC to release a transfer: plans expire on a TTL and are
+    // evicted by LRU. An explicit release would add a round trip without making
+    // anything more correct.
+
+    // --- Server-side compute ---
+
+    // Reductions produce a handful of bytes, so the result is returned inline.
+    rpc ApplyFunction(ApplyFunctionRequest) returns (ApplyFunctionReply);
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+message ConnectRequest {
+    uint32 protocol_version = 1;  // Data plane frame version; 1 in this release
+    uint32 desired_streams  = 2;  // Data connections wanted; 0 = server default
+    string client_name      = 3;  // Diagnostics only
+}
+
+// Where to reach a data plane. An empty host means the same host the control
+// plane was reached on, which keeps the server from having to guess how the
+// client addresses it.
+message DataEndpoint {
+    string host = 1;
+    uint32 port = 2;
+}
+
+message ConnectReply {
+    bytes session_id    = 1;  // 16 bytes
+    bytes session_token = 2;  // 16 bytes; authenticates each data connection
+    // One endpoint in this release. Repeated so that data held at several sites
+    // can later be served without a protocol change.
+    repeated DataEndpoint endpoints = 3;
+    uint32 granted_streams     = 4;
+    uint32 protocol_version    = 5;
+    uint64 default_chunk_bytes = 6;  // Chunk size the server recommends
+    uint32 supported_codecs    = 7;  // Bitmask: bit0=RAW, bit1=LZ4, bit2=ZSTD
+    uint32 supported_encodings = 8;  // Bitmask: bit0=EXACT, bit1=CAST, ...
+    // Ceiling on one FETCH. Fixed for the session, so it is sent once here
+    // rather than repeated in every plan.
+    uint64 max_fetch_bytes = 9;
+}
+
+message DisconnectRequest { bytes session_id = 1; }
+message DisconnectReply   {}
+
+// ---------------------------------------------------------------------------
+// Files and metadata
+// ---------------------------------------------------------------------------
+
+// The 14 element types AEX transfers. Values are shared with DType in aex-core.
+enum DataType {
+    INT8 = 0; INT16 = 1; INT32 = 2; INT64 = 3;
+    UINT8 = 4; UINT16 = 5; UINT32 = 6; UINT64 = 7;
+    FLOAT16 = 8; FLOAT32 = 9; FLOAT64 = 10;
+    COMPLEX64 = 11; COMPLEX128 = 12; BOOL = 13;
+}
+
+message Dataset {
+    DataType dtype = 1;
+    int32 ndim = 2;
+    repeated int64 shape = 3;
+}
+
+// A container. Empty: it exists to distinguish a group from a dataset.
+message Group {}
+
+message Item {
+    string name = 1;
+    oneof data {
+        Dataset dataset = 2;
+        Group group = 3;
+    }
+}
+
+message ItemList { repeated Item items = 1; }
+
+message OpenFileRequest {
+    bytes  session_id = 1;
+    string path       = 2;
+    string format     = 3;  // Empty = infer from the extension
+}
+
+// A handle is an integer rather than v1's UUID string: it is compared and
+// hashed on every request, and neither should allocate.
+message OpenFileReply  { uint64 handle = 1; }
+
+message CloseFileRequest { bytes session_id = 1; uint64 handle = 2; }
+message CloseFileReply   {}
+
+message GetItemRequest      { bytes session_id = 1; uint64 handle = 2; string name = 3; }
+message ListChildrenRequest { bytes session_id = 1; uint64 handle = 2; string name = 3; }
+
+// ---------------------------------------------------------------------------
+// Selections
+// ---------------------------------------------------------------------------
+
+message Slice {
+    optional int64 start = 1;
+    optional int64 stop  = 2;
+    optional int64 step  = 3;
+}
+
+message Fancy { repeated int64 indices = 1; }
+
+message Index {
+    oneof kind {
+        int64 single   = 1;  // arr[5]
+        Slice slice    = 2;  // arr[10:20:2]
+        Fancy fancy    = 3;  // arr[[1, 5, 10]]
+        bool  ellipsis = 4;  // arr[...]
+        bool  newaxis  = 5;  // arr[None]
+        // A boolean mask is expanded to integer indices by the client: a sparse
+        // mask can be larger on the wire than the selection it describes.
+        Fancy mask_true_indices = 6;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quality
+// ---------------------------------------------------------------------------
+
+enum Encoding {
+    EXACT       = 0;  // Lossless. The only one implemented so far
+    DTYPE_CAST  = 1;  // float64 -> float32/float16, etc.
+    SUBSAMPLE   = 2;  // Per-axis stride
+    ERROR_BOUND = 3;  // Error-bounded lossy compression (ZFP, SZ, ...)
+}
+
+// What the client asks for. A server that cannot honour it falls back to EXACT
+// and reports what it did in TransferPlan.applied_quality, so that a newer
+// client and an older server never fail to talk to each other.
+message QualitySpec {
+    Encoding encoding = 1;
+    optional DataType cast_dtype = 2;      // For DTYPE_CAST
+    repeated int64 subsample_step = 3;     // For SUBSAMPLE, one per axis
+    optional double abs_error_bound = 4;   // For ERROR_BOUND
+    optional double rel_error_bound = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Transfers
+// ---------------------------------------------------------------------------
+
+message PrepareSelectionRequest {
+    bytes  session_id = 1;
+    uint64 handle     = 2;
+    string name       = 3;
+    repeated Index indices = 4;
+    QualitySpec requested_quality = 5;
+    uint32 requested_codec = 6;  // 0 = RAW
+}
+
+message TransferPlan {
+    uint32 request_id = 1;  // Identifies this transfer on the data plane
+    bytes  ticket     = 2;  // 16 bytes; the capability for this transfer
+    DataType dtype    = 3;  // What is actually transferred, after any fallback
+    repeated int64 shape = 4;
+    uint64 total_bytes = 5;  // Length of the logical byte stream, uncompressed
+    uint32 codec       = 6;
+    QualitySpec applied_quality = 7;
+
+    // Valid until this instant. Every FETCH pushes it further out, so a plan
+    // expires only if the client really did go quiet.
+    uint64 expires_unix_ms = 8;
+
+    // Set when total_bytes fits the server's inline limit. The client is then
+    // done: no ticket is issued and the data plane is not used at all.
+    bytes inline_data = 9;
+}
+
+message PrepareSelectionsRequest {
+    bytes session_id = 1;
+    repeated PrepareSelectionRequest requests = 2;  // Per-element session_id is ignored
+}
+
+// Same order and length as the requests. One selection being out of range is
+// ordinary in numpy, so it must not fail the whole batch.
+message TransferPlanList { repeated TransferPlanOrError results = 1; }
+
+message TransferPlanOrError {
+    oneof result {
+        TransferPlan plan  = 1;
+        PlanError    error = 2;
+    }
+}
+
+// Mirrors the data plane's ERROR frame and the status byte in READY. Control
+// plane errors use the gRPC Status instead; this exists because a batch RPC
+// carries one Status but N outcomes.
+enum ErrorClass {
+    OK        = 0;
+    PROTOCOL  = 1;  // Malformed frame or handshake
+    AUTH      = 2;  // Bad or expired session, token or ticket
+    PLAN      = 3;  // Unknown or expired transfer plan
+    REQUEST   = 4;  // Out of range, over a limit, unsupported format
+    TRANSIENT = 5;  // Temporary server-side condition; worth retrying
+    PERMANENT = 6;  // Permanent server-side condition
+}
+
+message PlanError {
+    ErrorClass klass = 1;
+    string message = 2;  // Diagnostics for a human; never branch on it
+}
+
+// ---------------------------------------------------------------------------
+// Server-side compute
+// ---------------------------------------------------------------------------
+
+message IntTuple { repeated int64 values = 1; }
+
+message FunctionArgument {
+    oneof value {
+        int64    int_value   = 1;
+        double   float_value = 2;
+        bool     bool_value  = 3;
+        bool     none_value  = 4;
+        IntTuple tuple_int   = 5;
+    }
+}
+
+message ApplyFunctionRequest {
+    bytes  session_id = 1;
+    uint64 handle     = 2;
+    string name       = 3;
+    string function_name = 4;
+    map<string, FunctionArgument> kwargs = 5;
+    // Reduce over a selection rather than the whole dataset: np.sum(arr[0:100])
+    // should read 100 rows, not the file.
+    repeated Index indices = 6;
+}
+
+message ApplyFunctionReply {
+    DataType dtype = 1;
+    repeated int64 shape = 2;
+    bytes data = 3;                 // Set when the result fits the inline limit
+    optional TransferPlan plan = 4; // For results that do not; unused so far
+}

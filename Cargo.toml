@@ -1,16 +1,27 @@
 [workspace]
 resolver = "2"
-members = ["crates/aex-core"]
+members = [
+    "crates/aex-core",
+    "crates/aex-proto",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 repository = "https://github.com/keichi/aex2"
 
 [workspace.dependencies]
+aex-core = { path = "crates/aex-core" }
+aex-proto = { path = "crates/aex-proto" }
+
 npyz = "0.9"
+prost = "0.14"
 thiserror = "2"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+
 tempfile = "3"
 
 [profile.release]
