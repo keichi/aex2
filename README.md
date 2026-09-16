@@ -11,25 +11,58 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 
 ## 状態
 
-**M0 (足場) まで実装済み。** 現時点で動くのは `aex-core` の以下の部分である。
+**M1 (コントロールプレーン) まで実装済み。** Rust クライアントからサーバに接続し、
+`.npy` のメタデータを取得できる。
 
-- `DType` — AEX の 14 要素型と numpy `descr` の相互変換
-- `ErrorClass` / `AexError` — SPEC §5.6 の 6 クラスによるエラー分類
-- `NpyFile` — `.npy` のヘッダ解析 (shape / dtype / データ開始位置) と、
-  `pread` による論理バイト列の範囲読み出し
+- `aex-core` — `DType` (14 要素型と numpy `descr` の相互変換)、`ErrorClass` /
+  `AexError` (SPEC §5.6 の 6 クラス)、`ArrayFile` / `ArrayDataset` トレイト、
+  `.npy` バックエンド (ヘッダ解析と `pread` による範囲読み出し)
+- `aex-proto` — `protos/aex.proto` から tonic/prost が生成するコード。proto は
+  SPEC §5 の全定義を含む
+- `aex-server` — `Connect` / `Disconnect` / `OpenFile` / `CloseFile` /
+  `GetItem` / `ListChildren`、セッションとファイルのレジストリ、データルート
+  によるパス制限、SPEC §8.2 の設定ファイル
+- `aex-client` — 同期 API の Rust クライアント (内部に tokio ランタイムを持つ)
 
-サーバ、クライアント、Python バインディングはまだない (M1 以降)。
+データ転送 (`PrepareSelection` / データプレーン) と Python バインディングは
+まだない。転送系の RPC は `UNIMPLEMENTED` を返す。
 
 ## ビルドとテスト
 
+`protoc` が必要である (`brew install protobuf` / `apt install protobuf-compiler`)。
+
 ```console
 $ cargo test
-$ cargo clippy --all-targets -- -D warnings
+$ cargo clippy --all-targets --all-features -- -D warnings
 $ cargo fmt --all -- --check
 ```
 
 デバッグとリリースで挙動が変わる箇所 (オーバーフロー検査) があるため、CI は
 `cargo test` を両プロファイルで実行する。
+
+## 使い方
+
+```console
+$ aex-server --control-addr 127.0.0.1:50051 --root /path/to/data
+```
+
+設定ファイルを渡すこともできる (指定しなかった項目は既定値のまま)。項目は
+SPEC §8.2 を参照のこと。
+
+```console
+$ aex-server --config server.toml
+```
+
+```rust
+use aex_client::{Client, ClientConfig, Item};
+
+let client = Client::connect("http://127.0.0.1:50051", ClientConfig::default())?;
+let handle = client.open("ocean.npy")?;           // データルート配下の相対パス
+if let Item::Dataset(info) = client.get_item(handle, "array")? {
+    println!("{:?} {:?}", info.dtype, info.shape);
+}
+client.disconnect()?;
+```
 
 ## 前提と制約
 
@@ -42,8 +75,13 @@ $ cargo fmt --all -- --check
 ## リポジトリ構成
 
 ```
+protos/aex.proto   コントロールプレーンの定義
 crates/aex-core/   共通型とバックエンド (tokio / tonic に依存しない)
+crates/aex-proto/  aex.proto から生成されるコード
+crates/aex-server/ サーバ (コントロールプレーン)
+crates/aex-client/ Rust クライアント
+tests/rust/        サーバとクライアントを同一プロセスで動かす統合テスト
 ```
 
-M1 以降で `aex-wire` / `aex-proto` / `aex-server` / `aex-client` / `aex-py` と
-`python/` / `protos/` / `benchmarks/` が加わる (SPEC §4)。
+M2 以降で `aex-wire` (データプレーンのフレーム)、M3 で `aex-py` と `python/` が
+加わる (SPEC §4)。
