@@ -137,6 +137,24 @@ impl AxisSel {
     }
 }
 
+/// The axes numpy walks in step rather than independently.
+///
+/// An index array turns the whole selection into an advanced one: every plain
+/// integer sitting alongside it joins the same group, the group is broadcast
+/// together, and it contributes **one** dimension to the result rather than one
+/// per axis. `arr[[0, 2], [1, 3]]` picks two elements, not four.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Advanced {
+    /// Source axes in the group, in axis order.
+    pub axes: Vec<usize>,
+    /// Length of the dimension they contribute between them.
+    pub len: u64,
+    /// Whether they sit next to each other in the selection. When they do not,
+    /// numpy moves their dimension to the front of the result, because there is
+    /// no one place among the axes they were taken from that it belongs.
+    pub adjacent: bool,
+}
+
 /// A selection normalised against a shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSelection {
@@ -144,26 +162,86 @@ pub struct ResolvedSelection {
     pub axes: Vec<AxisSel>,
     /// The shape of the result, with the axes `NewAxis` inserted.
     pub out_shape: Vec<u64>,
+    /// The advanced group, when the selection contains an index array.
+    pub advanced: Option<Advanced>,
 }
 
 impl ResolvedSelection {
     /// Number of elements selected.
+    ///
+    /// Taken from the output shape rather than from the axes, because the axes
+    /// of an advanced group are walked in step: multiplying their lengths would
+    /// count the elements `arr[[0, 2], [1, 3]]` does *not* select.
     pub fn num_elements(&self) -> u64 {
-        // Every axis length is at most its dimension, so the product of the
-        // axis lengths is at most the number of elements in the array.
-        self.axes.iter().map(|axis| axis.len()).product()
+        self.out_shape.iter().product()
     }
+}
+
+/// One position in a selection, after the ellipsis has been expanded.
+enum Entry {
+    /// Consumes a source axis.
+    Axis {
+        sel: AxisSel,
+        /// Whether this is part of the advanced group.
+        advanced: bool,
+    },
+    /// Inserts a length-1 axis and consumes nothing.
+    New,
 }
 
 /// Normalise `indices` against `shape`.
 ///
 /// Rejects what numpy rejects — an index off the end, more indices than the
-/// array has axes, a second `Ellipsis`, a zero step — with the same meaning,
-/// since the client is a numpy user either way.
+/// array has axes, a second `Ellipsis`, a zero step, index arrays that will not
+/// broadcast — with the same meaning, since the client is a numpy user either
+/// way.
 pub fn resolve(shape: &[u64], indices: &[Index]) -> Result<ResolvedSelection> {
+    let entries = expand(shape, indices)?;
+
+    let mut axes = Vec::with_capacity(shape.len());
+    let mut group = Vec::new();
+    let mut positions = Vec::new();
+    let mut lengths = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if let Entry::Axis { sel, advanced } = entry {
+            if *advanced {
+                group.push(axes.len());
+                positions.push(position);
+                if let AxisSel::Fancy(list) = sel {
+                    // A plain integer is a scalar and broadcasts against
+                    // anything, so only the arrays constrain the length.
+                    lengths.push(list.len() as u64);
+                }
+            }
+            axes.push(sel.clone());
+        }
+    }
+
+    let advanced = if group.is_empty() {
+        None
+    } else {
+        Some(Advanced {
+            axes: group,
+            len: broadcast_len(&lengths)?,
+            adjacent: positions.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        })
+    };
+
+    Ok(ResolvedSelection {
+        out_shape: out_shape(&entries, advanced.as_ref(), positions.first().copied()),
+        axes,
+        advanced,
+    })
+}
+
+/// Expand the ellipsis and the axes the selection leaves out.
+fn expand(shape: &[u64], indices: &[Index]) -> Result<Vec<Entry>> {
     let ndim = shape.len();
     let mut consuming = 0usize;
     let mut has_ellipsis = false;
+    // An index array makes the whole selection advanced, which is what pulls
+    // the plain integers into the group with it.
+    let mut has_array = false;
     for index in indices {
         match index {
             Index::Ellipsis => {
@@ -175,6 +253,9 @@ pub fn resolve(shape: &[u64], indices: &[Index]) -> Result<ResolvedSelection> {
                 has_ellipsis = true;
             }
             other => {
+                if matches!(other, Index::Fancy(_)) {
+                    has_array = true;
+                }
                 if other.consumes_axis() {
                     consuming += 1;
                 }
@@ -191,42 +272,98 @@ pub fn resolve(shape: &[u64], indices: &[Index]) -> Result<ResolvedSelection> {
     // end when there is none.
     let implied = ndim - consuming;
 
-    let mut axes = Vec::with_capacity(ndim);
-    let mut out_shape = Vec::with_capacity(indices.len() + implied);
+    let mut entries = Vec::with_capacity(indices.len() + implied);
     let mut axis = 0usize;
+    let whole = |axis: usize| Entry::Axis {
+        sel: AxisSel::whole(shape[axis]),
+        advanced: false,
+    };
     for index in indices {
         match index {
-            Index::NewAxis => out_shape.push(1),
+            Index::NewAxis => entries.push(Entry::New),
             Index::Ellipsis => {
                 for _ in 0..implied {
-                    axes.push(AxisSel::whole(shape[axis]));
-                    out_shape.push(shape[axis]);
+                    entries.push(whole(axis));
                     axis += 1;
                 }
             }
             other => {
-                let selected = resolve_axis(other, shape[axis], axis)?;
-                if let Some(len) = selected.out_len() {
-                    out_shape.push(len);
-                }
-                axes.push(selected);
+                entries.push(Entry::Axis {
+                    sel: resolve_axis(other, shape[axis], axis)?,
+                    advanced: has_array && matches!(other, Index::Single(_) | Index::Fancy(_)),
+                });
                 axis += 1;
             }
         }
     }
     if !has_ellipsis {
         for _ in 0..implied {
-            axes.push(AxisSel::whole(shape[axis]));
-            out_shape.push(shape[axis]);
+            entries.push(whole(axis));
             axis += 1;
         }
     }
     debug_assert_eq!(axis, ndim);
 
-    Ok(ResolvedSelection { axes, out_shape })
+    Ok(entries)
 }
 
-/// Normalise one index against one axis.
+/// The shape of the result.
+///
+/// The advanced group contributes its one dimension where its first axis was,
+/// unless a slice or a new axis came between its members, in which case numpy
+/// puts it at the front instead.
+fn out_shape(entries: &[Entry], advanced: Option<&Advanced>, first: Option<usize>) -> Vec<u64> {
+    let mut shape = Vec::with_capacity(entries.len() + 1);
+    if let Some(advanced) = advanced {
+        if !advanced.adjacent {
+            shape.push(advanced.len);
+        }
+    }
+    for (position, entry) in entries.iter().enumerate() {
+        match entry {
+            Entry::New => shape.push(1),
+            Entry::Axis { advanced: true, .. } => {
+                if let Some(advanced) = advanced {
+                    if advanced.adjacent && Some(position) == first {
+                        shape.push(advanced.len);
+                    }
+                }
+            }
+            Entry::Axis {
+                sel,
+                advanced: false,
+            } => {
+                if let Some(len) = sel.out_len() {
+                    shape.push(len);
+                }
+            }
+        }
+    }
+    shape
+}
+
+/// Broadcast the index arrays of an advanced group against each other.
+///
+/// One-dimensional throughout, since that is all an index can be on the wire,
+/// so this is the whole of numpy's broadcasting here: a length of 1 stretches
+/// to meet anything, and everything else has to agree.
+fn broadcast_len(lengths: &[u64]) -> Result<u64> {
+    let mut result = 1u64;
+    for &len in lengths {
+        if len == 1 {
+            continue;
+        }
+        if result != 1 && result != len {
+            return Err(AexError::BadSelection(format!(
+                "index arrays of lengths {lengths:?} cannot be broadcast together"
+            )));
+        }
+        result = len;
+    }
+    Ok(result)
+}
+
+/// Normalise one index against one axis./// Normalise one index against one axis.
 fn resolve_axis(index: &Index, dim: u64, axis: usize) -> Result<AxisSel> {
     let dim_i64 = i64::try_from(dim).map_err(|_| {
         AexError::BadSelection(format!(
@@ -374,6 +511,7 @@ impl SelectionLayout {
         }
 
         let resolved = resolve(shape, indices)?;
+        check_advanced(&resolved)?;
         let num_elements = resolved.num_elements();
         let total_bytes = num_elements.checked_mul(dtype.itemsize()).ok_or_else(|| {
             AexError::BadSelection(format!(
@@ -413,6 +551,40 @@ impl SelectionLayout {
         }
         Ok(())
     }
+}
+
+/// Refuse an advanced group this release cannot lay out.
+///
+/// The axes of a group are walked in step, and [`contiguous_run`] walks them
+/// independently. The two agree only when at most one of them takes more than
+/// one index, and when the group's dimension has not been moved to the front —
+/// otherwise the result is a different set of elements, or the same elements in
+/// a different order, and serving it would be worse than refusing it.
+fn check_advanced(resolved: &ResolvedSelection) -> Result<()> {
+    let Some(advanced) = &resolved.advanced else {
+        return Ok(());
+    };
+
+    if !advanced.adjacent {
+        return Err(AexError::UnsupportedSelection(
+            "an index array separated from another index by a slice reorders the result, \
+             which is not implemented yet"
+                .to_string(),
+        ));
+    }
+    let walked: usize = advanced
+        .axes
+        .iter()
+        .filter(|&&axis| resolved.axes[axis].len() > 1)
+        .count();
+    if walked > 1 {
+        return Err(AexError::UnsupportedSelection(
+            "advanced indexing over more than one axis picks elements pairwise rather than \
+             as a grid, which is not implemented yet"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// The one run of source elements a selection covers, if it is one.
@@ -785,6 +957,242 @@ mod tests {
         assert!(layout.check_range(40, 1).is_err());
         // Offset plus length overflowing must not wrap into a valid range.
         assert!(layout.check_range(u64::MAX, 8).is_err());
+    }
+
+    #[test]
+    fn advanced_indexing_matches_numpy() {
+        // An index array makes the whole selection advanced: the integers
+        // beside it join the group, the group broadcasts to one dimension, and
+        // that dimension goes where the group was — or at the front, if a slice
+        // came between its members. Every line here was checked against numpy.
+        let cases: Vec<(&[u64], Vec<Index>, Vec<u64>)> = vec![
+            // One array, on its own: the axes it does not name are untouched.
+            (&[4, 5, 6], vec![Index::Fancy(vec![0, 1])], vec![2, 5, 6]),
+            (
+                &[4, 5, 6],
+                vec![Index::full(), Index::Fancy(vec![0, 1])],
+                vec![4, 2, 6],
+            ),
+            // Two arrays side by side pick pairwise, not as a grid.
+            (
+                &[4, 5, 6],
+                vec![Index::Fancy(vec![0, 1]), Index::Fancy(vec![2, 3])],
+                vec![2, 6],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::Fancy(vec![0]), Index::Fancy(vec![1])],
+                vec![1, 6],
+            ),
+            (
+                &[4, 5, 6],
+                vec![
+                    Index::Fancy(vec![0, 1, 2]),
+                    Index::Fancy(vec![0, 1, 2]),
+                    Index::Fancy(vec![0, 1, 2]),
+                ],
+                vec![3],
+            ),
+            // A length of one stretches to meet the others.
+            (
+                &[4, 5, 6],
+                vec![Index::Fancy(vec![0]), Index::Fancy(vec![1, 2])],
+                vec![2, 6],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::Fancy(vec![0, 1]), Index::Fancy(vec![2])],
+                vec![2, 6],
+            ),
+            // An integer beside an array is part of the same group, so it adds
+            // no dimension of its own and does not break the group up.
+            (
+                &[4, 5, 6],
+                vec![Index::Fancy(vec![0, 1]), Index::Single(2)],
+                vec![2, 6],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::Single(2), Index::Fancy(vec![0, 1])],
+                vec![2, 6],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::Single(0), Index::Fancy(vec![1, 2]), Index::Single(3)],
+                vec![2],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::full(), Index::Fancy(vec![0, 1]), Index::Single(2)],
+                vec![4, 2],
+            ),
+            // Separated by a slice: the dimension moves to the front.
+            (
+                &[4, 5, 6],
+                vec![
+                    Index::Fancy(vec![0, 1]),
+                    Index::full(),
+                    Index::Fancy(vec![2, 3]),
+                ],
+                vec![2, 5],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::Single(0), Index::full(), Index::Fancy(vec![1, 2])],
+                vec![2, 5],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::Fancy(vec![1, 2]), Index::full(), Index::Single(0)],
+                vec![2, 5],
+            ),
+            // Adjacent, so it stays where it was.
+            (
+                &[4, 5, 6],
+                vec![Index::full(), Index::Single(0), Index::Fancy(vec![1, 2])],
+                vec![4, 2],
+            ),
+            // An ellipsis that stands for an axis separates; one that stands
+            // for nothing does not.
+            (
+                &[4, 5, 6],
+                vec![
+                    Index::Fancy(vec![0, 1]),
+                    Index::Ellipsis,
+                    Index::Fancy(vec![2, 3]),
+                ],
+                vec![2, 5],
+            ),
+            (
+                &[4, 5, 6, 7],
+                vec![
+                    Index::Fancy(vec![0, 1]),
+                    Index::Ellipsis,
+                    Index::Fancy(vec![2, 3]),
+                ],
+                vec![2, 5, 6],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::Ellipsis, Index::Fancy(vec![0, 1])],
+                vec![4, 5, 2],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::Fancy(vec![0, 1]), Index::Ellipsis],
+                vec![2, 5, 6],
+            ),
+            // A new axis separates too, and keeps its own place.
+            (
+                &[4, 5, 6],
+                vec![
+                    Index::Fancy(vec![0, 1]),
+                    Index::NewAxis,
+                    Index::Fancy(vec![2, 3]),
+                ],
+                vec![2, 1, 6],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::Fancy(vec![0, 1]), Index::NewAxis],
+                vec![2, 1, 5, 6],
+            ),
+            (
+                &[4, 5, 6],
+                vec![Index::NewAxis, Index::Fancy(vec![0, 1])],
+                vec![1, 2, 5, 6],
+            ),
+            // An empty array selects nothing, and broadcasts against a scalar.
+            (&[4, 5, 6], vec![Index::Fancy(vec![])], vec![0, 5, 6]),
+            (
+                &[4, 5, 6],
+                vec![Index::Fancy(vec![]), Index::Fancy(vec![1])],
+                vec![0, 6],
+            ),
+            // No array at all, so the integers stay ordinary and drop their axes.
+            (
+                &[4, 5, 6],
+                vec![Index::Single(0), Index::full(), Index::Single(1)],
+                vec![5],
+            ),
+        ];
+
+        for (shape, indices, expected) in cases {
+            let resolved = resolve(shape, &indices)
+                .unwrap_or_else(|e| panic!("{indices:?} on {shape:?}: {e}"));
+            assert_eq!(resolved.out_shape, expected, "{indices:?} on {shape:?}");
+            // The element count has to follow the shape, not the axes: the axes
+            // of a group are walked in step.
+            assert_eq!(
+                resolved.num_elements(),
+                expected.iter().product::<u64>(),
+                "{indices:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn index_arrays_that_cannot_broadcast_are_rejected() {
+        // numpy raises IndexError here, and so must this.
+        let err = resolve(
+            &[4, 5, 6],
+            &[Index::Fancy(vec![0, 1]), Index::Fancy(vec![2, 3, 4])],
+        )
+        .unwrap_err();
+        assert!(matches!(err, AexError::BadSelection(_)), "{err}");
+        assert_eq!(err.class(), crate::ErrorClass::Request);
+
+        // Lengths of one stretch, so these do broadcast.
+        resolve(&[4, 5], &[Index::Fancy(vec![0]), Index::Fancy(vec![1, 3])]).expect("broadcasts");
+    }
+
+    #[test]
+    fn an_advanced_group_this_release_cannot_lay_out_is_refused() {
+        // Two axes walked in step pick elements pairwise; the layout walks axes
+        // independently, so serving this would return a different set.
+        let err = layout(
+            &[4, 5],
+            DType::Int8,
+            &[Index::Fancy(vec![0, 2]), Index::Fancy(vec![1, 3])],
+        )
+        .unwrap_err();
+        assert!(matches!(err, AexError::UnsupportedSelection(_)), "{err}");
+
+        // A group split by a slice has its dimension moved to the front, which
+        // reorders the bytes.
+        let err = layout(
+            &[4, 5, 6],
+            DType::Int8,
+            &[Index::Single(0), Index::full(), Index::Fancy(vec![1, 2])],
+        )
+        .unwrap_err();
+        assert!(matches!(err, AexError::UnsupportedSelection(_)), "{err}");
+
+        // One axis of the group taking more than one index is fine: walking in
+        // step and walking independently agree, and the bytes are one run.
+        let served = layout(
+            &[4, 5],
+            DType::Int8,
+            &[Index::Single(1), Index::Fancy(vec![0, 1])],
+        )
+        .expect("one array and one integer, side by side");
+        assert_eq!(served.out_shape, vec![2]);
+        assert_eq!(
+            served.kind,
+            LayoutKind::Contiguous {
+                src_offset: 5,
+                len: 2
+            }
+        );
+
+        // And so is a group that only ever names one element.
+        let served = layout(
+            &[4, 5],
+            DType::Int8,
+            &[Index::Fancy(vec![0]), Index::Fancy(vec![1])],
+        )
+        .expect("both arrays hold one index");
+        assert_eq!(served.out_shape, vec![1], "numpy gives (1,), not (1, 1)");
     }
 
     #[test]
