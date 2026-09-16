@@ -48,9 +48,13 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
 ([M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
-[sendfile を採らない理由](docs/sendfile.md))。メモリ上のデータで単一接続
-12,048 MiB/s (iPerf3 の 62 %)、ストレージを経路から外すと 15,791 MiB/s (同 81 %)、
-ディスク上のデータでは `pread` の限界近く。
+[sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
+[docs/benchmark-linux.md](docs/benchmark-linux.md) にある。
+
+macOS (M4) ではメモリ上のデータで単一接続 12,048 MiB/s (iPerf3 の 62 %)、Linux
+(Ryzen 9 5900X) では 6,694 MiB/s。どちらでもダブルバッファリングが 50 % 以上効く。
+**Linux では読みスレッドと送りスレッドを同じ L3 に載せるかどうかで 36 % 変わる**
+(未対応)。
 
 ## 転送の流れ
 
@@ -84,6 +88,10 @@ $ cargo fmt --all -- --check
 
 デバッグとリリースで挙動が変わる箇所 (オーバーフロー検査) があるため、CI は
 `cargo test` を両プロファイルで実行する。
+
+`protoc` は **3.15 以降**が要る (proto3 の optional フィールドを使うため)。
+Ubuntu 22.04 の `protobuf-compiler` は 3.12 なので、
+[公式リリース](https://github.com/protocolbuffers/protobuf/releases) から入れること。
 
 ## 使い方
 

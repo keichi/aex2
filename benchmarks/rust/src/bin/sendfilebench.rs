@@ -9,6 +9,12 @@
 //! pieces, each preceded by a 32-byte header, and differ only in how the
 //! payload gets there. Over loopback there is no network card to hand the
 //! pages to, so this measures the saved copy and nothing else.
+//!
+//! The call differs by system. macOS takes the header in the same call and
+//! counts its length toward the length to send; Linux has no room for a header
+//! at all, so it goes first under `MSG_MORE` to keep it in the same segment.
+//! That is two syscalls a piece either way — `writev` needs only one — which is
+//! part of what is being compared.
 
 use std::fs::File;
 use std::io::{IoSlice, Read, Write};
@@ -208,6 +214,7 @@ fn write_all_vectored(
 /// macOS counts the header toward the length to send, unlike FreeBSD where the
 /// two are separate, so the call asks for both together. The socket is
 /// blocking, so a successful call has sent all of it.
+#[cfg(target_os = "macos")]
 fn send_file(
     file: &File,
     stream: &TcpStream,
@@ -243,4 +250,63 @@ fn send_file(
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Send `len` bytes of `file` from `offset`, with `header` in front of them.
+///
+/// Linux's `sendfile` carries only the file, so the header goes first under
+/// `MSG_MORE`, which holds it back until the payload joins it rather than
+/// pushing a 32-byte segment on its own.
+#[cfg(target_os = "linux")]
+fn send_file(
+    file: &File,
+    stream: &TcpStream,
+    offset: i64,
+    len: usize,
+    header: &[u8],
+) -> std::io::Result<()> {
+    // SAFETY: the socket is open for the call and the header outlives it.
+    let sent = unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            header.as_ptr() as *const libc::c_void,
+            header.len(),
+            libc::MSG_MORE,
+        )
+    };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if sent as usize != header.len() {
+        return Err(std::io::ErrorKind::WriteZero.into());
+    }
+
+    let mut at = offset as libc::off_t;
+    let mut left = len;
+    while left > 0 {
+        // SAFETY: both descriptors are open, and `at` outlives the call.
+        let n = unsafe { libc::sendfile(stream.as_raw_fd(), file.as_raw_fd(), &mut at, left) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        left -= n as usize;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn send_file(
+    _file: &File,
+    _stream: &TcpStream,
+    _offset: i64,
+    _len: usize,
+    _header: &[u8],
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "sendfile is only wired up for macOS and Linux",
+    ))
 }
