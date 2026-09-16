@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/aex-core",
     "crates/aex-proto",
+    "crates/aex-server",
 ]
 
 [workspace.package]
@@ -15,12 +16,21 @@ repository = "https://github.com/keichi/aex2"
 aex-core = { path = "crates/aex-core" }
 aex-proto = { path = "crates/aex-proto" }
 
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+getrandom = "0.4"
 npyz = "0.9"
 prost = "0.14"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tokio = "1"
+tokio-stream = { version = "0.1", features = ["net"] }
+toml = "1"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 tempfile = "3"
 
