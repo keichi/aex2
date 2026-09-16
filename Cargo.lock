@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "aex-client"
+version = "0.1.0"
+dependencies = [
+ "aex-core",
+ "aex-proto",
+ "thiserror",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "aex-core"
 version = "0.1.0"
 dependencies = [
@@ -40,6 +51,18 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aex-tests"
+version = "0.1.0"
+dependencies = [
+ "aex-client",
+ "aex-core",
+ "aex-server",
+ "npyz",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

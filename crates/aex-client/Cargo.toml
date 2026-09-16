@@ -1,0 +1,14 @@
+[package]
+name = "aex-client"
+description = "AEX2 Rust client. Usable on its own, and the base of the Python bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+aex-core.workspace = true
+aex-proto.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tonic.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "aex-tests"
+description = "AEX2 integration tests: server and client in one process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+# No library and no binary: this package exists only to hold the integration
+# tests, which are listed explicitly so that they can sit in this directory
+# rather than a nested tests/.
+autolib = false
+autobins = false
+autotests = false
+
+[dev-dependencies]
+aex-client.workspace = true
+aex-core.workspace = true
+aex-server.workspace = true
+npyz.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+
+[[test]]
+name = "control_plane"
+path = "control_plane.rs"

@@ -4,6 +4,8 @@ members = [
     "crates/aex-core",
     "crates/aex-proto",
     "crates/aex-server",
+    "crates/aex-client",
+    "tests/rust",
 ]
 
 [workspace.package]
@@ -13,6 +15,8 @@ rust-version = "1.85"
 repository = "https://github.com/keichi/aex2"
 
 [workspace.dependencies]
+aex-client = { path = "crates/aex-client" }
+aex-server = { path = "crates/aex-server" }
 aex-core = { path = "crates/aex-core" }
 aex-proto = { path = "crates/aex-proto" }
 
