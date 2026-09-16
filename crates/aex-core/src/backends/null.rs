@@ -10,6 +10,12 @@
 //! `.npy` backend is what reading the data costs; the difference between this
 //! and `iperf3` is what the protocol costs.
 //!
+//! The pattern's length is part of the specification, which makes it an
+//! instrument for a second question: a pattern that fits in cache costs almost
+//! nothing to read, and one much larger than cache has to be fetched from
+//! memory like any real data. The difference between the two is what reading
+//! costs, with no filesystem anywhere near it.
+//!
 //! It serves data that was never stored anywhere, so a server only offers it
 //! when explicitly told to. It is a measuring instrument, not a format.
 
@@ -23,12 +29,16 @@ use crate::selection::{LayoutKind, SelectionLayout};
 /// Name of the one dataset, matching what the other backends call theirs.
 pub const DATASET_NAME: &str = "array";
 
-/// Length of the repeating pattern.
+/// Length of the repeating pattern unless the specification says otherwise.
 ///
-/// Small enough to sit in cache — the point is that reading it costs as close
-/// to nothing as a real read can — and a power of two, so that the byte at any
-/// position in the logical stream is just the low byte of that position.
-const PERIOD: usize = 64 * 1024;
+/// Small enough to sit in cache, so that reading it costs as close to nothing
+/// as a real read can.
+const DEFAULT_PERIOD: u64 = 64 * 1024;
+
+/// The pattern repeats on a multiple of 256 whatever its length, so that the
+/// byte at any position in the logical stream is the low byte of that position
+/// and a caller can check what arrived without holding a copy of it.
+const PERIOD_MULTIPLE: u64 = 256;
 
 /// A dataset that answers from a pattern rather than from storage.
 #[derive(Debug)]
@@ -36,23 +46,37 @@ pub struct NullDataset {
     dtype: DType,
     shape: Vec<u64>,
     data_len: u64,
-    /// `pattern[i] == i as u8`, so the byte at stream position `p` is `p as u8`
-    /// and a caller can check what arrived without holding a copy of it.
+    /// `pattern[i] == i as u8`.
     pattern: Vec<u8>,
 }
 
 impl NullDataset {
-    /// Build one from a specification: `<dtype>:<dim>[x<dim>...]`.
+    /// Build one from a specification: `<dtype>:<dim>[x<dim>...][@<period>]`.
     ///
     /// For instance `float32:1000x200`, or `uint8:4294967296` for a stream of a
-    /// given number of bytes.
+    /// given number of bytes. `@<period>` sets the length of the pattern the
+    /// reads come from: leave it out and they come from cache, set it far above
+    /// the cache and they come from memory like any real data would.
     pub fn from_spec(spec: &str) -> Result<Self> {
         let bad = |what: &str| {
             AexError::BadSelection(format!(
                 "{spec:?} is not a synthetic dataset: {what}. Write it as \
-                 <dtype>:<dim>[x<dim>...], such as float32:1000x200"
+                 <dtype>:<dim>[x<dim>...][@<period>], such as float32:1000x200"
             ))
         };
+
+        let (spec, period) = match spec.split_once('@') {
+            Some((spec, period)) => (
+                spec,
+                period
+                    .parse::<u64>()
+                    .map_err(|_| bad("the period is not a number"))?,
+            ),
+            None => (spec, DEFAULT_PERIOD),
+        };
+        if period == 0 || period % PERIOD_MULTIPLE != 0 {
+            return Err(bad("the period must be a positive multiple of 256"));
+        }
 
         let (dtype, shape) = spec.split_once(':').ok_or_else(|| bad("no ':'"))?;
         let dtype = dtype_from_name(dtype).ok_or_else(|| bad("unknown dtype"))?;
@@ -64,10 +88,15 @@ impl NullDataset {
             })
             .collect::<Result<Vec<u64>>>()?;
 
-        Self::new(dtype, shape)
+        Self::with_period(dtype, shape, period)
     }
 
     pub fn new(dtype: DType, shape: Vec<u64>) -> Result<Self> {
+        Self::with_period(dtype, shape, DEFAULT_PERIOD)
+    }
+
+    /// Build one whose reads come from a pattern of the given length.
+    pub fn with_period(dtype: DType, shape: Vec<u64>, period: u64) -> Result<Self> {
         let elements = shape.iter().try_fold(1u64, |acc, &n| acc.checked_mul(n));
         let data_len = elements
             .and_then(|elements| elements.checked_mul(dtype.itemsize()))
@@ -77,11 +106,17 @@ impl NullDataset {
                 ))
             })?;
 
+        let period = usize::try_from(period).map_err(|_| {
+            AexError::BadSelection(format!(
+                "a pattern of {period} bytes does not fit in memory"
+            ))
+        })?;
+
         Ok(NullDataset {
             dtype,
             shape,
             data_len,
-            pattern: (0..PERIOD).map(|i| i as u8).collect(),
+            pattern: (0..period).map(|i| i as u8).collect(),
         })
     }
 
@@ -90,14 +125,19 @@ impl NullDataset {
         self.data_len
     }
 
+    /// Length of the pattern the reads come from.
+    pub fn period(&self) -> usize {
+        self.pattern.len()
+    }
+
     /// Fill `dst` with what stands at `at` in the stream.
     fn fill(&self, at: u64, dst: &mut [u8]) {
+        let period = self.pattern.len();
         let mut written = 0;
         while written < dst.len() {
-            // The pattern repeats every PERIOD bytes, so this is where in it
-            // the next stretch begins.
-            let start = ((at + written as u64) % PERIOD as u64) as usize;
-            let run = (PERIOD - start).min(dst.len() - written);
+            // Where in the pattern the next stretch begins.
+            let start = ((at + written as u64) % period as u64) as usize;
+            let run = (period - start).min(dst.len() - written);
             dst[written..written + run].copy_from_slice(&self.pattern[start..start + run]);
             written += run;
         }
@@ -256,9 +296,9 @@ mod tests {
         for &(offset, len) in &[
             (0u64, 16usize),
             (1, 3),
-            (PERIOD as u64 - 8, 16),
-            (PERIOD as u64, 8),
-            (3 * PERIOD as u64 + 17, 5000),
+            (DEFAULT_PERIOD - 8, 16),
+            (DEFAULT_PERIOD, 8),
+            (3 * DEFAULT_PERIOD + 17, 5000),
             (1048576 - 4, 4),
         ] {
             let mut got = vec![0u8; len];
@@ -266,6 +306,34 @@ mod tests {
             let expected: Vec<u8> = (offset..offset + len as u64).map(|p| p as u8).collect();
             assert_eq!(got, expected, "at {offset} for {len}");
         }
+    }
+
+    #[test]
+    fn the_pattern_length_can_be_set_and_does_not_change_what_arrives() {
+        // A pattern far larger than cache makes a read cost what a real one
+        // costs. What it produces has to stay the same, or the two are not
+        // measuring the same transfer.
+        let small = NullDataset::from_spec("uint8:1048576").expect("spec");
+        let large = NullDataset::from_spec("uint8:1048576@16777216").expect("spec");
+        assert_eq!(small.period(), 64 * 1024);
+        assert_eq!(large.period(), 16 * 1024 * 1024);
+
+        let layout = whole(&small);
+        let mut from_small = vec![0u8; 100_000];
+        let mut from_large = vec![0u8; 100_000];
+        small
+            .read_range(&layout, 777, &mut from_small)
+            .expect("read");
+        large
+            .read_range(&layout, 777, &mut from_large)
+            .expect("read");
+        assert_eq!(from_small, from_large);
+
+        // A period that would break `p as u8` is refused rather than quietly
+        // serving something the caller cannot check.
+        assert!(NullDataset::from_spec("uint8:1024@100").is_err());
+        assert!(NullDataset::from_spec("uint8:1024@0").is_err());
+        assert!(NullDataset::from_spec("uint8:1024@abc").is_err());
     }
 
     #[test]

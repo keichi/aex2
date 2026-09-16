@@ -47,8 +47,9 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
 ([M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
-[ストレージを外した場合](docs/benchmark-null-backend.md))。メモリ上のデータで単一接続
-12,048 MiB/s (iPerf3 の 62 %)、ストレージを経路から外すと 16,290 MiB/s (同 84 %)、
+[ストレージを外した場合](docs/benchmark-null-backend.md)、
+[sendfile を採らない理由](docs/sendfile.md))。メモリ上のデータで単一接続
+12,048 MiB/s (iPerf3 の 62 %)、ストレージを経路から外すと 15,791 MiB/s (同 81 %)、
 ディスク上のデータでは `pread` の限界近く。
 
 ## 転送の流れ
