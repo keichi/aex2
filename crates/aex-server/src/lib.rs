@@ -1,14 +1,18 @@
 //! The AEX2 server.
 //!
-//! The gRPC control plane decides what to send; the data plane sends it. They
-//! meet at the transfer registry, which one writes and the other reads.
+//! The gRPC control plane decides *what* to send; the data plane sends it. They
+//! meet at the transfer registry, which one writes and the other reads, and
+//! nowhere else. That separation is what keeps the bulk data out of protobuf
+//! encoding entirely.
 //!
-//! [`ControlServer::bind`] takes the socket before serving so that a caller —
-//! an integration test, say — can ask for port 0 and still learn where to
-//! connect.
+//! [`Server::bind`] takes both sockets before serving so that a caller — an
+//! integration test, say — can ask for port 0 and still learn where to connect.
+//! The data port is also what the control plane advertises, so binding it first
+//! is what lets that advertisement be true.
 
 pub mod config;
 pub mod control;
+pub mod dataplane;
 pub mod error;
 pub mod paths;
 pub mod session;
@@ -25,6 +29,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 
 pub use crate::config::ServerConfig;
 use crate::control::ControlService;
+use crate::dataplane::DataPlane;
 pub use crate::error::{Result, ServerError};
 use crate::paths::PathPolicy;
 use crate::session::SessionRegistry;
@@ -38,32 +43,40 @@ use crate::transfer::TransferRegistry;
 /// run yet, so sweeping often would buy nothing.
 const SWEEPS_PER_TIMEOUT: u32 = 4;
 
-/// A control plane that has its socket and is ready to serve.
-pub struct ControlServer {
-    listener: TcpListener,
+/// A server that has its sockets and is ready to serve.
+pub struct Server {
+    control: TcpListener,
+    data: DataPlane,
     sessions: Arc<SessionRegistry>,
     transfers: Arc<TransferRegistry>,
     service: ControlService,
     config: Arc<ServerConfig>,
 }
 
-impl ControlServer {
-    /// Validate the configuration, resolve the data roots and take the socket.
+impl Server {
+    /// Validate the configuration, resolve the data roots and take the sockets.
     pub async fn bind(config: ServerConfig) -> Result<Self> {
         config.validate()?;
         let paths = Arc::new(PathPolicy::new(&config.paths.roots)?);
         let config = Arc::new(config);
         let sessions = Arc::new(SessionRegistry::new(config.clone()));
         let transfers = Arc::new(TransferRegistry::new(config.clone()));
-        let listener = TcpListener::bind(config.control_addr).await?;
 
-        Ok(ControlServer {
-            listener,
+        // Bound first so that the port it really got is the port the control
+        // plane hands out.
+        let data = DataPlane::bind(config.clone(), sessions.clone(), transfers.clone())?;
+        let data_port = data.local_addr()?.port();
+        let control = TcpListener::bind(config.control_addr).await?;
+
+        Ok(Server {
+            control,
+            data,
             service: ControlService::new(
                 sessions.clone(),
                 transfers.clone(),
                 paths,
                 config.clone(),
+                data_port,
             ),
             sessions,
             transfers,
@@ -71,19 +84,14 @@ impl ControlServer {
         })
     }
 
-    /// The registry the data plane serves fetches out of.
-    pub fn transfers(&self) -> &Arc<TransferRegistry> {
-        &self.transfers
-    }
-
-    pub fn sessions(&self) -> &Arc<SessionRegistry> {
-        &self.sessions
-    }
-
-    /// The address actually bound, which differs from the configured one when
-    /// the port was 0.
+    /// The control plane address actually bound.
     pub fn control_addr(&self) -> Result<SocketAddr> {
-        Ok(self.listener.local_addr()?)
+        Ok(self.control.local_addr()?)
+    }
+
+    /// The data plane address actually bound.
+    pub fn data_addr(&self) -> Result<SocketAddr> {
+        self.data.local_addr()
     }
 
     pub fn config(&self) -> &Arc<ServerConfig> {
@@ -100,13 +108,18 @@ impl ControlServer {
         self,
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<()> {
-        let ControlServer {
-            listener,
+        let Server {
+            control,
+            data,
             sessions,
             transfers,
             service,
             config,
         } = self;
+
+        // Dropping the handle stops the data plane, which happens on every way
+        // out of this function.
+        let _data = data.serve();
 
         let sweeper = tokio::spawn(sweep(
             sessions,
@@ -122,7 +135,7 @@ impl ControlServer {
 
         let result = tonic::transport::Server::builder()
             .add_service(service)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(control), shutdown)
             .await;
 
         sweeper.abort();

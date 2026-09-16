@@ -18,6 +18,11 @@ pub enum ServerError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// A peer that is not following the wire protocol. Means a bug in an
+    /// implementation, or something that is not an AEX client at all.
+    #[error("{0}")]
+    Protocol(String),
+
     /// Unknown or expired session.
     #[error("{0}")]
     Auth(String),
@@ -57,6 +62,7 @@ impl ServerError {
     /// Map this error onto its wire class.
     pub fn class(&self) -> ErrorClass {
         match self {
+            ServerError::Protocol(_) => ErrorClass::Protocol,
             ServerError::Auth(_) => ErrorClass::Auth,
             ServerError::NoSuchPlan(_) => ErrorClass::Plan,
             ServerError::BadRequest(_) | ServerError::PathNotAllowed(_) => ErrorClass::Request,

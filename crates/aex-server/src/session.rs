@@ -8,7 +8,7 @@
 //! session fails on the spot, and a sweep drops the ones nobody asks about, so
 //! that a client which simply vanished does not pin its files open forever.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -92,6 +92,8 @@ pub struct Session {
     granted_streams: u32,
     client_name: String,
     files: FileRegistry,
+    /// Data connections currently open, capped at `granted_streams`.
+    data_conns: AtomicU32,
     /// Milliseconds since the registry's epoch, at the last request.
     last_seen_ms: AtomicU64,
 }
@@ -116,6 +118,42 @@ impl Session {
 
     pub fn files(&self) -> &FileRegistry {
         &self.files
+    }
+
+    /// Count a data connection in, refusing one past what was granted.
+    ///
+    /// A client that opens more than it was told it may is not malicious so
+    /// much as mistaken, and the condition clears as its other connections
+    /// close, so this is reported as temporary rather than as a refusal.
+    pub fn open_data_conn(&self) -> Result<()> {
+        let mut open = self.data_conns.load(Ordering::Relaxed);
+        loop {
+            if open >= self.granted_streams {
+                return Err(ServerError::Exhausted(format!(
+                    "this session was granted {} data connections and already has {open}",
+                    self.granted_streams
+                )));
+            }
+            match self.data_conns.compare_exchange_weak(
+                open,
+                open + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => open = actual,
+            }
+        }
+    }
+
+    /// Count a data connection out.
+    pub fn close_data_conn(&self) {
+        self.data_conns.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Data connections currently open.
+    pub fn data_conns(&self) -> u32 {
+        self.data_conns.load(Ordering::Relaxed)
     }
 
     fn touch(&self, now_ms: u64) {
@@ -190,6 +228,7 @@ impl SessionRegistry {
             granted_streams,
             client_name: client_name.to_string(),
             files: FileRegistry::new(),
+            data_conns: AtomicU32::new(0),
             last_seen_ms: AtomicU64::new(now_ms),
         });
         self.sessions.insert(session.id, session.clone());
@@ -226,6 +265,18 @@ impl SessionRegistry {
 
         session.touch(now_ms);
         Ok(session)
+    }
+
+    /// Mark a session as used, without needing to look up what it holds.
+    ///
+    /// Activity on a data connection counts too: a transfer in progress must
+    /// not be cut off by the control plane's idle timeout just because no RPC
+    /// happened to be made while it ran.
+    pub fn touch(&self, id: &SessionId) {
+        let now_ms = self.now_ms();
+        if let Some(session) = self.sessions.get(id) {
+            session.touch(now_ms);
+        }
     }
 
     /// Whether a session is still live, without counting as activity.
@@ -402,6 +453,41 @@ mod tests {
         // Asking whether a session is live must not count as using it.
         assert!(reg.contains(fresh.id()));
         assert!(!reg.contains(old.id()));
+    }
+
+    #[test]
+    fn a_session_opens_no_more_data_connections_than_it_was_granted() {
+        let reg = registry();
+        let session = reg.create("test", 2).expect("create");
+
+        session.open_data_conn().expect("first");
+        session.open_data_conn().expect("second");
+        assert_eq!(session.data_conns(), 2);
+
+        let err = session.open_data_conn().unwrap_err();
+        // Temporary, not a refusal: it clears as the others close.
+        assert!(matches!(err, ServerError::Exhausted(_)), "{err}");
+        assert_eq!(err.class(), aex_core::ErrorClass::Transient);
+
+        session.close_data_conn();
+        session.open_data_conn().expect("room again");
+        assert_eq!(session.data_conns(), 2);
+    }
+
+    #[test]
+    fn data_plane_activity_keeps_a_session_alive() {
+        let reg = registry();
+        let timeout_ms = reg.idle_timeout_ms();
+        let session = reg.create_at("test", 0, 0).expect("create");
+
+        // No RPC is made for the length of the timeout, but the transfer is
+        // very much going on.
+        session.touch(timeout_ms);
+        assert!(reg.get_at(session.id(), timeout_ms + 1).is_ok());
+
+        // Touching an id that is not there is not an error; the session may
+        // have ended while a connection was still closing.
+        reg.touch(&[9u8; 16]);
     }
 
     #[test]

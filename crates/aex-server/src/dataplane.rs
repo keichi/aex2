@@ -1,0 +1,533 @@
+//! The data plane: raw TCP, one dedicated thread per connection.
+//!
+//! Reading a regular file has no true asynchronous form on Linux or macOS —
+//! `O_NONBLOCK` does not apply to it, and epoll and kqueue always report it
+//! ready — which is why `tokio::fs` hands the work to a blocking pool anyway.
+//! An async runtime here would therefore not save a thread, so the connections
+//! get real ones and the control plane keeps tokio to itself.
+//!
+//! A connection carries no state past the handshake. Any connection may serve
+//! any fetch of its session, which is what later makes work stealing, parallel
+//! streams and re-fetching a lost chunk all fall out for free.
+//!
+//! Nothing is encrypted and no user is identified here. The session token
+//! proves which session a connection belongs to, and the ticket in each `FETCH`
+//! proves which transfers it may read; who may open which file was settled by
+//! the control plane before any of this existed.
+
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use aex_core::ErrorClass;
+use aex_wire::{
+    write_frame, ErrorPayload, FrameHeader, FrameType, Hello, Ready, Ticket, HEADER_LEN, HELLO_LEN,
+    PROTOCOL_VERSION, TICKET_LEN,
+};
+
+use crate::config::ServerConfig;
+use crate::error::{Result, ServerError};
+use crate::session::{Session, SessionId, SessionRegistry};
+use crate::transfer::TransferRegistry;
+
+/// How often a blocked thread looks up to see whether the server is stopping.
+///
+/// Short enough that shutting down is not noticeable, long enough that an idle
+/// connection costs a handful of wakeups a second.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// How long a connection has to finish its handshake.
+///
+/// Separate from the idle timeout, which is measured between frames: a peer
+/// that connects and then says nothing at all should not hold a thread for the
+/// several minutes a working connection is allowed to be quiet for.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What to do after handling a frame.
+enum Disposition {
+    /// Keep serving this connection.
+    Continue,
+    /// Hang up. Used where continuing would mean talking to a peer that has
+    /// already proved it is not following the protocol.
+    Close,
+}
+
+/// A data plane that has its socket and is ready to serve.
+pub struct DataPlane {
+    listener: TcpListener,
+    context: Arc<Context>,
+}
+
+/// What every connection thread needs.
+struct Context {
+    sessions: Arc<SessionRegistry>,
+    transfers: Arc<TransferRegistry>,
+    config: Arc<ServerConfig>,
+    stop: Arc<AtomicBool>,
+}
+
+impl DataPlane {
+    /// Take the socket.
+    ///
+    /// Separate from serving so that a caller can bind port 0 and still learn
+    /// where to connect, which is also what the control plane advertises.
+    pub fn bind(
+        config: Arc<ServerConfig>,
+        sessions: Arc<SessionRegistry>,
+        transfers: Arc<TransferRegistry>,
+    ) -> Result<Self> {
+        if config.tcp.sndbuf != 0 || !config.tcp.congestion.is_empty() {
+            // Saying so beats leaving an operator to conclude from a benchmark
+            // that the setting made no difference.
+            tracing::warn!(
+                "tcp.sndbuf and tcp.congestion are not applied yet; only tcp.nodelay is"
+            );
+        }
+
+        let listener = TcpListener::bind(config.data_addr)?;
+        // The accept loop polls rather than blocking, so that it can be told to
+        // stop without something else having to connect to wake it.
+        listener.set_nonblocking(true)?;
+
+        Ok(DataPlane {
+            listener,
+            context: Arc::new(Context {
+                sessions,
+                transfers,
+                config,
+                stop: Arc::new(AtomicBool::new(false)),
+            }),
+        })
+    }
+
+    /// The address actually bound, which differs from the configured one when
+    /// the port was 0.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+
+    /// Start accepting. Serving stops when the returned handle is dropped.
+    pub fn serve(self) -> DataPlaneHandle {
+        let DataPlane { listener, context } = self;
+        let stop = context.stop.clone();
+        let connections: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let accept = {
+            let connections = connections.clone();
+            std::thread::Builder::new()
+                .name("aex-data-accept".to_string())
+                .spawn(move || accept_loop(listener, context, connections))
+                .expect("the accept thread must start")
+        };
+
+        DataPlaneHandle {
+            stop,
+            accept: Some(accept),
+            connections,
+        }
+    }
+}
+
+/// Keeps the data plane running, and stops it when dropped.
+pub struct DataPlaneHandle {
+    stop: Arc<AtomicBool>,
+    accept: Option<JoinHandle<()>>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl DataPlaneHandle {
+    /// Stop accepting and wait for the connections to notice.
+    ///
+    /// Each thread is between polls at worst, so this takes about as long as
+    /// one poll interval rather than as long as a transfer.
+    pub fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
+        let threads = std::mem::take(&mut *lock(&self.connections));
+        for thread in threads {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for DataPlaneHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn accept_loop(
+    listener: TcpListener,
+    context: Arc<Context>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+) {
+    while !context.stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                let context = context.clone();
+                let thread = std::thread::Builder::new()
+                    .name("aex-data-conn".to_string())
+                    .spawn(move || serve_connection(stream, peer, context));
+                match thread {
+                    Ok(thread) => {
+                        let mut live = lock(&connections);
+                        // Threads that have already finished would otherwise
+                        // accumulate for the life of the server.
+                        live.retain(|thread| !thread.is_finished());
+                        live.push(thread);
+                    }
+                    Err(e) => tracing::error!("cannot start a connection thread: {e}"),
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL_INTERVAL),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                tracing::error!("data plane accept failed: {e}");
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+fn serve_connection(mut stream: TcpStream, peer: SocketAddr, context: Arc<Context>) {
+    // Back to blocking, with a short timeout so that a read can be interrupted
+    // by the server stopping.
+    if let Err(e) = configure(&stream, &context.config) {
+        tracing::warn!(%peer, "cannot configure a data connection: {e}");
+        return;
+    }
+
+    let session = match handshake(&mut stream, &context) {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::info!(%peer, "data connection refused: {e}");
+            return;
+        }
+    };
+    let session_id = *session.id();
+    tracing::debug!(%peer, session = %hex(&session_id), "data connection accepted");
+
+    let result = serve_frames(&mut stream, &session_id, &context);
+    session.close_data_conn();
+    match result {
+        Ok(()) => tracing::debug!(%peer, "data connection closed"),
+        Err(e) => tracing::info!(%peer, "data connection ended: {e}"),
+    }
+}
+
+fn configure(stream: &TcpStream, config: &ServerConfig) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    // Without this, Nagle holds back a DATA header whose payload has already
+    // gone, and every small reply waits for an ack.
+    stream.set_nodelay(config.tcp.nodelay)?;
+    stream.set_read_timeout(Some(POLL_INTERVAL))?;
+    Ok(())
+}
+
+/// Check the client in, or refuse it and say which class of thing was wrong.
+fn handshake(stream: &mut TcpStream, context: &Context) -> Result<Arc<Session>> {
+    let mut bytes = [0u8; HELLO_LEN];
+    if !read_full(stream, &mut bytes, &context.stop, HANDSHAKE_TIMEOUT)? {
+        // A connection that opened and closed without saying anything. A port
+        // scan or a health check, not something to report as a refusal.
+        return Err(ServerError::BadRequest("no handshake was sent".to_string()));
+    }
+
+    let result = check_hello(&bytes, context);
+    let ready = match &result {
+        Ok(_) => Ready::accepted(),
+        Err(e) => Ready::refused(e.class()),
+    };
+    // Answer before hanging up: READY carries no message, but its class is all
+    // the client needs in order to know what to do next.
+    stream.write_all(&ready.encode())?;
+    result
+}
+
+fn check_hello(bytes: &[u8; HELLO_LEN], context: &Context) -> Result<Arc<Session>> {
+    let hello = Hello::decode(bytes).map_err(|e| ServerError::Protocol(e.to_string()))?;
+    if hello.version != PROTOCOL_VERSION {
+        return Err(ServerError::Protocol(format!(
+            "client speaks data plane version {}, this server speaks {PROTOCOL_VERSION}",
+            hello.version
+        )));
+    }
+
+    let session = context.sessions.get(&hello.session_id)?;
+    if !constant_time_eq(session.token(), &hello.session_token) {
+        return Err(ServerError::Auth(
+            "the token presented is not the one this session was issued".to_string(),
+        ));
+    }
+    // Counted here so that it is released exactly when the connection ends.
+    session.open_data_conn()?;
+    Ok(session)
+}
+
+/// Serve fetches until the peer hangs up, goes quiet or breaks the protocol.
+fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) -> Result<()> {
+    let idle = Duration::from_secs(context.config.limits.data_conn_idle_timeout_sec);
+    // One read buffer per connection, grown to what is asked for and then
+    // reused, so that a transfer allocates nothing once it is going.
+    let mut buffer: Vec<u8> = Vec::new();
+
+    loop {
+        let mut bytes = [0u8; HEADER_LEN];
+        if !read_full(stream, &mut bytes, &context.stop, idle)? {
+            return Ok(());
+        }
+        let header = match FrameHeader::decode(&bytes) {
+            Ok(header) => header,
+            Err(e) => {
+                send_connection_error(stream, e.class(), &e)?;
+                return Err(ServerError::Protocol(e.to_string()));
+            }
+        };
+
+        // Any activity keeps the session alive, so a transfer in progress
+        // cannot be cut off by the control plane's idle timeout.
+        context.sessions.touch(session);
+
+        match handle_frame(stream, &header, session, context, &mut buffer)? {
+            Disposition::Continue => {}
+            Disposition::Close => return Ok(()),
+        }
+    }
+}
+
+fn handle_frame(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    session: &SessionId,
+    context: &Context,
+    buffer: &mut Vec<u8>,
+) -> Result<Disposition> {
+    match header.frame_type {
+        FrameType::Fetch => handle_fetch(stream, header, session, context, buffer),
+        FrameType::Ping => {
+            write_frame(stream, &FrameHeader::bare(FrameType::Pong), &[])?;
+            Ok(Disposition::Continue)
+        }
+        // A reply to a ping this server sent. Nothing to do but note that the
+        // peer is alive, which reading the frame already did.
+        FrameType::Pong => Ok(Disposition::Continue),
+        // Server-to-client frames arriving from a client mean the two
+        // implementations disagree about who says what. That is wrong with the
+        // connection rather than with any one fetch, so it is reported against
+        // no transfer at all.
+        other => {
+            let e = ServerError::Protocol(format!("{other:?} is not a frame a client may send"));
+            send_connection_error(stream, ErrorClass::Protocol, &e)?;
+            Ok(Disposition::Close)
+        }
+    }
+}
+
+fn handle_fetch(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    session: &SessionId,
+    context: &Context,
+    buffer: &mut Vec<u8>,
+) -> Result<Disposition> {
+    if header.wire_len != TICKET_LEN as u64 {
+        let e = ServerError::Protocol(format!(
+            "a fetch carries a {TICKET_LEN} byte ticket, not {} bytes",
+            header.wire_len
+        ));
+        send_error(stream, header, ErrorClass::Protocol, &e)?;
+        return Ok(Disposition::Close);
+    }
+
+    let mut ticket: Ticket = [0u8; TICKET_LEN];
+    let idle = Duration::from_secs(context.config.limits.data_conn_idle_timeout_sec);
+    if !read_full(stream, &mut ticket, &context.stop, idle)? {
+        return Err(ServerError::Protocol(
+            "a fetch header arrived without its ticket".to_string(),
+        ));
+    }
+
+    let max_fetch = context.config.transfer.max_fetch_bytes;
+    if header.logical_len > max_fetch {
+        // Not fatal: the client can ask again for less.
+        let e = ServerError::BadRequest(format!(
+            "a fetch of {} bytes is over this server's limit of {max_fetch}",
+            header.logical_len
+        ));
+        send_error(stream, header, ErrorClass::Request, &e)?;
+        return Ok(Disposition::Continue);
+    }
+
+    let entry = match context.transfers.fetch(header.request_id, &ticket, session) {
+        Ok(entry) => entry,
+        Err(e) => {
+            let class = e.class();
+            send_error(stream, header, class, &e)?;
+            // A wrong ticket is either a bug or someone guessing at another
+            // session's transfers; neither is worth carrying on with.
+            return Ok(match class {
+                ErrorClass::Auth => Disposition::Close,
+                _ => Disposition::Continue,
+            });
+        }
+    };
+
+    let len = header.logical_len as usize;
+    if buffer.len() < len {
+        // Grows to whatever this connection is asked for, capped by
+        // max_fetch_bytes above, and is then reused for every later fetch.
+        buffer.resize(len, 0);
+    }
+    let dst = &mut buffer[..len];
+
+    if let Err(e) = entry
+        .layout()
+        .check_range(header.offset, header.logical_len)
+        .and_then(|()| {
+            entry
+                .dataset()
+                .read_range(entry.layout(), header.offset, dst)
+        })
+    {
+        let class = e.class();
+        send_error(stream, header, class, &e)?;
+        return Ok(Disposition::Continue);
+    }
+
+    // A read can take a while on a cold cache, and the plan must not have
+    // expired out from under the reply it is about to send.
+    context.transfers.touch(&entry);
+    write_frame(
+        stream,
+        &FrameHeader::data(header.request_id, header.offset, header.logical_len),
+        dst,
+    )?;
+    Ok(Disposition::Continue)
+}
+
+/// Report a failure against the fetch that caused it.
+///
+/// The reply names that fetch — its transfer, offset and length — so that the
+/// client can put exactly that chunk back on its queue rather than starting the
+/// transfer again.
+fn send_error(
+    stream: &mut TcpStream,
+    fetch: &FrameHeader,
+    class: ErrorClass,
+    error: impl std::fmt::Display,
+) -> Result<()> {
+    send_error_for(
+        stream,
+        fetch.request_id,
+        fetch.offset,
+        fetch.logical_len,
+        class,
+        error,
+    )
+}
+
+/// Report a failure that no fetch can be blamed for.
+///
+/// A transfer is numbered from 1, so 0 says the trouble is with the connection
+/// itself rather than with anything that was asked for.
+fn send_connection_error(
+    stream: &mut TcpStream,
+    class: ErrorClass,
+    error: impl std::fmt::Display,
+) -> Result<()> {
+    send_error_for(stream, 0, 0, 0, class, error)
+}
+
+fn send_error_for(
+    stream: &mut TcpStream,
+    request_id: u32,
+    offset: u64,
+    logical_len: u64,
+    class: ErrorClass,
+    error: impl std::fmt::Display,
+) -> Result<()> {
+    tracing::debug!(request_id, ?class, "{error}");
+    let payload = ErrorPayload::new(class, error.to_string()).encode();
+    let header = FrameHeader::error(request_id, offset, logical_len, payload.len() as u64);
+    write_frame(stream, &header, &payload)?;
+    Ok(())
+}
+
+/// Fill `buf`, waking often enough to notice the server stopping.
+///
+/// Returns `false` for a clean end of stream before any byte of the buffer,
+/// which is how a peer says it is done rather than how it fails.
+fn read_full(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    stop: &AtomicBool,
+    idle: Duration,
+) -> io::Result<bool> {
+    let mut filled = 0;
+    let mut since_progress = Instant::now();
+    while filled < buf.len() {
+        if stop.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the server is shutting down",
+            ));
+        }
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "the peer hung up {filled} bytes into a {} byte read",
+                        buf.len()
+                    ),
+                ))
+            }
+            Ok(n) => {
+                filled += n;
+                since_progress = Instant::now();
+            }
+            // The read timeout, which is how the loop gets to look at `stop`.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if since_progress.elapsed() >= idle {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("nothing arrived for {idle:?}"),
+                    ));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// Compare two tokens without leaking where they differ.
+fn constant_time_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Hex for logs. Session ids are opaque, so they are shown as bytes.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}

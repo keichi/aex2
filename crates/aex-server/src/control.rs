@@ -37,6 +37,9 @@ pub struct ControlService {
     transfers: Arc<TransferRegistry>,
     paths: Arc<PathPolicy>,
     config: Arc<ServerConfig>,
+    /// The port the data plane really bound, which is not the configured one
+    /// when that was 0.
+    data_port: u16,
 }
 
 impl ControlService {
@@ -45,12 +48,14 @@ impl ControlService {
         transfers: Arc<TransferRegistry>,
         paths: Arc<PathPolicy>,
         config: Arc<ServerConfig>,
+        data_port: u16,
     ) -> Self {
         ControlService {
             sessions,
             transfers,
             paths,
             config,
+            data_port,
         }
     }
 
@@ -178,11 +183,11 @@ impl AexControl for ControlService {
             session_id: session.id().to_vec(),
             session_token: session.token().to_vec(),
             // One endpoint, and an empty host so the client reuses the address
-            // it already reached the control plane on. The data plane itself
-            // starts listening in M2; the port it will listen on is fixed now.
+            // it already reached the control plane on. The server cannot know
+            // how the client addresses it through a NAT or a container.
             endpoints: vec![DataEndpoint {
                 host: self.config.data_advertise_host.clone(),
-                port: self.config.data_addr.port() as u32,
+                port: self.data_port as u32,
             }],
             granted_streams: session.granted_streams(),
             protocol_version: PROTOCOL_VERSION,

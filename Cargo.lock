@@ -61,6 +61,7 @@ dependencies = [
  "aex-client",
  "aex-core",
  "aex-server",
+ "aex-wire",
  "npyz",
  "tempfile",
  "tokio",

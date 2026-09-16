@@ -1,141 +1,12 @@
 //! Control plane round trips, with a real server and a real client.
-//!
-//! The server runs in this process on its own thread and a loopback port, so a
-//! test exercises the RPC path end to end — tonic codecs included — without
-//! anything to set up first.
-//!
-//! Fixture files are written with `npyz`, which is also what the server parses
-//! headers with. Agreement with what numpy itself writes is the job of the
-//! differential tests in M3; what these tests pin down is the RPC layer.
 
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::thread::JoinHandle;
-
-use aex_client::{Client, ClientConfig, ClientError, Item};
+use aex_client::{Client, ClientConfig, Item};
 use aex_core::{DType, ErrorClass};
-use aex_server::{ControlServer, ServerConfig};
-use tempfile::TempDir;
 
-/// Port advertised for the data plane. Nothing listens on it: M1 only has to
-/// carry the number to the client.
-const DATA_PORT: u16 = 59999;
+#[path = "support.rs"]
+mod support;
 
-/// A server running on a loopback port, shut down when dropped.
-struct TestServer {
-    url: String,
-    root: TempDir,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl TestServer {
-    fn start() -> TestServer {
-        Self::start_with(|_| {})
-    }
-
-    /// Start a server, letting the caller adjust the configuration first.
-    fn start_with(adjust: impl FnOnce(&mut ServerConfig)) -> TestServer {
-        let root = tempfile::tempdir().expect("tempdir");
-
-        let mut config = ServerConfig {
-            // Port 0: the OS picks one, so tests can run at the same time.
-            control_addr: "127.0.0.1:0".parse().unwrap(),
-            data_addr: SocketAddr::from(([127, 0, 0, 1], DATA_PORT)),
-            paths: aex_server::config::Paths {
-                roots: vec![root.path().to_path_buf()],
-            },
-            ..ServerConfig::default()
-        };
-        adjust(&mut config);
-
-        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
-        let (stop, stop_rx) = tokio::sync::oneshot::channel();
-
-        let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("runtime");
-            runtime.block_on(async move {
-                let server = ControlServer::bind(config).await.expect("bind");
-                addr_tx
-                    .send(server.control_addr().expect("local addr"))
-                    .expect("the test is waiting for the address");
-                server
-                    .serve_with_shutdown(async {
-                        let _ = stop_rx.await;
-                    })
-                    .await
-                    .expect("serve");
-            });
-        });
-
-        let addr = addr_rx.recv().expect("server failed to start");
-        TestServer {
-            url: format!("http://{addr}"),
-            root,
-            stop: Some(stop),
-            thread: Some(thread),
-        }
-    }
-
-    fn connect(&self) -> Client {
-        Client::connect(&self.url, ClientConfig::default()).expect("connect")
-    }
-
-    fn root(&self) -> &Path {
-        self.root.path()
-    }
-
-    /// Write a `.npy` of `f32` counting up from zero.
-    fn write_npy(&self, name: &str, shape: &[usize]) -> PathBuf {
-        let path = self.root().join(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("mkdir");
-        }
-        let count: usize = shape.iter().product();
-        let shape: Vec<u64> = shape.iter().map(|&n| n as u64).collect();
-
-        let file = std::io::BufWriter::new(std::fs::File::create(&path).expect("create"));
-        let mut writer = {
-            use npyz::WriterBuilder;
-            npyz::WriteOptions::new()
-                .default_dtype()
-                .shape(&shape)
-                .writer(file)
-                .begin_nd()
-                .expect("npy header")
-        };
-        for i in 0..count {
-            writer.push(&(i as f32)).expect("npy element");
-        }
-        writer.finish().expect("npy finish");
-        path
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// The class of a server error, or a failure if the call did not fail.
-fn error_class(result: Result<impl std::fmt::Debug, ClientError>) -> ErrorClass {
-    match result {
-        Ok(value) => panic!("expected an error, got {value:?}"),
-        Err(err) => err
-            .class()
-            .unwrap_or_else(|| panic!("expected a server error, got {err}")),
-    }
-}
+use support::{error_class, write_raw_npy, TestServer};
 
 #[test]
 fn metadata_makes_the_round_trip() {
@@ -179,8 +50,12 @@ fn a_session_reports_what_the_server_granted() {
     assert_eq!(session.supported_codecs, 1);
     assert_eq!(session.supported_encodings, 1);
 
-    // The server advertises no host, so the client keeps the one it dialled.
-    assert_eq!(session.data_endpoint, ("127.0.0.1".to_string(), DATA_PORT));
+    // The server advertises no host, so the client keeps the one it dialled,
+    // and the port is the one the data plane really bound.
+    assert_eq!(
+        session.data_endpoint,
+        ("127.0.0.1".to_string(), server.data_addr.port())
+    );
 }
 
 #[test]
@@ -387,35 +262,4 @@ fn connecting_to_nothing_fails_without_hanging() {
     let err = Client::connect("http://127.0.0.1:1", ClientConfig::default()).unwrap_err();
     assert!(err.class().is_none(), "a transport failure has no class");
     assert!(!err.is_retryable());
-}
-
-/// Write a `.npy` with an arbitrary `descr` and raw payload.
-///
-/// npyz's writer only writes the dtypes it can serialise; this covers the rest.
-fn write_raw_npy(path: &Path, descr: &str, shape: &[u64], payload: &[u8]) {
-    let shape_text = match shape {
-        [] => "()".to_string(),
-        [n] => format!("({n},)"),
-        dims => format!(
-            "({})",
-            dims.iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
-    let dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_text}, }}");
-    // A v1.0 header: magic, version, a 2-byte length, then text padded so the
-    // data starts on a 64-byte boundary.
-    let padding = (64 - (10 + dict.len() + 1) % 64) % 64;
-    let header_len = dict.len() + padding + 1;
-
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
-    bytes.extend_from_slice(&(header_len as u16).to_le_bytes());
-    bytes.extend_from_slice(dict.as_bytes());
-    bytes.extend(std::iter::repeat_n(b' ', padding));
-    bytes.push(b'\n');
-    bytes.extend_from_slice(payload);
-    std::fs::write(path, bytes).expect("write npy");
 }

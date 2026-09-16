@@ -18,6 +18,7 @@ autotests = false
 aex-client.workspace = true
 aex-core.workspace = true
 aex-server.workspace = true
+aex-wire.workspace = true
 npyz.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
@@ -25,3 +26,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 [[test]]
 name = "control_plane"
 path = "control_plane.rs"
+
+[[test]]
+name = "data_plane"
+path = "data_plane.rs"

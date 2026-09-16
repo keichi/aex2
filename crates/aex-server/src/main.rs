@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use aex_server::{ControlServer, Result, ServerConfig};
+use aex_server::{Result, Server, ServerConfig};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -68,11 +68,10 @@ async fn main() -> std::process::ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     let config = cli.config()?;
-    let server = ControlServer::bind(config).await?;
-    let addr = server.control_addr()?;
+    let server = Server::bind(config).await?;
     tracing::info!(
-        control = %addr,
-        data = %server.config().data_addr,
+        control = %server.control_addr()?,
+        data = %server.data_addr()?,
         roots = ?server.config().paths.roots,
         "aex-server listening"
     );
