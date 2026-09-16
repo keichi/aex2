@@ -1,6 +1,5 @@
 //! Backend implementations.
 //!
-//! Only `.npy` for now. The shared `ArrayFile` / `ArrayDataset` traits arrive
-//! with selection resolution in M2, alongside their first real caller.
+//! Only `.npy` for now. The traits they implement live in [`crate::backend`].
 
 pub mod npy;

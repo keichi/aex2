@@ -6,25 +6,33 @@
 //!
 //! We never `mmap`: it would turn a truncation mid-transfer into SIGBUS, and
 //! page faults cannot keep the I/O queue deep on a cold cache.
+//!
+//! A `.npy` holds one array, which [`NpyFile`] presents as the hierarchy v1
+//! used: a root group with a single dataset named `array`.
 
 use std::fs::File;
 use std::io::Seek;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::backend::{normalize_path, ArrayDataset, ArrayFile, Item};
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
+
+/// Name of the one dataset in a `.npy`, as v1 exposed it.
+pub const DATASET_NAME: &str = "array";
 
 /// A `.npy` file opened for reading.
 ///
 /// The data is `data_len` bytes of the array flattened in C order: the simplest
 /// form of a logical byte stream, which is the coordinate system
-/// [`NpyFile::read_range`] takes its offsets in.
+/// [`NpyDataset::read_range`] takes its offsets in.
 ///
 /// `read_range` needs only `&self` because `pread` carries no shared file
 /// position, so many connection threads can read one file at once.
 #[derive(Debug)]
-pub struct NpyFile {
+pub struct NpyDataset {
     /// Read with `pread`, never mapped.
     file: File,
     /// First byte after the header; the base for every `pread`.
@@ -39,7 +47,7 @@ pub struct NpyFile {
     shape: Vec<u64>,
 }
 
-impl NpyFile {
+impl NpyDataset {
     /// Open a `.npy`, parse its header and check it against the file.
     ///
     /// Anything AEX cannot serve — fortran order, big-endian, structured dtypes,
@@ -97,7 +105,7 @@ impl NpyFile {
             )));
         }
 
-        Ok(NpyFile {
+        Ok(NpyDataset {
             file,
             data_offset,
             file_len,
@@ -172,6 +180,66 @@ impl NpyFile {
             filled += n;
         }
         Ok(())
+    }
+}
+
+impl ArrayDataset for NpyDataset {
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+}
+
+/// A `.npy` presented as a hierarchy: a root group holding one dataset.
+///
+/// The dataset is behind an `Arc` because a transfer plan outlives the request
+/// that produced it and holds the dataset it reads from.
+#[derive(Debug, Clone)]
+pub struct NpyFile {
+    dataset: Arc<NpyDataset>,
+}
+
+impl NpyFile {
+    /// Open a `.npy`. Rejects anything AEX cannot serve; see [`NpyDataset::open`].
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(NpyFile {
+            dataset: Arc::new(NpyDataset::open(path)?),
+        })
+    }
+
+    /// The single array in this file.
+    pub fn dataset(&self) -> &Arc<NpyDataset> {
+        &self.dataset
+    }
+}
+
+impl ArrayFile for NpyFile {
+    fn contains(&self, path: &str) -> bool {
+        matches!(normalize_path(path), "" | DATASET_NAME)
+    }
+
+    fn get_item(&self, path: &str) -> Result<Item> {
+        match normalize_path(path) {
+            "" => Ok(Item::Group),
+            DATASET_NAME => Ok(Item::Dataset(self.dataset.clone())),
+            other => Err(AexError::NotFound(format!(
+                "{other:?}: a .npy holds a single array, reachable as {DATASET_NAME:?}"
+            ))),
+        }
+    }
+
+    fn list_children(&self, path: &str) -> Result<Vec<(String, Item)>> {
+        match normalize_path(path) {
+            "" => Ok(vec![(
+                DATASET_NAME.to_string(),
+                Item::Dataset(self.dataset.clone()),
+            )]),
+            DATASET_NAME => Err(AexError::NotAGroup(DATASET_NAME.to_string())),
+            other => Err(AexError::NotFound(other.to_string())),
+        }
     }
 }
 
@@ -305,9 +373,9 @@ mod tests {
         (dir, path)
     }
 
-    fn open_bytes(bytes: &[u8]) -> Result<NpyFile> {
+    fn open_bytes(bytes: &[u8]) -> Result<NpyDataset> {
         let (_dir, path) = write_npy(bytes);
-        NpyFile::open(path)
+        NpyDataset::open(path)
     }
 
     #[test]
@@ -502,9 +570,75 @@ mod tests {
 
     #[test]
     fn open_reports_a_missing_file_as_io_error() {
-        let err = NpyFile::open("/nonexistent/aex2/does-not-exist.npy").unwrap_err();
+        let err = NpyDataset::open("/nonexistent/aex2/does-not-exist.npy").unwrap_err();
         assert!(matches!(err, AexError::Io(_)), "{err}");
         assert_eq!(err.class(), crate::error::ErrorClass::Request);
+    }
+
+    #[test]
+    fn the_hierarchy_holds_one_dataset_named_array() {
+        let bytes = NpyBuilder::new("<f4", &[3, 4]).filled_payload(4).build();
+        let (_dir, path) = write_npy(&bytes);
+        let file = NpyFile::open(&path).expect("open");
+
+        // v1 exposed the array under both spellings of the path.
+        for name in [DATASET_NAME, "/array", "/array/"] {
+            assert!(file.contains(name), "{name} must exist");
+            let Item::Dataset(dataset) = file.get_item(name).expect(name) else {
+                panic!("{name} must be a dataset");
+            };
+            assert_eq!(dataset.dtype(), DType::Float32);
+            assert_eq!(dataset.shape(), &[3, 4]);
+            assert_eq!(dataset.ndim(), 2);
+        }
+
+        for root in ["", "/"] {
+            assert!(file.contains(root));
+            assert!(matches!(file.get_item(root), Ok(Item::Group)));
+            let children = file.list_children(root).expect("list root");
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].0, DATASET_NAME);
+            assert!(matches!(children[0].1, Item::Dataset(_)));
+        }
+    }
+
+    #[test]
+    fn the_hierarchy_rejects_other_paths() {
+        let bytes = NpyBuilder::new("<i2", &[2]).filled_payload(2).build();
+        let (_dir, path) = write_npy(&bytes);
+        let file = NpyFile::open(&path).expect("open");
+
+        assert!(!file.contains("data"));
+        let err = file.get_item("data").unwrap_err();
+        assert!(matches!(err, AexError::NotFound(_)), "{err}");
+        // The message has to say where the array actually is: "data" is what
+        // every other backend would have called it.
+        assert!(err.to_string().contains(DATASET_NAME), "{err}");
+        assert!(file.list_children("data").is_err());
+
+        // A dataset has no children.
+        let err = file.list_children(DATASET_NAME).unwrap_err();
+        assert!(matches!(err, AexError::NotAGroup(_)), "{err}");
+    }
+
+    #[test]
+    fn one_open_file_is_shared_by_every_request() {
+        // A transfer plan outlives the request that made it, so the dataset it
+        // reads from has to be clonable out of the file.
+        let bytes = NpyBuilder::new("<f8", &[8]).filled_payload(8).build();
+        let (_dir, path) = write_npy(&bytes);
+        let file = NpyFile::open(&path).expect("open");
+
+        let Item::Dataset(first) = file.get_item(DATASET_NAME).unwrap() else {
+            panic!("expected a dataset");
+        };
+        let Item::Dataset(second) = file.get_item(DATASET_NAME).unwrap() else {
+            panic!("expected a dataset");
+        };
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "each request must see one file"
+        );
     }
 
     #[test]
@@ -514,7 +648,7 @@ mod tests {
         let builder = NpyBuilder::new("<f4", &[256, 64]).filled_payload(4);
         let expected = builder.payload.clone();
         let (_dir, path) = write_npy(&builder.build());
-        let npy = NpyFile::open(path).expect("open");
+        let npy = NpyDataset::open(path).expect("open");
 
         std::thread::scope(|scope| {
             for t in 0..8u64 {

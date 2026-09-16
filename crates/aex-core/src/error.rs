@@ -71,6 +71,14 @@ pub enum AexError {
     #[error("malformed npy file: {0}")]
     MalformedNpy(String),
 
+    /// No item at this path in the file.
+    #[error("no such item: {0}")]
+    NotFound(String),
+
+    /// A group operation was given the path of a dataset.
+    #[error("{0:?} is a dataset, not a group")]
+    NotAGroup(String),
+
     /// Access outside the logical byte stream.
     #[error("range [{offset}, {}) is out of bounds for a {total} byte logical stream",
             .offset.saturating_add(*.len))]
@@ -86,6 +94,8 @@ impl AexError {
         match self {
             AexError::UnsupportedDType(_)
             | AexError::UnsupportedNpy(_)
+            | AexError::NotFound(_)
+            | AexError::NotAGroup(_)
             | AexError::OutOfRange { .. } => ErrorClass::Request,
             AexError::MalformedNpy(_) => ErrorClass::Permanent,
             AexError::Io(e) => match e.kind() {
@@ -162,6 +172,8 @@ mod tests {
             .class(),
             ErrorClass::Request
         );
+        assert_eq!(AexError::NotFound("x".into()).class(), ErrorClass::Request);
+        assert_eq!(AexError::NotAGroup("x".into()).class(), ErrorClass::Request);
         assert_eq!(
             AexError::MalformedNpy("x".into()).class(),
             ErrorClass::Permanent
