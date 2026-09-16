@@ -23,8 +23,8 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 - `aex-proto` — `protos/aex.proto` から tonic/prost が生成するコードと、
   生成型とコア型の相互変換
 - `aex-server` — コントロールプレーン (セッション、ファイル、メタデータ、
-  `PrepareSelection`)、`TransferRegistry`、接続ごとに専用スレッドを持つ
-  データプレーン
+  `PrepareSelection`)、`TransferRegistry`、接続ごとに読みスレッドと送りスレッドを
+  持つデータプレーン
 - `aex-client` — 同期 API の Rust クライアント。`read_selection_into` /
   `read_selection` / `read_selection_as`
 
@@ -39,14 +39,17 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
   ソース上で 1 個の連続領域になる選択を扱う。`arr[:, 0:50]` や `arr[::2]` のような
   ストライド選択・断片的選択は `ErrorClass::Request` で明示的に拒否する
 - **データ接続は 1 本**。チャンク分割はクライアントが行い、1 本の接続で逐次
-  フェッチする。並列ストリーム・ワークスティーリング・credit パイプラインは未実装
-- サーバの読み出しと送出は逐次 (ダブルバッファリング未実装)
+  フェッチする。並列ストリーム・ワークスティーリング・credit パイプラインは未実装。
+  なお localhost では単一接続で既にマシンの限界に達しており、接続を増やしても
+  合計は増えない
 - `tcp.sndbuf` / `tcp.congestion` は設定を受け付けるがまだ適用しない
   (起動時に警告を出す)
 
 ローカル (同一ホスト) での転送性能の測定結果は
-[docs/benchmark-m2-local.md](docs/benchmark-m2-local.md) にある。ディスク上のデータでは
-`pread` の限界の 99.6 %、メモリ上のデータでは単一接続で 43 % (接続を増やせば 71 %)。
+[docs/benchmark-m2-local.md](docs/benchmark-m2-local.md) と
+[docs/benchmark-double-buffering.md](docs/benchmark-double-buffering.md) にある。
+メモリ上のデータで単一接続 12,048 MiB/s (iPerf3 の 62 %、メモリコピー能力の 77 %)、
+ディスク上のデータでは `pread` の限界近く。
 
 ## 転送の流れ
 

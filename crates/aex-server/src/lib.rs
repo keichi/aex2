@@ -15,6 +15,7 @@ pub mod control;
 pub mod dataplane;
 pub mod error;
 pub mod paths;
+pub mod reader;
 pub mod session;
 pub mod transfer;
 

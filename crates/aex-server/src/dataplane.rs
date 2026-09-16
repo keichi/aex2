@@ -1,10 +1,15 @@
-//! The data plane: raw TCP, one dedicated thread per connection.
+//! The data plane: raw TCP, two dedicated threads per connection.
 //!
 //! Reading a regular file has no true asynchronous form on Linux or macOS —
 //! `O_NONBLOCK` does not apply to it, and epoll and kqueue always report it
 //! ready — which is why `tokio::fs` hands the work to a blocking pool anyway.
 //! An async runtime here would therefore not save a thread, so the connections
 //! get real ones and the control plane keeps tokio to itself.
+//!
+//! Each connection has two: one reading ([`crate::reader`]) and one writing.
+//! Doing both in turn on one thread leaves the disk idle while the socket works
+//! and the socket idle while the disk works, and for data that does not fit in
+//! memory that is most of the throughput.
 //!
 //! A connection carries no state past the handshake. Any connection may serve
 //! any fetch of its session, which is what later makes work stealing, parallel
@@ -30,6 +35,7 @@ use aex_wire::{
 
 use crate::config::ServerConfig;
 use crate::error::{Result, ServerError};
+use crate::reader::{Piece, ReadPipeline};
 use crate::session::{Session, SessionId, SessionRegistry};
 use crate::transfer::TransferRegistry;
 
@@ -272,9 +278,13 @@ fn check_hello(bytes: &[u8; HELLO_LEN], context: &Context) -> Result<Arc<Session
 /// Serve fetches until the peer hangs up, goes quiet or breaks the protocol.
 fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) -> Result<()> {
     let idle = Duration::from_secs(context.config.limits.data_conn_idle_timeout_sec);
-    // One read buffer per connection, grown to what is asked for and then
-    // reused, so that a transfer allocates nothing once it is going.
-    let mut buffer: Vec<u8> = Vec::new();
+    // The reader that fills buffers while this thread writes the last one out.
+    // Its pool is allocated here and circulates for the life of the connection,
+    // so a transfer in progress allocates nothing.
+    let pipeline = ReadPipeline::start(
+        context.config.transfer.read_buffers,
+        context.config.transfer.read_buffer_bytes as usize,
+    )?;
 
     loop {
         let mut bytes = [0u8; HEADER_LEN];
@@ -293,7 +303,7 @@ fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) 
         // cannot be cut off by the control plane's idle timeout.
         context.sessions.touch(session);
 
-        match handle_frame(stream, &header, session, context, &mut buffer)? {
+        match handle_frame(stream, &header, session, context, &pipeline)? {
             Disposition::Continue => {}
             Disposition::Close => return Ok(()),
         }
@@ -305,10 +315,10 @@ fn handle_frame(
     header: &FrameHeader,
     session: &SessionId,
     context: &Context,
-    buffer: &mut Vec<u8>,
+    pipeline: &ReadPipeline,
 ) -> Result<Disposition> {
     match header.frame_type {
-        FrameType::Fetch => handle_fetch(stream, header, session, context, buffer),
+        FrameType::Fetch => handle_fetch(stream, header, session, context, pipeline),
         FrameType::Ping => {
             write_frame(stream, &FrameHeader::bare(FrameType::Pong), &[])?;
             Ok(Disposition::Continue)
@@ -333,7 +343,7 @@ fn handle_fetch(
     header: &FrameHeader,
     session: &SessionId,
     context: &Context,
-    buffer: &mut Vec<u8>,
+    pipeline: &ReadPipeline,
 ) -> Result<Disposition> {
     if header.wire_len != TICKET_LEN as u64 {
         let e = ServerError::Protocol(format!(
@@ -377,36 +387,42 @@ fn handle_fetch(
         }
     };
 
-    let len = header.logical_len as usize;
-    if buffer.len() < len {
-        // Grows to whatever this connection is asked for, capped by
-        // max_fetch_bytes above, and is then reused for every later fetch.
-        buffer.resize(len, 0);
-    }
-    let dst = &mut buffer[..len];
-
     if let Err(e) = entry
         .layout()
         .check_range(header.offset, header.logical_len)
-        .and_then(|()| {
-            entry
-                .dataset()
-                .read_range(entry.layout(), header.offset, dst)
-        })
     {
         let class = e.class();
         send_error(stream, header, class, &e)?;
         return Ok(Disposition::Continue);
     }
 
-    // A read can take a while on a cold cache, and the plan must not have
-    // expired out from under the reply it is about to send.
-    context.transfers.touch(&entry);
-    write_frame(
-        stream,
-        &FrameHeader::data(header.request_id, header.offset, header.logical_len),
-        dst,
-    )?;
+    // Hand the range to the reader and write out each piece as it arrives. The
+    // pieces go as separate DATA frames; a fetch and a frame were never
+    // required to be the same size, and this is what that is for.
+    pipeline.request(entry.clone(), header.offset, header.logical_len)?;
+    loop {
+        match pipeline.next_piece()? {
+            Piece::Data { offset, bytes, len } => {
+                let frame = FrameHeader::data(header.request_id, offset, len as u64);
+                let sent = write_frame(stream, &frame, &bytes[..len]);
+                pipeline.recycle(bytes);
+                sent?;
+            }
+            Piece::Done => break,
+            Piece::Failed(e) => {
+                // Whatever went out before this stands; the client abandons the
+                // fetch on the error and asks for the same range again, which
+                // is always safe because a fetch names what it wants.
+                let class = e.class();
+                send_error(stream, header, class, &e)?;
+                return Ok(Disposition::Continue);
+            }
+        }
+        // A large fetch off a cold cache takes a while, and the plan must not
+        // expire out from under the reply it is still sending.
+        context.transfers.touch(&entry);
+    }
+
     Ok(Disposition::Continue)
 }
 

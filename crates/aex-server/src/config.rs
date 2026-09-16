@@ -73,8 +73,13 @@ pub struct Limits {
 #[serde(deny_unknown_fields, default)]
 pub struct Transfer {
     pub default_chunk_bytes: u64,
-    /// Read buffers per connection, for overlapping a read with a send.
+    /// Read buffers per connection, circulating between its reader thread and
+    /// its writer. One makes the two take turns; two or more lets them overlap.
     pub read_buffers: u32,
+    /// Size of each of those buffers, and so how much of a fetch one `DATA`
+    /// frame carries. A fetch larger than this is answered in several frames,
+    /// which is what gives the reader and the writer something to overlap.
+    pub read_buffer_bytes: u64,
     pub max_fetch_bytes: u64,
     /// Selections at most this large come back inside the transfer plan, which
     /// keeps an interactive read at one round trip.
@@ -134,6 +139,7 @@ impl Default for Transfer {
         Transfer {
             default_chunk_bytes: 4 * 1024 * 1024,
             read_buffers: 3,
+            read_buffer_bytes: 512 * 1024,
             max_fetch_bytes: 16 * 1024 * 1024,
             inline_limit_bytes: 64 * 1024,
             decode_cache_bytes: 0,
@@ -195,6 +201,9 @@ impl ServerConfig {
         if self.transfer.read_buffers == 0 {
             return bad("transfer.read_buffers must be at least 1".to_string());
         }
+        if self.transfer.read_buffer_bytes == 0 {
+            return bad("transfer.read_buffer_bytes must be at least 1".to_string());
+        }
         if self.transfer.max_fetch_bytes < self.transfer.default_chunk_bytes {
             // A client that follows the recommended chunk size must not have
             // every one of its fetches rejected.
@@ -230,6 +239,8 @@ mod tests {
         assert_eq!(cfg.limits.max_sessions, 64);
         assert_eq!(cfg.transfer.default_chunk_bytes, 4 * 1024 * 1024);
         assert_eq!(cfg.transfer.inline_limit_bytes, 64 * 1024);
+        assert_eq!(cfg.transfer.read_buffers, 3);
+        assert_eq!(cfg.transfer.read_buffer_bytes, 512 * 1024);
         assert!(cfg.tcp.nodelay);
         cfg.validate().expect("the defaults must be valid");
     }
@@ -306,6 +317,10 @@ mod tests {
 
         let mut cfg = ServerConfig::default();
         cfg.limits.max_sessions = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = ServerConfig::default();
+        cfg.transfer.read_buffer_bytes = 0;
         assert!(cfg.validate().is_err());
     }
 }
