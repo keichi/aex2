@@ -44,6 +44,10 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 - `tcp.sndbuf` / `tcp.congestion` は設定を受け付けるがまだ適用しない
   (起動時に警告を出す)
 
+ローカル (同一ホスト) での転送性能の測定結果は
+[docs/benchmark-m2-local.md](docs/benchmark-m2-local.md) にある。ディスク上のデータでは
+`pread` の限界の 99.6 %、メモリ上のデータでは単一接続で 43 % (接続を増やせば 71 %)。
+
 ## 転送の流れ
 
 ```
@@ -137,6 +141,8 @@ crates/aex-wire/   データプレーンのワイヤ形式 (サーバとクラ�
 crates/aex-proto/  aex.proto から生成されるコードと型変換
 crates/aex-server/ サーバ (両プレーン)
 crates/aex-client/ Rust クライアント
+benchmarks/        転送性能の測定 (基準値の iperf3 / pread と、端から端まで)
+docs/              測定結果
 tests/rust/        サーバとクライアントを同一プロセスで動かす統合テスト
 ```
 

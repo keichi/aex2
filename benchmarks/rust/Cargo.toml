@@ -1,0 +1,13 @@
+[package]
+name = "aex-bench"
+description = "AEX2 transfer benchmarks: fixtures, baselines and end-to-end runs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+aex-client.workspace = true
+clap.workspace = true
+libc = "0.2"
