@@ -11,21 +11,58 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 
 ## 状態
 
-**M1 (コントロールプレーン) まで実装済み。** Rust クライアントからサーバに接続し、
-`.npy` のメタデータを取得できる。
+**M2 (データプレーン最小構成) まで実装済み。** Rust クライアントから `.npy` の
+選択を取得できる。実データは protobuf を一切通らず、カーネルから呼び出し側の
+バッファへ直接読み込まれる。
 
-- `aex-core` — `DType` (14 要素型と numpy `descr` の相互変換)、`ErrorClass` /
-  `AexError` (SPEC §5.6 の 6 クラス)、`ArrayFile` / `ArrayDataset` トレイト、
-  `.npy` バックエンド (ヘッダ解析と `pread` による範囲読み出し)
-- `aex-proto` — `protos/aex.proto` から tonic/prost が生成するコード。proto は
-  SPEC §5 の全定義を含む
-- `aex-server` — `Connect` / `Disconnect` / `OpenFile` / `CloseFile` /
-  `GetItem` / `ListChildren`、セッションとファイルのレジストリ、データルート
-  によるパス制限、SPEC §8.2 の設定ファイル
-- `aex-client` — 同期 API の Rust クライアント (内部に tokio ランタイムを持つ)
+- `aex-core` — `DType`、`ErrorClass` / `AexError`、選択の解決 (`Index` の正規化と
+  `SelectionLayout`)、`ArrayFile` / `ArrayDataset` トレイト、`.npy` バックエンド
+- `aex-wire` — データプレーンのワイヤ形式。ハンドシェイク、32 バイト固定ヘッダの
+  フレーム、複数接続が 1 個の出力バッファへ書き込むための `ScatterBuffer`。
+  サーバとクライアントが**同一コードから**エンコード/デコードする
+- `aex-proto` — `protos/aex.proto` から tonic/prost が生成するコードと、
+  生成型とコア型の相互変換
+- `aex-server` — コントロールプレーン (セッション、ファイル、メタデータ、
+  `PrepareSelection`)、`TransferRegistry`、接続ごとに専用スレッドを持つ
+  データプレーン
+- `aex-client` — 同期 API の Rust クライアント。`read_selection_into` /
+  `read_selection` / `read_selection_as`
 
-データ転送 (`PrepareSelection` / データプレーン) と Python バインディングは
-まだない。転送系の RPC は `UNIMPLEMENTED` を返す。
+Python バインディング (`aex-py` と `python/`) はまだない。`PrepareSelections`
+(gather) と `ApplyFunction` は `UNIMPLEMENTED` を返す。
+
+### この時点での制限
+
+M4 以降で解消する予定の、**実装上の**制限 (プロトコルの制限ではない)。
+
+- **連続な選択のみ**。`arr[:]` / `arr[5]` / `arr[10:20]` / `arr[[8,9,10]]` のように
+  ソース上で 1 個の連続領域になる選択を扱う。`arr[:, 0:50]` や `arr[::2]` のような
+  ストライド選択・断片的選択は `ErrorClass::Request` で明示的に拒否する
+- **データ接続は 1 本**。チャンク分割はクライアントが行い、1 本の接続で逐次
+  フェッチする。並列ストリーム・ワークスティーリング・credit パイプラインは未実装
+- サーバの読み出しと送出は逐次 (ダブルバッファリング未実装)
+- `tcp.sndbuf` / `tcp.congestion` は設定を受け付けるがまだ適用しない
+  (起動時に警告を出す)
+
+## 転送の流れ
+
+```
+クライアント                                            サーバ
+  │ ── gRPC: PrepareSelection ──────────────────────→ │ 選択を解決
+  │ ←── TransferPlan{request_id, ticket, total} ───── │ plan を登録
+  │                                                    │
+  │  出力バッファを確保し、論理バイト列をチャンクに分割 │
+  │ ── FETCH{request_id, offset, len} + ticket ─────→ │ pread → バッファ
+  │ ←── DATA{request_id, offset, len} + 生バイト ──── │ writev(header, buf)
+```
+
+選択が `inline_limit_bytes` (既定 64 KiB) 以下なら、サーバは `TransferPlan` に
+データ本体を載せて返す。データプレーンを一切使わず 1 RTT で完結するため、小さい
+対話的な取得が v1 より遅くなることがない。
+
+すべてのオフセットは**論理バイト列** (選択結果を C 順で平坦化した仮想的なバイト列)
+上の座標である。そのためチャンクはどの接続で受け取っても正しい位置に書け、失われた
+チャンクだけを再取得できる。
 
 ## ビルドとテスト
 
@@ -43,7 +80,8 @@ $ cargo fmt --all -- --check
 ## 使い方
 
 ```console
-$ aex-server --control-addr 127.0.0.1:50051 --root /path/to/data
+$ aex-server --control-addr 127.0.0.1:50051 --data-addr 127.0.0.1:50052 \
+    --root /path/to/data
 ```
 
 設定ファイルを渡すこともできる (指定しなかった項目は既定値のまま)。項目は
@@ -54,15 +92,29 @@ $ aex-server --config server.toml
 ```
 
 ```rust
-use aex_client::{Client, ClientConfig, Item};
+use aex_client::{Client, ClientConfig, Index, Item};
 
 let client = Client::connect("http://127.0.0.1:50051", ClientConfig::default())?;
 let handle = client.open("ocean.npy")?;           // データルート配下の相対パス
+
 if let Item::Dataset(info) = client.get_item(handle, "array")? {
     println!("{:?} {:?}", info.dtype, info.shape);
 }
+
+// 配列全体、または先頭軸の連続した範囲
+let all = client.read_selection_as::<f32>(handle, "array", &[])?;
+let rows = client.read_selection_as::<f32>(handle, "array", &[Index::range(10, 20)])?;
+println!("{:?} {:.1} MiB/s", rows.shape, rows.transfer.throughput_mib_per_sec());
+
+// 呼び出し側のバッファへ直接読む (コピーが 1 回も入らない経路)
+let mut buf = vec![0u8; all.bytes.len()];
+client.read_selection_into(handle, "array", &[], &mut buf)?;
+
 client.disconnect()?;
 ```
+
+ベンチマークのパラメータ掃引のため、主要な設定は環境変数でも上書きできる
+(`AEX_STREAMS`、`AEX_CHUNK_BYTES`、`AEX_MAX_RETRIES`、`AEX_TCP_NODELAY` ほか)。
 
 ## 前提と制約
 
@@ -70,18 +122,22 @@ client.disconnect()?;
 - `.npy` のみ対応。HDF5 / netCDF4 / Zarr は将来課題 (SPEC §14.1)
 - 読み出し専用
 - fortran order とビッグエンディアンの `.npy` は非対応 (SPEC §7.2)
-- 「少数クライアント・信頼できる環境」を前提とする。厳密なマルチテナント制御は行わない
+- データプレーンは平文。認証はセッショントークンと転送ごとの ticket のみで、
+  「少数クライアント・信頼できる環境」を前提とする。厳密なマルチテナント制御や
+  暗号化は行わない (TLS は HELLO の `flags` に枠のみ確保)
+- 接続ごとに専用 OS スレッドを使う。スレッド数は
+  `クライアント数 × 接続数` に比例する
 
 ## リポジトリ構成
 
 ```
 protos/aex.proto   コントロールプレーンの定義
-crates/aex-core/   共通型とバックエンド (tokio / tonic に依存しない)
-crates/aex-proto/  aex.proto から生成されるコード
-crates/aex-server/ サーバ (コントロールプレーン)
+crates/aex-core/   共通型・選択の解決・バックエンド (tokio / tonic に依存しない)
+crates/aex-wire/   データプレーンのワイヤ形式 (サーバとクライアントで共用)
+crates/aex-proto/  aex.proto から生成されるコードと型変換
+crates/aex-server/ サーバ (両プレーン)
 crates/aex-client/ Rust クライアント
 tests/rust/        サーバとクライアントを同一プロセスで動かす統合テスト
 ```
 
-M2 以降で `aex-wire` (データプレーンのフレーム)、M3 で `aex-py` と `python/` が
-加わる (SPEC §4)。
+M3 で `aex-py` と `python/` が加わる (SPEC §4)。
