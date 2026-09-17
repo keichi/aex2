@@ -150,6 +150,61 @@ impl Drop for TestServer {
     }
 }
 
+/// A session opened over gRPC alone, holding no data connections, for tests
+/// that speak the data plane by hand.
+pub struct RawSession {
+    pub hello: aex_wire::Hello,
+    id: Vec<u8>,
+    control: aex_proto::aex_control_client::AexControlClient<tonic::transport::Channel>,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl RawSession {
+    pub fn disconnect(&mut self) {
+        let request = aex_proto::DisconnectRequest {
+            session_id: self.id.clone(),
+        };
+        self.runtime
+            .block_on(self.control.disconnect(request))
+            .expect("disconnect");
+    }
+}
+
+impl TestServer {
+    pub fn raw_session(&self, streams: u32) -> RawSession {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let channel = runtime
+            .block_on(
+                tonic::transport::Endpoint::from(
+                    self.url.parse::<tonic::codegen::http::Uri>().unwrap(),
+                )
+                .connect(),
+            )
+            .expect("connect");
+        let mut control = aex_proto::aex_control_client::AexControlClient::new(channel);
+        let reply = runtime
+            .block_on(control.connect(aex_proto::ConnectRequest {
+                protocol_version: aex_client::PROTOCOL_VERSION,
+                desired_streams: streams,
+                client_name: "raw".to_string(),
+            }))
+            .expect("session")
+            .into_inner();
+        RawSession {
+            hello: aex_wire::Hello::new(
+                reply.session_id.clone().try_into().expect("16 bytes"),
+                reply.session_token.try_into().expect("16 bytes"),
+            ),
+            id: reply.session_id,
+            control,
+            runtime,
+        }
+    }
+}
+
 /// A TCP proxy in front of the data plane that can break connections.
 ///
 /// Threads are left to die with the sockets; a test process is short-lived.

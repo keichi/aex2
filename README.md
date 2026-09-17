@@ -26,7 +26,9 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
   `PrepareSelection`)、`TransferRegistry`、接続ごとに読みスレッドと送りスレッドを
   持つデータプレーン
 - `aex-client` — 同期 API の Rust クライアント。`prepare` / `fill`、
-  `read_selection_into` / `read_selection` / `read_selection_as`
+  `read_selection_into` / `read_selection` / `read_selection_as`。転送は
+  `granted_streams` 本の接続へワークスティーリングで配り、各接続は credit 個まで
+  `FETCH` を先行投入する。切れた接続のチャンクだけを別接続で再取得する
 - `aex-py` — PyO3 による拡張モジュール `aex._aex`。ネットワーク待ちの間は GIL を解放し、
   出力配列を検証してから直接書き込む
 - `python/aex` — v1 と同じ API (`Client` / `FileProxy` / `GroupProxy` / `ArrayProxy`)。
@@ -44,10 +46,8 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 - **numpy 関数はすべてクライアントで計算する**。`np.sum(arr)` なども配列全体を
   転送してから計算する (64 MiB を超えると `AexFallbackWarning`)。サーバ側の集約は M5
 - **多次元の整数インデックス配列は非対応**。1 次元にして送り、結果を reshape すること
-- **データ接続は 1 本**。チャンク分割はクライアントが行い、1 本の接続で逐次
-  フェッチする。並列ストリーム・ワークスティーリング・credit パイプラインは未実装。
-  なお localhost では単一接続で既にマシンの限界に達しており、接続を増やしても
-  合計は増えない
+- **credit は固定値** (既定 4、`AEX_CREDIT`)。RTT と帯域から自動で決める処理は
+  M6 の測定後に入れる
 - `tcp.congestion` は Linux でのみ適用する (他の OS では起動時に警告を出す)
 
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある

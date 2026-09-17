@@ -40,15 +40,9 @@ fn shake_hands(stream: &mut TcpStream, hello: &Hello) -> Ready {
 #[test]
 fn a_connection_with_the_session_token_is_accepted() {
     let server = TestServer::start();
-    let client = server.connect();
-    let session = client.session();
+    let session = server.raw_session(1);
 
-    let mut stream = dial(&server);
-    let hello = Hello::new(
-        session.id.clone().try_into().expect("16 bytes"),
-        session.token.clone().try_into().expect("16 bytes"),
-    );
-    let ready = shake_hands(&mut stream, &hello);
+    let ready = shake_hands(&mut dial(&server), &session.hello);
     assert!(ready.is_accepted(), "{ready:?}");
     assert_eq!(ready.version, aex_wire::PROTOCOL_VERSION);
 }
@@ -56,10 +50,8 @@ fn a_connection_with_the_session_token_is_accepted() {
 #[test]
 fn a_connection_without_the_right_token_is_refused() {
     let server = TestServer::start();
-    let client = server.connect();
-    let session = client.session();
-    let id: [u8; 16] = session.id.clone().try_into().unwrap();
-    let token: [u8; 16] = session.token.clone().try_into().unwrap();
+    let mut session = server.raw_session(1);
+    let (id, token) = (session.hello.session_id, session.hello.session_token);
 
     // The right session, the wrong token.
     let mut wrong_token = token;
@@ -72,7 +64,7 @@ fn a_connection_without_the_right_token_is_refused() {
     assert_eq!(ready.status, ErrorClass::Auth);
 
     // A session that has ended takes its data connections with it.
-    client.disconnect().expect("disconnect");
+    session.disconnect();
     let ready = shake_hands(&mut dial(&server), &Hello::new(id, token));
     assert_eq!(ready.status, ErrorClass::Auth);
 }
@@ -99,13 +91,9 @@ fn something_that_is_not_a_handshake_is_refused_as_a_protocol_error() {
 #[test]
 fn a_client_speaking_another_version_is_refused() {
     let server = TestServer::start();
-    let client = server.connect();
-    let session = client.session();
+    let session = server.raw_session(1);
 
-    let mut hello = Hello::new(
-        session.id.clone().try_into().unwrap(),
-        session.token.clone().try_into().unwrap(),
-    );
+    let mut hello = session.hello;
     hello.version = aex_wire::PROTOCOL_VERSION + 1;
     let ready = shake_hands(&mut dial(&server), &hello);
     // Refused here rather than showing up later as a frame nobody can parse.
@@ -115,19 +103,16 @@ fn a_client_speaking_another_version_is_refused() {
 #[test]
 fn a_session_opens_no_more_connections_than_it_was_granted() {
     let server = TestServer::start_with(|config| config.limits.max_streams_per_session = 2);
-    // The client opens one of the two as it connects.
-    let client = server.connect();
-    let session = client.session();
-    assert_eq!(session.granted_streams, 2);
-    let hello = Hello::new(
-        session.id.clone().try_into().unwrap(),
-        session.token.clone().try_into().unwrap(),
-    );
+    // Asking for more than the server allows gets its limit.
+    let session = server.raw_session(8);
+    let hello = &session.hello;
 
+    let mut first = dial(&server);
+    assert!(shake_hands(&mut first, hello).is_accepted());
     let mut second = dial(&server);
-    assert!(shake_hands(&mut second, &hello).is_accepted());
+    assert!(shake_hands(&mut second, hello).is_accepted());
 
-    let ready = shake_hands(&mut dial(&server), &hello);
+    let ready = shake_hands(&mut dial(&server), hello);
     // Temporary, not a refusal: it clears as the others close.
     assert_eq!(ready.status, ErrorClass::Transient);
 
@@ -135,7 +120,7 @@ fn a_session_opens_no_more_connections_than_it_was_granted() {
     drop(second);
     let freed = (0..100).any(|_| {
         std::thread::sleep(Duration::from_millis(20));
-        shake_hands(&mut dial(&server), &hello).is_accepted()
+        shake_hands(&mut dial(&server), hello).is_accepted()
     });
     assert!(freed, "a closed connection must free its slot");
 }
@@ -143,15 +128,10 @@ fn a_session_opens_no_more_connections_than_it_was_granted() {
 #[test]
 fn a_ping_is_answered_with_a_pong() {
     let server = TestServer::start();
-    let client = server.connect();
-    let session = client.session();
+    let session = server.raw_session(1);
 
     let mut stream = dial(&server);
-    let hello = Hello::new(
-        session.id.clone().try_into().unwrap(),
-        session.token.clone().try_into().unwrap(),
-    );
-    assert!(shake_hands(&mut stream, &hello).is_accepted());
+    assert!(shake_hands(&mut stream, &session.hello).is_accepted());
 
     write_frame(&mut stream, &FrameHeader::bare(FrameType::Ping), &[]).expect("ping");
     let pong = read_frame_header(&mut stream).expect("pong");
@@ -162,15 +142,10 @@ fn a_ping_is_answered_with_a_pong() {
 #[test]
 fn a_frame_only_a_server_may_send_ends_the_connection() {
     let server = TestServer::start();
-    let client = server.connect();
-    let session = client.session();
+    let session = server.raw_session(1);
 
     let mut stream = dial(&server);
-    let hello = Hello::new(
-        session.id.clone().try_into().unwrap(),
-        session.token.clone().try_into().unwrap(),
-    );
-    assert!(shake_hands(&mut stream, &hello).is_accepted());
+    assert!(shake_hands(&mut stream, &session.hello).is_accepted());
 
     // A DATA frame from a client means the two implementations disagree about
     // who says what, so the server says so and hangs up.
@@ -193,15 +168,10 @@ fn a_frame_only_a_server_may_send_ends_the_connection() {
 #[test]
 fn a_fetch_for_a_transfer_that_does_not_exist_is_reported_as_a_plan_error() {
     let server = TestServer::start();
-    let client = server.connect();
-    let session = client.session();
+    let session = server.raw_session(1);
 
     let mut stream = dial(&server);
-    let hello = Hello::new(
-        session.id.clone().try_into().unwrap(),
-        session.token.clone().try_into().unwrap(),
-    );
-    assert!(shake_hands(&mut stream, &hello).is_accepted());
+    assert!(shake_hands(&mut stream, &session.hello).is_accepted());
 
     write_frame(&mut stream, &FrameHeader::fetch(4242, 0, 1024), &[0u8; 16]).expect("fetch");
     let header = read_frame_header(&mut stream).expect("error frame");
@@ -243,7 +213,10 @@ fn the_whole_array_comes_back() {
     assert_eq!(array.data, expected);
     assert!(!array.transfer.inline);
     assert_eq!(array.transfer.bytes, 800_000);
-    assert_eq!(array.transfer.streams, 1);
+    // 800 KB in 4 MiB chunks would be one chunk; it is split so that each of
+    // the four connections has one.
+    assert_eq!(array.transfer.streams, 4);
+    assert_eq!(array.transfer.chunks, 4);
     assert_eq!(array.transfer.retries, 0);
 }
 

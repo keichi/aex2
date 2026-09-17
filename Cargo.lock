@@ -82,11 +82,13 @@ version = "0.1.0"
 dependencies = [
  "aex-client",
  "aex-core",
+ "aex-proto",
  "aex-server",
  "aex-wire",
  "npyz",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

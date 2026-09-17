@@ -21,13 +21,12 @@ use aex_proto::{
     CloseFileRequest, ConnectRequest, DisconnectRequest, GetItemRequest, ListChildrenRequest,
     OpenFileRequest, PrepareSelectionRequest,
 };
-use aex_wire::ScatterBuffer;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::config::ClientConfig;
 use crate::error::{ClientError, Result};
-use crate::pool::{ConnSettings, DataPool};
+use crate::pool::{ConnSettings, DataPool, FetchSpec};
 use crate::transfer::{ArrayData, Element, Plan, TransferResult, TypedArray};
 
 /// The data plane frame version this client speaks.
@@ -230,15 +229,18 @@ impl Client {
         // Opened now rather than at the first transfer, so that a data plane
         // which cannot be reached is reported here, and so that the first large
         // read does not pay for a handshake.
-        let pool = DataPool::connect(ConnSettings {
-            host: session.data_endpoint.0.clone(),
-            port: session.data_endpoint.1,
-            session_id: as_16_bytes(&session.id, "session id")?,
-            session_token: as_16_bytes(&session.token, "session token")?,
-            nodelay: config.tcp_nodelay,
-            rcvbuf: config.rcvbuf,
-            connect_timeout: config.connect_timeout,
-        })?;
+        let pool = DataPool::connect(
+            ConnSettings {
+                host: session.data_endpoint.0.clone(),
+                port: session.data_endpoint.1,
+                session_id: as_16_bytes(&session.id, "session id")?,
+                session_token: as_16_bytes(&session.token, "session token")?,
+                nodelay: config.tcp_nodelay,
+                rcvbuf: config.rcvbuf,
+                connect_timeout: config.connect_timeout,
+            },
+            session.granted_streams,
+        )?;
 
         Ok(Client {
             control,
@@ -453,17 +455,25 @@ impl Client {
             });
         }
 
+        let chunk_bytes = self.chunk_bytes(plan.total_bytes);
+        let chunks = plan.chunks(chunk_bytes).count() as u32;
         let mut plan = plan.clone();
         let mut retries = 0;
         loop {
-            match self.run_transfer(&plan, dst) {
-                Ok((chunks, attempts)) => {
+            let spec = FetchSpec {
+                request_id: plan.request_id,
+                ticket: &plan.ticket,
+                credit: self.config.credit,
+                max_retries: self.config.max_retries,
+            };
+            match self.pool.fetch(spec, plan.chunks(chunk_bytes), dst) {
+                Ok(fetched) => {
                     return Ok(TransferResult {
                         bytes: plan.total_bytes,
                         elapsed: started.elapsed(),
                         chunks,
-                        streams: self.pool.streams(),
-                        retries: retries + attempts,
+                        streams: fetched.streams,
+                        retries: retries + fetched.retries,
                         inline: false,
                     })
                 }
@@ -485,39 +495,22 @@ impl Client {
         }
     }
 
-    /// Fetch every chunk of a plan. Returns the chunks and the retries.
-    fn run_transfer(&self, plan: &Plan, dst: &mut [u8]) -> Result<(u32, u32)> {
-        let chunk_bytes = self.chunk_bytes();
-        let scatter = ScatterBuffer::new(dst);
-        let mut chunks = 0;
-        let mut retries = 0;
-
-        for (offset, len) in plan.chunks(chunk_bytes) {
-            let mut slice = scatter.claim(offset, len)?;
-            retries += self.pool.fetch_into(
-                plan.request_id,
-                &plan.ticket,
-                offset,
-                &mut slice,
-                self.config.max_retries,
-            )?;
-            chunks += 1;
-        }
-        Ok((chunks, retries))
-    }
-
     /// How much of the logical byte stream one fetch asks for.
     ///
     /// The client decides this, not the server: what makes a good chunk size —
     /// how many connections there are, what the round trip and the bandwidth
     /// are — is all known on this side. The server only states a ceiling.
-    fn chunk_bytes(&self) -> u64 {
-        let wanted = if self.config.chunk_bytes == 0 {
-            self.session.default_chunk_bytes
-        } else {
-            self.config.chunk_bytes
-        };
-        wanted.clamp(1, self.session.max_fetch_bytes.max(1))
+    fn chunk_bytes(&self, total_bytes: u64) -> u64 {
+        let ceiling = self.session.max_fetch_bytes.max(1);
+        if self.config.chunk_bytes != 0 {
+            // A benchmark sweeping this wants exactly what it asked for.
+            return self.config.chunk_bytes.clamp(1, ceiling);
+        }
+        split_for_streams(
+            self.session.default_chunk_bytes.clamp(1, ceiling),
+            total_bytes,
+            self.pool.streams(),
+        )
     }
 
     /// Release the session and everything it holds.
@@ -539,6 +532,23 @@ impl Client {
         let response = self.runtime.block_on(rpc(self.control.clone()))?;
         Ok(response.into_inner())
     }
+}
+
+/// Chunks are not cut smaller than this to keep extra connections busy: past
+/// here the headers and syscalls start to cost more than the parallelism gains.
+const MIN_CHUNK_BYTES: u64 = 256 * 1024;
+
+/// Shrink `chunk_bytes` so that a transfer has a chunk for every connection,
+/// down to [`MIN_CHUNK_BYTES`].
+fn split_for_streams(chunk_bytes: u64, total_bytes: u64, streams: u32) -> u64 {
+    let streams = u64::from(streams.max(1));
+    if total_bytes.div_ceil(chunk_bytes) >= streams {
+        return chunk_bytes;
+    }
+    total_bytes
+        .div_ceil(streams)
+        .max(MIN_CHUNK_BYTES)
+        .min(chunk_bytes)
 }
 
 /// Convert one item off the wire.
@@ -722,6 +732,20 @@ mod tests {
         assert_eq!(strip_brackets("example.org"), "example.org");
         // Brackets around something that is not an address are left alone.
         assert_eq!(strip_brackets("[host]"), "[host]");
+    }
+
+    #[test]
+    fn a_small_transfer_is_split_to_keep_every_connection_busy() {
+        const MIB: u64 = 1 << 20;
+        // Plenty of chunks already.
+        assert_eq!(split_for_streams(4 * MIB, 64 * MIB, 4), 4 * MIB);
+        // Two chunks for four connections becomes four.
+        assert_eq!(split_for_streams(4 * MIB, 8 * MIB, 4), 2 * MIB);
+        assert_eq!(split_for_streams(4 * MIB, 8 * MIB + 1, 4), 2 * MIB + 1);
+        // Not below the floor, even if some connections then sit idle.
+        assert_eq!(split_for_streams(4 * MIB, MIB, 16), MIN_CHUNK_BYTES);
+        // Never above what was asked for.
+        assert_eq!(split_for_streams(128 * 1024, 200 * 1024, 4), 128 * 1024);
     }
 
     #[test]

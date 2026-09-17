@@ -11,6 +11,9 @@ use std::time::Duration;
 /// the gain flattens while the server-side cost does not.
 pub const DEFAULT_STREAMS: u32 = 4;
 
+/// Fetches outstanding per connection until measurements say otherwise.
+pub const DEFAULT_CREDIT: u32 = 4;
+
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// Data connections to ask for. 0 accepts whatever the server suggests.
@@ -24,6 +27,10 @@ pub struct ClientConfig {
     /// server's recommendation, which is the right answer unless a benchmark is
     /// sweeping this.
     pub chunk_bytes: u64,
+    /// Fetches one connection may have outstanding at once. Deeper hides more
+    /// of the round trip on a long link, at the cost of more data to drain if
+    /// the transfer is abandoned.
+    pub credit: u32,
     /// How many times a chunk may be fetched again before the transfer fails.
     pub max_retries: u32,
     /// Whether to disable Nagle on the data connections. A fetch is 48 bytes
@@ -45,6 +52,7 @@ impl Default for ClientConfig {
             connect_timeout: Duration::from_secs(10),
             max_message_bytes: 4 * 1024 * 1024,
             chunk_bytes: 0,
+            credit: DEFAULT_CREDIT,
             max_retries: 3,
             tcp_nodelay: true,
             rcvbuf: None,
@@ -79,6 +87,9 @@ impl ClientConfig {
         }
         if let Some(bytes) = lookup("AEX_CHUNK_BYTES").and_then(|v| v.parse().ok()) {
             self.chunk_bytes = bytes;
+        }
+        if let Some(credit) = lookup("AEX_CREDIT").and_then(|v| v.parse().ok()) {
+            self.credit = credit;
         }
         if let Some(retries) = lookup("AEX_MAX_RETRIES").and_then(|v| v.parse().ok()) {
             self.max_retries = retries;
@@ -129,6 +140,7 @@ mod tests {
         // client should be doing.
         assert_eq!(config.chunk_bytes, 0);
         assert_eq!(config.max_retries, 3);
+        assert_eq!(config.credit, DEFAULT_CREDIT);
         assert!(config.tcp_nodelay);
         assert_eq!(config.rcvbuf, None);
     }
@@ -141,10 +153,12 @@ mod tests {
             "AEX_CHUNK_BYTES" => Some("262144".to_string()),
             "AEX_TCP_NODELAY" => Some("off".to_string()),
             "AEX_RCVBUF" => Some("8388608".to_string()),
+            "AEX_CREDIT" => Some("1".to_string()),
             _ => None,
         });
         assert_eq!(config.streams, 16);
         assert_eq!(config.rcvbuf, Some(8 << 20));
+        assert_eq!(config.credit, 1);
         assert_eq!(config.connect_timeout, Duration::from_millis(250));
         assert_eq!(config.chunk_bytes, 256 * 1024);
         assert!(!config.tcp_nodelay);
