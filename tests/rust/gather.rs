@@ -8,7 +8,10 @@ use aex_core::Encoding;
 #[path = "support.rs"]
 mod support;
 
-use support::TestServer;
+use std::time::{Duration, Instant};
+
+use aex_client::ClientConfig;
+use support::{Fault, Proxy, TestServer};
 
 const ROW: usize = 2000;
 
@@ -162,6 +165,47 @@ fn a_quality_the_server_lacks_falls_back_to_exact() {
     assert_eq!(plan.dtype, DType::Float32);
     let (data, _) = fill_all(&client, &[plan], &[selection]).expect("fill");
     assert_eq!(data[0], expected[..10 * ROW]);
+}
+
+#[test]
+fn a_batch_costs_one_round_trip_where_one_by_one_costs_many() {
+    let server = TestServer::start();
+    server.write_counting_npy("grid.npy", &[64, ROW]);
+    let control: std::net::SocketAddr = server.url.trim_start_matches("http://").parse().unwrap();
+    // 10 ms each way: a 20 ms round trip on the control plane only.
+    let proxy = Proxy::start(control, Fault::Delay(Duration::from_millis(10)));
+    let client = Client::connect(&format!("http://{}", proxy.addr), ClientConfig::default())
+        .expect("connect");
+    let handle = client.open("grid.npy").expect("open");
+
+    // Twenty rows, each small enough to come back inline.
+    let keys: Vec<_> = (0..20).map(|i| rows(i, i + 1)).collect();
+    let sels = selections(handle, &keys);
+
+    let started = Instant::now();
+    for selection in &sels {
+        client.prepare_selection(selection).expect("prepare");
+    }
+    let one_by_one = started.elapsed();
+
+    let started = Instant::now();
+    let plans: Vec<Plan> = client
+        .prepare_many(&sels)
+        .expect("prepare")
+        .into_iter()
+        .map(|r| r.expect("plan"))
+        .collect();
+    fill_all(&client, &plans, &sels).expect("fill");
+    let batch = started.elapsed();
+
+    assert!(
+        one_by_one >= Duration::from_millis(20 * 20),
+        "{one_by_one:?}"
+    );
+    assert!(
+        batch * 4 < one_by_one,
+        "batch {batch:?}, one by one {one_by_one:?}"
+    );
 }
 
 #[test]

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use aex_client::{Client, ClientConfig, ClientError};
 use aex_core::ErrorClass;
@@ -215,6 +216,9 @@ pub enum Fault {
     /// Answer the first fetch on each connection with a TRANSIENT error
     /// instead of passing it on. Being first, it cannot land inside a frame.
     FailFirstFetch,
+    /// Hold every read this long before passing it on, in either direction:
+    /// a long link, one round trip costing twice this.
+    Delay(Duration),
 }
 
 /// A TCP proxy in front of the data plane that can break connections.
@@ -300,7 +304,17 @@ fn pump_up(mut client: TcpStream, mut server: TcpStream, down: &Mutex<TcpStream>
             return;
         }
     }
-    let _ = std::io::copy(&mut client, &mut server);
+    if let Fault::Delay(delay) = fault {
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(n @ 1..) = client.read(&mut buf) {
+            std::thread::sleep(delay);
+            if server.write_all(&buf[..n]).is_err() {
+                break;
+            }
+        }
+    } else {
+        let _ = std::io::copy(&mut client, &mut server);
+    }
     let _ = server.shutdown(Shutdown::Write);
 }
 
@@ -315,6 +329,9 @@ fn pump_down(mut server: TcpStream, down: &Mutex<TcpStream>, fault: Fault, cuts:
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        if let Fault::Delay(delay) = fault {
+            std::thread::sleep(delay);
+        }
         let pass = (n as u64).min(left) as usize;
         let mut client = down.lock().unwrap();
         if client.write_all(&buf[..pass]).is_err() {
