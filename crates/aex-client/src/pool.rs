@@ -216,15 +216,28 @@ fn dial(addr: &SocketAddr, settings: &ConnSettings) -> std::io::Result<TcpStream
     Ok(socket.into())
 }
 
-/// What one transfer asks of the pool.
+/// How the pool runs one batch of transfers.
 #[derive(Debug, Clone, Copy)]
-pub struct FetchSpec<'a> {
-    pub request_id: u32,
-    pub ticket: &'a Ticket,
+pub struct FetchSpec {
     /// Fetches one connection may have outstanding.
     pub credit: u32,
     /// Times one chunk may be fetched again before the transfer fails.
     pub max_retries: u32,
+}
+
+/// One plan's share of a batch: its chunks, and where they go.
+pub struct FetchPart<'a> {
+    pub request_id: u32,
+    pub ticket: &'a Ticket,
+    pub chunks: Vec<(u64, u64)>,
+    pub dst: &'a mut [u8],
+}
+
+/// A part once its buffer is split up for the connections.
+struct Part<'a> {
+    request_id: u32,
+    ticket: &'a Ticket,
+    scatter: ScatterBuffer<'a>,
 }
 
 /// How a transfer went on the data plane.
@@ -278,19 +291,28 @@ impl DataPool {
         self.conns.len() as u32
     }
 
-    /// Fetch `chunks` of a transfer into `dst`, over as many connections as
-    /// there are chunks to keep busy.
-    pub fn fetch(
-        &self,
-        spec: FetchSpec<'_>,
-        chunks: impl Iterator<Item = (u64, u64)>,
-        dst: &mut [u8],
-    ) -> Result<Fetched> {
-        let queue: VecDeque<Chunk> = chunks
-            .map(|(offset, len)| Chunk {
-                offset,
-                len,
-                attempts: 0,
+    /// Fetch the chunks of every part into its buffer, over as many
+    /// connections as there are chunks to keep busy.
+    ///
+    /// The parts share one queue, so a batch of plans fills the connections as
+    /// one transfer would, rather than one plan at a time.
+    pub fn fetch(&self, spec: FetchSpec, parts: Vec<FetchPart<'_>>) -> Result<Fetched> {
+        let mut queue = VecDeque::new();
+        let parts: Vec<Part<'_>> = parts
+            .into_iter()
+            .enumerate()
+            .map(|(part, p)| {
+                queue.extend(p.chunks.iter().map(|&(offset, len)| Chunk {
+                    part,
+                    offset,
+                    len,
+                    attempts: 0,
+                }));
+                Part {
+                    request_id: p.request_id,
+                    ticket: p.ticket,
+                    scatter: ScatterBuffer::new(p.dst),
+                }
             })
             .collect();
         let used = queue.len().min(self.conns.len());
@@ -301,11 +323,10 @@ impl DataPool {
             });
         }
 
-        let scatter = ScatterBuffer::new(dst);
         let transfer = Transfer {
             pool: self,
             spec,
-            scatter: &scatter,
+            parts: &parts,
             state: Mutex::new(State {
                 remaining: queue.len(),
                 queue,
@@ -369,6 +390,8 @@ impl DataPool {
 /// A range of the logical byte stream still to be fetched.
 #[derive(Debug, Clone, Copy)]
 struct Chunk {
+    /// Which part of the batch it belongs to.
+    part: usize,
     offset: u64,
     len: u64,
     /// Fetches of it that failed.
@@ -398,8 +421,8 @@ struct State {
 
 struct Transfer<'a> {
     pool: &'a DataPool,
-    spec: FetchSpec<'a>,
-    scatter: &'a ScatterBuffer<'a>,
+    spec: FetchSpec,
+    parts: &'a [Part<'a>],
     state: Mutex<State>,
     wake: Condvar,
 }
@@ -523,17 +546,15 @@ impl Transfer<'_> {
             }
         };
 
-        let FetchSpec {
-            request_id, ticket, ..
-        } = self.spec;
         for chunk in fresh {
-            let slice = self.scatter.claim(chunk.offset, chunk.len)?;
+            let part = &self.parts[chunk.part];
+            let slice = part.scatter.claim(chunk.offset, chunk.len)?;
             flight.push_back(InFlight {
                 chunk,
                 slice,
                 received: 0,
             });
-            conn.send_fetch(request_id, ticket, chunk.offset, chunk.len)?;
+            conn.send_fetch(part.request_id, part.ticket, chunk.offset, chunk.len)?;
         }
 
         let header = conn.read_header()?;
@@ -542,6 +563,7 @@ impl Transfer<'_> {
                 // The server answers fetches in order, so data is always for
                 // the oldest one outstanding.
                 let front = flight.front_mut().expect("a fetch is outstanding");
+                let request_id = self.parts[front.chunk.part].request_id;
                 conn.receive_data(&header, request_id, front.chunk.offset, &mut front.slice)?;
                 front.received += header.logical_len;
                 if front.received >= front.chunk.len {
@@ -558,6 +580,7 @@ impl Transfer<'_> {
                 let InFlight { chunk, slice, .. } =
                     flight.pop_front().expect("a fetch is outstanding");
                 drop(slice);
+                let request_id = self.parts[chunk.part].request_id;
                 if header.request_id != request_id || header.offset != chunk.offset {
                     return Err(ClientError::Protocol(format!(
                         "an error for [{}, ..) of transfer {} arrived while [{}, ..) of {request_id} was outstanding",

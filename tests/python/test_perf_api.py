@@ -1,4 +1,4 @@
-"""The performance APIs: read_into, stats."""
+"""The performance APIs: read_into, gather, stats."""
 
 import numpy as np
 import pytest
@@ -59,6 +59,39 @@ def test_read_into_refuses_a_read_only_buffer(array_proxy):
     out.flags.writeable = False
     with pytest.raises(aex.AexValueError):
         array_proxy.read_into(out, np.s_[0:10])
+
+
+# ============================================================
+# gather
+# ============================================================
+
+
+def test_gather_matches_indexing_one_by_one(array_proxy):
+    keys = [np.s_[0:10], np.s_[5], np.s_[:], np.s_[..., 3], np.s_[[1, 50], ::7], np.s_[2:2]]
+    results = array_proxy.gather(keys)
+    assert len(results) == len(keys)
+    for key, result in zip(keys, results, strict=True):
+        expected = expected_ds1()[key]
+        np.testing.assert_array_equal(result, expected)
+        assert result.shape == expected.shape
+        assert result.dtype == expected.dtype
+        assert not result.flags.writeable
+
+
+def test_gather_of_nothing_is_nothing(array_proxy):
+    assert array_proxy.gather([]) == []
+
+
+def test_gather_spans_several_batches(array_proxy):
+    # More than one PrepareSelections call's worth, many of them remote.
+    keys = [np.s_[i % 100 : i % 100 + 1 + i % 3] for i in range(150)]
+    for key, result in zip(keys, array_proxy.gather(keys), strict=True):
+        np.testing.assert_array_equal(result, expected_ds1()[key])
+
+
+def test_gather_raises_the_first_failure(array_proxy):
+    with pytest.raises(aex.AexValueError, match="500"):
+        array_proxy.gather([np.s_[0], np.s_[500], np.s_[600]])
 
 
 # ============================================================

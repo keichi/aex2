@@ -7,7 +7,9 @@
 
 use std::sync::{Arc, RwLock};
 
-use aex_client::{ClientConfig, ClientError, DType, ErrorClass, FileHandle, Index, Item};
+use aex_client::{
+    ClientConfig, ClientError, DType, ErrorClass, FileHandle, Index, Item, Selection,
+};
 use half::f16;
 use numpy::{
     Complex32, Complex64, Element, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods,
@@ -215,27 +217,88 @@ impl Client {
         .map(Plan)
     }
 
+    /// Resolve several selections of one dataset in one round trip. Each
+    /// element is a `Plan` or the exception it failed with.
+    fn prepare_many<'py>(
+        &self,
+        py: Python<'py>,
+        handle: u64,
+        name: String,
+        keys: Vec<Bound<'py, PyTuple>>,
+    ) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        let indices = keys
+            .iter()
+            .map(indices_from_py)
+            .collect::<PyResult<Vec<_>>>()?;
+        let handle = FileHandle::from_u64(handle);
+        let results = self.call(py, |c| c.prepare_many(&selections(handle, &name, &indices)))?;
+        results
+            .into_iter()
+            .map(|result| match result {
+                Ok(plan) => Ok(Bound::new(py, Plan(plan))?.into_any()),
+                Err(e) => Ok(to_py(e).into_value(py).into_bound(py).into_any()),
+            })
+            .collect()
+    }
+
     /// Transfer a plan into `out`, which must match it exactly.
     ///
     /// On failure the contents of `out` are undefined.
     fn fill(
         &self,
         py: Python<'_>,
-        plan: &Plan,
+        plan: Bound<'_, Plan>,
         handle: u64,
         name: String,
-        key: &Bound<'_, PyTuple>,
-        out: &Bound<'_, PyUntypedArray>,
+        key: Bound<'_, PyTuple>,
+        out: Bound<'_, PyUntypedArray>,
     ) -> PyResult<()> {
-        let indices = indices_from_py(key)?;
-        let plan = &plan.0;
+        self.fill_many(py, vec![plan], handle, name, vec![key], vec![out])
+    }
+
+    /// Transfer plans of one dataset into their buffers as one batch.
+    ///
+    /// On failure the contents of every buffer are undefined.
+    fn fill_many(
+        &self,
+        py: Python<'_>,
+        plans: Vec<Bound<'_, Plan>>,
+        handle: u64,
+        name: String,
+        keys: Vec<Bound<'_, PyTuple>>,
+        outs: Vec<Bound<'_, PyUntypedArray>>,
+    ) -> PyResult<()> {
+        let indices = keys
+            .iter()
+            .map(indices_from_py)
+            .collect::<PyResult<Vec<_>>>()?;
+        let plans: Vec<aex_client::Plan> = plans.iter().map(|p| p.get().0.clone()).collect();
+        if plans.len() != outs.len() || plans.len() != indices.len() {
+            return Err(value_error(
+                "plans, keys and output arrays do not pair up".into(),
+            ));
+        }
+        let Some(dtype) = plans.first().map(|p| p.dtype) else {
+            return Ok(());
+        };
+        for (plan, out) in plans.iter().zip(&outs) {
+            if plan.dtype != dtype {
+                return Err(value_error("a batch has to be of one dtype".into()));
+            }
+            check_buffer(plan, out)?;
+        }
         let client = self.get()?;
-        check_buffer(plan, out)?;
+        let batch = Batch {
+            client: &client,
+            plans: &plans,
+            selections: &selections(FileHandle::from_u64(handle), &name, &indices),
+            outs: &outs,
+        };
 
         macro_rules! fill_as {
             ($($dtype:ident => $ty:ty),* $(,)?) => {
-                match plan.dtype {
-                    $(DType::$dtype => fill_typed::<$ty>(py, &client, plan, handle, &name, &indices, out),)*
+                match dtype {
+                    $(DType::$dtype => batch.fill::<$ty>(py),)*
                 }
             };
         }
@@ -331,41 +394,69 @@ fn check_buffer(plan: &aex_client::Plan, out: &Bound<'_, PyUntypedArray>) -> PyR
     Ok(())
 }
 
-fn fill_typed<T: Element>(
-    py: Python<'_>,
-    client: &aex_client::Client,
-    plan: &aex_client::Plan,
-    handle: u64,
-    name: &str,
-    indices: &[Index],
-    out: &Bound<'_, PyUntypedArray>,
-) -> PyResult<()> {
-    let array = out.cast::<PyArrayDyn<T>>().map_err(|_| {
-        value_error(format!(
-            "the output array is not of dtype {}",
-            plan.dtype.descr()
-        ))
-    })?;
-    // The borrow is what keeps another view from writing at the same time. It
-    // is held here, outside the closure, for as long as the GIL is released.
-    let mut guard = array
-        .try_readwrite()
-        .map_err(|e| value_error(format!("the output array cannot be written: {e}")))?;
-    let elements = guard
-        .as_slice_mut()
-        .map_err(|e| value_error(format!("the output array is not contiguous: {e}")))?;
-    // Every AEX dtype is plain little-endian bytes, the byte order was checked
-    // above, and the length is the element count times the item size.
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(
-            elements.as_mut_ptr() as *mut u8,
-            std::mem::size_of_val(elements),
-        )
-    };
-    let handle = FileHandle::from_u64(handle);
-    py.detach(|| client.fill(plan, handle, name, indices, bytes))
+fn selections<'a>(
+    handle: FileHandle,
+    name: &'a str,
+    indices: &'a [Vec<Index>],
+) -> Vec<Selection<'a>> {
+    indices
+        .iter()
+        .map(|indices| Selection {
+            handle,
+            name,
+            indices,
+        })
+        .collect()
+}
+
+/// A batch whose buffers have been checked against their plans.
+struct Batch<'a, 'py> {
+    client: &'a aex_client::Client,
+    plans: &'a [aex_client::Plan],
+    selections: &'a [Selection<'a>],
+    outs: &'a [Bound<'py, PyUntypedArray>],
+}
+
+impl Batch<'_, '_> {
+    fn fill<T: Element>(&self, py: Python<'_>) -> PyResult<()> {
+        // The borrows are what keep another view from writing at the same time,
+        // and what refuse one array passed twice. They are held here, outside
+        // the closure, for as long as the GIL is released.
+        let mut guards = Vec::with_capacity(self.outs.len());
+        for out in self.outs {
+            let array = out.cast::<PyArrayDyn<T>>().map_err(|_| {
+                value_error(format!(
+                    "the output array is not of dtype {}",
+                    self.plans[0].dtype.descr()
+                ))
+            })?;
+            guards.push(
+                array
+                    .try_readwrite()
+                    .map_err(|e| value_error(format!("the output array cannot be written: {e}")))?,
+            );
+        }
+        let mut dsts = Vec::with_capacity(guards.len());
+        for guard in &mut guards {
+            let elements = guard
+                .as_slice_mut()
+                .map_err(|e| value_error(format!("the output array is not contiguous: {e}")))?;
+            // Every AEX dtype is plain little-endian bytes, the byte order was
+            // checked, and the length is the element count times the item size.
+            dsts.push(unsafe {
+                std::slice::from_raw_parts_mut(
+                    elements.as_mut_ptr() as *mut u8,
+                    std::mem::size_of_val(elements),
+                )
+            });
+        }
+        py.detach(|| {
+            self.client
+                .fill_many(self.plans, self.selections, &mut dsts)
+        })
         .map(|_| ())
         .map_err(to_py)
+    }
 }
 
 #[pymodule]

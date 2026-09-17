@@ -15,11 +15,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aex_core::{ArrayDataset, ArrayFile, Codec, Item, NpyFile, NullFile, SelectionLayout};
 use aex_proto::aex_control_server::AexControl;
 use aex_proto::convert::{indices_from_proto, quality_from_proto, quality_to_proto};
+use aex_proto::transfer_plan_or_error;
 use aex_proto::{
     ApplyFunctionReply, ApplyFunctionRequest, CloseFileReply, CloseFileRequest, ConnectReply,
     ConnectRequest, DataEndpoint, Dataset, DisconnectReply, DisconnectRequest, GetItemRequest,
-    Group, ItemList, ListChildrenRequest, OpenFileReply, OpenFileRequest, PrepareSelectionRequest,
-    PrepareSelectionsRequest, TransferPlan, TransferPlanList,
+    Group, ItemList, ListChildrenRequest, OpenFileReply, OpenFileRequest, PlanError,
+    PrepareSelectionRequest, PrepareSelectionsRequest, TransferPlan, TransferPlanList,
+    TransferPlanOrError,
 };
 use tonic::{Request, Response, Status};
 
@@ -132,9 +134,14 @@ impl ControlService {
     }
 
     /// Resolve a selection into a plan, or into the data itself when it is
-    /// small enough to travel inline.
-    fn prepare(&self, request: &PrepareSelectionRequest) -> Result<TransferPlan> {
-        let session = self.sessions.get(&request.session_id)?;
+    /// small enough to travel inline and `inline_budget` still has room for it.
+    fn prepare(
+        &self,
+        session_id: &[u8],
+        request: &PrepareSelectionRequest,
+        inline_budget: &mut u64,
+    ) -> Result<TransferPlan> {
+        let session = self.sessions.get(session_id)?;
         let file = session.files().get(request.handle)?;
 
         let Item::Dataset(dataset) = file.get_item(&request.name).map_err(ServerError::from)?
@@ -158,7 +165,10 @@ impl ControlService {
         let layout = dataset.layout(&indices, &applied)?;
         self.check_decode_cache(&*dataset, session.granted_streams());
 
-        if layout.total_bytes <= self.config.transfer.inline_limit_bytes {
+        if layout.total_bytes <= self.config.transfer.inline_limit_bytes
+            && layout.total_bytes <= *inline_budget
+        {
+            *inline_budget -= layout.total_bytes;
             let mut inline_data = vec![0u8; layout.total_bytes as usize];
             dataset.read_range(&layout, 0, &mut inline_data)?;
             tracing::debug!(
@@ -304,14 +314,42 @@ impl AexControl for ControlService {
         &self,
         request: Request<PrepareSelectionRequest>,
     ) -> std::result::Result<Response<TransferPlan>, Status> {
-        Ok(Response::new(self.prepare(&request.into_inner())?))
+        let request = request.into_inner();
+        let mut budget = u64::MAX;
+        Ok(Response::new(self.prepare(
+            &request.session_id,
+            &request,
+            &mut budget,
+        )?))
     }
 
     async fn prepare_selections(
         &self,
-        _request: Request<PrepareSelectionsRequest>,
+        request: Request<PrepareSelectionsRequest>,
     ) -> std::result::Result<Response<TransferPlanList>, Status> {
-        Err(not_implemented_yet("PrepareSelections", "gather"))
+        let request = request.into_inner();
+        // A dead session fails the call rather than every element.
+        self.sessions.get(&request.session_id)?;
+        // Half the message limit, so that many small selections still fit one
+        // reply with their plans; the rest go over the data plane.
+        let mut budget = self.config.limits.grpc_max_message_bytes as u64 / 2;
+        let results = request
+            .requests
+            .iter()
+            .map(|element| {
+                let result = match self.prepare(&request.session_id, element, &mut budget) {
+                    Ok(plan) => transfer_plan_or_error::Result::Plan(plan),
+                    Err(e) => transfer_plan_or_error::Result::Error(PlanError {
+                        klass: e.class() as i32,
+                        message: e.to_string(),
+                    }),
+                };
+                TransferPlanOrError {
+                    result: Some(result),
+                }
+            })
+            .collect();
+        Ok(Response::new(TransferPlanList { results }))
     }
 
     async fn apply_function(

@@ -1,0 +1,158 @@
+//! Several selections resolved in one round trip and fetched as one batch.
+
+use aex_client::{Client, ClientError, ErrorClass, FileHandle, Index, Plan, Selection};
+
+#[path = "support.rs"]
+mod support;
+
+use support::TestServer;
+
+const ROW: usize = 2000;
+
+/// Rows `start..stop` of the counting grid.
+fn rows(start: i64, stop: i64) -> Vec<Index> {
+    vec![Index::range(start, stop)]
+}
+
+/// Fill every plan and return the buffers as f32.
+fn fill_all(
+    client: &Client,
+    plans: &[Plan],
+    selections: &[Selection<'_>],
+) -> Result<(Vec<Vec<f32>>, aex_client::TransferResult), ClientError> {
+    let mut bufs: Vec<Vec<u8>> = plans
+        .iter()
+        .map(|p| vec![0u8; p.total_bytes as usize])
+        .collect();
+    let mut dsts: Vec<&mut [u8]> = bufs.iter_mut().map(|b| b.as_mut_slice()).collect();
+    let result = client.fill_many(plans, selections, &mut dsts)?;
+    let floats = bufs
+        .iter()
+        .map(|b| {
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
+    Ok((floats, result))
+}
+
+fn selections<'a>(handle: FileHandle, keys: &'a [Vec<Index>]) -> Vec<Selection<'a>> {
+    keys.iter()
+        .map(|indices| Selection {
+            handle,
+            name: "array",
+            indices,
+        })
+        .collect()
+}
+
+#[test]
+fn a_batch_mixes_inline_remote_and_failed_selections() {
+    let server = TestServer::start();
+    let expected = server.write_counting_npy("grid.npy", &[64, ROW]);
+    let client = server.connect();
+    let handle = client.open("grid.npy").expect("open");
+
+    // One row is inline, ten rows are not, and row 99 does not exist.
+    let keys = [
+        rows(0, 1),
+        rows(10, 20),
+        vec![Index::Single(99)],
+        rows(60, 64),
+    ];
+    let sels = selections(handle, &keys);
+    let results = client.prepare_many(&sels).expect("prepare");
+    assert_eq!(results.len(), 4);
+    assert!(results[0].as_ref().unwrap().is_inline());
+    assert!(!results[1].as_ref().unwrap().is_inline());
+    let err = results[2].as_ref().unwrap_err();
+    assert_eq!(err.class(), Some(ErrorClass::Request), "{err}");
+
+    let ok: Vec<usize> = vec![0, 1, 3];
+    let plans: Vec<Plan> = ok
+        .iter()
+        .map(|&i| results[i].as_ref().unwrap().clone())
+        .collect();
+    let ok_sels: Vec<_> = ok.iter().map(|&i| sels[i]).collect();
+    let (data, transfer) = fill_all(&client, &plans, &ok_sels).expect("fill");
+
+    assert_eq!(data[0], expected[..ROW]);
+    assert_eq!(data[1], expected[10 * ROW..20 * ROW]);
+    assert_eq!(data[2], expected[60 * ROW..]);
+    assert!(!transfer.inline);
+    assert_eq!(transfer.bytes, (1 + 10 + 4) as u64 * ROW as u64 * 4);
+}
+
+#[test]
+fn inline_data_stops_at_what_one_reply_can_carry() {
+    let server = TestServer::start_with(|config| {
+        config.limits.grpc_max_message_bytes = 256 * 1024;
+    });
+    let expected = server.write_counting_npy("grid.npy", &[64, ROW]);
+    let client = server.connect();
+    let handle = client.open("grid.npy").expect("open");
+
+    // Seven rows are 56 KB, under the inline limit, but a reply carries at most
+    // half of 256 KiB of inline data, so only two of the four fit.
+    let keys: Vec<_> = (0..4).map(|i| rows(i * 7, i * 7 + 7)).collect();
+    let sels = selections(handle, &keys);
+    let plans: Vec<Plan> = client
+        .prepare_many(&sels)
+        .expect("prepare")
+        .into_iter()
+        .map(|r| r.expect("plan"))
+        .collect();
+    let inline = plans.iter().filter(|p| p.is_inline()).count();
+    assert_eq!(inline, 2, "{plans:?}");
+
+    let (data, _) = fill_all(&client, &plans, &sels).expect("fill");
+    for (i, got) in data.iter().enumerate() {
+        assert_eq!(got[..], expected[i * 7 * ROW..(i + 1) * 7 * ROW]);
+    }
+}
+
+#[test]
+fn evicted_plans_in_a_batch_are_prepared_again() {
+    let server = TestServer::start_with(|config| {
+        config.limits.max_transfers_per_session = 2;
+    });
+    let expected = server.write_counting_npy("grid.npy", &[64, ROW]);
+    let client = server.connect();
+    let handle = client.open("grid.npy").expect("open");
+
+    let keys = [rows(0, 10), rows(10, 20)];
+    let sels = selections(handle, &keys);
+    let plans: Vec<Plan> = client
+        .prepare_many(&sels)
+        .expect("prepare")
+        .into_iter()
+        .map(|r| r.expect("plan"))
+        .collect();
+    // Two more plans push the first two out.
+    let others = [rows(20, 30), rows(30, 40)];
+    for r in client.prepare_many(&selections(handle, &others)).unwrap() {
+        r.expect("plan");
+    }
+
+    let (data, transfer) = fill_all(&client, &plans, &sels).expect("fill");
+    assert_eq!(data[0], expected[..10 * ROW]);
+    assert_eq!(data[1], expected[10 * ROW..20 * ROW]);
+    assert!(transfer.retries >= 1);
+}
+
+#[test]
+fn a_batch_that_does_not_pair_up_is_refused() {
+    let server = TestServer::start();
+    server.write_counting_npy("grid.npy", &[64, ROW]);
+    let client = server.connect();
+    let handle = client.open("grid.npy").expect("open");
+
+    let keys = [rows(0, 10)];
+    let sels = selections(handle, &keys);
+    let plan = client.prepare_many(&sels).unwrap().remove(0).unwrap();
+    let err = client
+        .fill_many(&[plan], &sels, &mut [])
+        .expect_err("no buffer");
+    assert!(matches!(err, ClientError::BadRequest(_)), "{err}");
+}

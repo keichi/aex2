@@ -52,3 +52,7 @@ path = "faults.rs"
 name = "hdf5"
 path = "hdf5.rs"
 required-features = ["hdf5"]
+
+[[test]]
+name = "gather"
+path = "gather.rs"

@@ -14,19 +14,20 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aex_core::{DType, Index};
+use aex_core::{DType, ErrorClass, Index};
 use aex_proto::aex_control_client::AexControlClient;
 use aex_proto::convert::{check_fancy_limit, indices_to_proto, quality_to_proto};
+use aex_proto::transfer_plan_or_error;
 use aex_proto::{
     CloseFileRequest, ConnectRequest, DisconnectRequest, GetItemRequest, ListChildrenRequest,
-    OpenFileRequest, PrepareSelectionRequest,
+    OpenFileRequest, PrepareSelectionRequest, PrepareSelectionsRequest,
 };
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::config::ClientConfig;
 use crate::error::{ClientError, Result};
-use crate::pool::{ConnSettings, DataPool, FetchSpec};
+use crate::pool::{ConnSettings, DataPool, FetchPart, FetchSpec};
 use crate::transfer::{ArrayData, ClientStats, Element, Plan, TransferResult, TypedArray};
 
 /// The data plane frame version this client speaks.
@@ -49,6 +50,14 @@ impl FileHandle {
     pub fn from_u64(handle: u64) -> Self {
         FileHandle(handle)
     }
+}
+
+/// A selection of a dataset, as a batch names it.
+#[derive(Debug, Clone, Copy)]
+pub struct Selection<'a> {
+    pub handle: FileHandle,
+    pub name: &'a str,
+    pub indices: &'a [Index],
 }
 
 /// What lives at a path in a file.
@@ -417,21 +426,61 @@ impl Client {
         check_fancy_limit(indices, self.session.max_fancy_indices)
             .map_err(|e| ClientError::BadRequest(e.to_string()))?;
 
+        let selection = Selection {
+            handle,
+            name,
+            indices,
+        };
+        let request = prepare_request(self.session.id.clone(), &selection);
+        let reply =
+            self.call(|mut control| async move { control.prepare_selection(request).await })?;
+        Plan::from_proto(reply)
+    }
+
+    /// Ask the server to resolve several selections in one round trip.
+    ///
+    /// Each comes back as a plan or as its own error: one selection being out
+    /// of range must not cost the others.
+    pub fn prepare_many(&self, selections: &[Selection<'_>]) -> Result<Vec<Result<Plan>>> {
+        let mut results: Vec<Option<Result<Plan>>> = Vec::with_capacity(selections.len());
+        let mut requests = Vec::new();
+        for selection in selections {
+            match check_fancy_limit(selection.indices, self.session.max_fancy_indices) {
+                Ok(()) => {
+                    results.push(None);
+                    requests.push(prepare_request(Vec::new(), selection));
+                }
+                Err(e) => results.push(Some(Err(ClientError::BadRequest(e.to_string())))),
+            }
+        }
+
         let reply = self.call(|mut control| async move {
             control
-                .prepare_selection(PrepareSelectionRequest {
+                .prepare_selections(PrepareSelectionsRequest {
                     session_id: self.session.id.clone(),
-                    handle: handle.0,
-                    name: name.to_string(),
-                    indices: indices_to_proto(indices),
-                    // Lossless and uncompressed: nothing else is implemented on
-                    // either side yet, and the plan says what was applied.
-                    requested_quality: Some(quality_to_proto(&aex_core::QualitySpec::exact())),
-                    requested_codec: aex_core::Codec::Raw.as_u32(),
+                    requests,
                 })
                 .await
         })?;
-        Plan::from_proto(reply)
+
+        let mut replies = reply.results.into_iter();
+        results
+            .into_iter()
+            .map(|result| match result {
+                Some(local) => Ok(local),
+                None => match replies.next().and_then(|r| r.result) {
+                    Some(transfer_plan_or_error::Result::Plan(plan)) => Ok(Plan::from_proto(plan)),
+                    Some(transfer_plan_or_error::Result::Error(e)) => Ok(Err(ClientError::Data {
+                        class: ErrorClass::from_u8(u8::try_from(e.klass).unwrap_or(u8::MAX)),
+                        message: e.message,
+                    })),
+                    None => Err(ClientError::Protocol(format!(
+                        "asked for {} plans and got fewer back",
+                        selections.len()
+                    ))),
+                },
+            })
+            .collect()
     }
 
     /// Fill `dst` from a plan, preparing again once if the plan has gone.
@@ -448,7 +497,25 @@ impl Client {
         indices: &[Index],
         dst: &mut [u8],
     ) -> Result<TransferResult> {
-        let result = self.fill_once(plan, handle, name, indices, dst)?;
+        let selection = Selection {
+            handle,
+            name,
+            indices,
+        };
+        self.fill_many(std::slice::from_ref(plan), &[selection], &mut [dst])
+    }
+
+    /// Fill each buffer from its plan, all chunks sharing one queue.
+    ///
+    /// The result covers the batch as a whole. As with [`Client::fill`], plans
+    /// that have gone are prepared again, once.
+    pub fn fill_many(
+        &self,
+        plans: &[Plan],
+        selections: &[Selection<'_>],
+        dsts: &mut [&mut [u8]],
+    ) -> Result<TransferResult> {
+        let result = self.fill_batch(plans, selections, dsts)?;
         self.stats
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -456,73 +523,110 @@ impl Client {
         Ok(result)
     }
 
-    fn fill_once(
+    fn fill_batch(
         &self,
-        plan: &Plan,
-        handle: FileHandle,
-        name: &str,
-        indices: &[Index],
-        dst: &mut [u8],
+        plans: &[Plan],
+        selections: &[Selection<'_>],
+        dsts: &mut [&mut [u8]],
     ) -> Result<TransferResult> {
-        if plan.total_bytes != dst.len() as u64 {
+        if plans.len() != selections.len() || plans.len() != dsts.len() {
             return Err(ClientError::BadRequest(format!(
-                "the selection is {} bytes and the buffer is {}",
-                plan.total_bytes,
-                dst.len()
+                "{} plans, {} selections and {} buffers do not pair up",
+                plans.len(),
+                selections.len(),
+                dsts.len()
             )));
         }
-        let started = Instant::now();
-
-        if plan.is_inline() {
-            dst.copy_from_slice(&plan.inline_data);
-            return Ok(TransferResult {
-                bytes: plan.total_bytes,
-                elapsed: started.elapsed(),
-                chunks: 0,
-                streams: 0,
-                retries: 0,
-                inline: true,
-            });
+        for (plan, dst) in plans.iter().zip(dsts.iter()) {
+            if plan.total_bytes != dst.len() as u64 {
+                return Err(ClientError::BadRequest(format!(
+                    "the selection is {} bytes and the buffer is {}",
+                    plan.total_bytes,
+                    dst.len()
+                )));
+            }
         }
+        let started = Instant::now();
+        let bytes = plans.iter().map(|p| p.total_bytes).sum();
 
-        let chunk_bytes = self.chunk_bytes(plan.total_bytes);
-        let chunks = plan.chunks(chunk_bytes).count() as u32;
-        let mut plan = plan.clone();
+        // What is left for the data plane, by position in the batch.
+        let mut remote: Vec<(usize, Plan)> = Vec::new();
+        for (i, plan) in plans.iter().enumerate() {
+            if plan.is_inline() {
+                dsts[i].copy_from_slice(&plan.inline_data);
+            } else {
+                remote.push((i, plan.clone()));
+            }
+        }
+        let all_inline = remote.is_empty();
+
+        let remote_bytes = remote.iter().map(|(_, p)| p.total_bytes).sum();
+        let chunk_bytes = self.chunk_bytes(remote_bytes);
         let mut retries = 0;
-        loop {
+        let mut streams = 0;
+        let mut chunks = 0;
+        while !remote.is_empty() {
             let spec = FetchSpec {
-                request_id: plan.request_id,
-                ticket: &plan.ticket,
                 credit: self.config.credit,
                 max_retries: self.config.max_retries,
             };
-            match self.pool.fetch(spec, plan.chunks(chunk_bytes), dst) {
+            let mut parts = Vec::with_capacity(remote.len());
+            let mut next = remote.iter();
+            let mut pending = next.next();
+            for (i, dst) in dsts.iter_mut().enumerate() {
+                if let Some((_, plan)) = pending.filter(|(at, _)| *at == i) {
+                    parts.push(FetchPart {
+                        request_id: plan.request_id,
+                        ticket: &plan.ticket,
+                        chunks: plan.chunks(chunk_bytes).collect(),
+                        dst,
+                    });
+                    pending = next.next();
+                }
+            }
+            chunks = parts.iter().map(|p| p.chunks.len() as u32).sum();
+
+            match self.pool.fetch(spec, parts) {
                 Ok(fetched) => {
-                    return Ok(TransferResult {
-                        bytes: plan.total_bytes,
-                        elapsed: started.elapsed(),
-                        chunks,
-                        streams: fetched.streams,
-                        retries: retries + fetched.retries,
-                        inline: false,
-                    })
+                    streams = fetched.streams;
+                    retries += fetched.retries;
+                    break;
                 }
                 Err(e) if e.needs_reprepare() && retries == 0 => {
-                    let fresh = self.prepare(handle, name, indices)?;
-                    if fresh.total_bytes != plan.total_bytes {
-                        // The file changed underneath the selection; the buffer
-                        // no longer fits what is being sent.
-                        return Err(ClientError::BadRequest(format!(
-                            "the selection was {} bytes and is now {}",
-                            plan.total_bytes, fresh.total_bytes
-                        )));
-                    }
-                    plan = fresh;
                     retries += 1;
+                    let again: Vec<_> = remote.iter().map(|(i, _)| selections[*i]).collect();
+                    let fresh = self.prepare_many(&again)?;
+                    let mut still = Vec::new();
+                    for ((i, old), fresh) in remote.into_iter().zip(fresh) {
+                        let fresh = fresh?;
+                        if fresh.total_bytes != old.total_bytes {
+                            // The file changed underneath the selection; the
+                            // buffer no longer fits what is being sent.
+                            return Err(ClientError::BadRequest(format!(
+                                "the selection was {} bytes and is now {}",
+                                old.total_bytes, fresh.total_bytes
+                            )));
+                        }
+                        if fresh.is_inline() {
+                            dsts[i].copy_from_slice(&fresh.inline_data);
+                        } else {
+                            still.push((i, fresh));
+                        }
+                    }
+                    remote = still;
                 }
                 Err(e) => return Err(e),
             }
         }
+
+        Ok(TransferResult {
+            bytes,
+            elapsed: started.elapsed(),
+            chunks,
+            streams,
+            retries,
+            inline: all_inline,
+        })
     }
 
     /// How much of the logical byte stream one fetch asks for.
@@ -565,6 +669,21 @@ impl Client {
         let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         stats.rtt = stats.rtt.min(took);
         Ok(response.into_inner())
+    }
+}
+
+/// The wire form of a selection. A batch leaves `session_id` empty, since the
+/// server reads the batch's own.
+fn prepare_request(session_id: Vec<u8>, selection: &Selection<'_>) -> PrepareSelectionRequest {
+    PrepareSelectionRequest {
+        session_id,
+        handle: selection.handle.0,
+        name: selection.name.to_string(),
+        indices: indices_to_proto(selection.indices),
+        // Lossless and uncompressed: nothing else is implemented on either
+        // side yet, and the plan says what was applied.
+        requested_quality: Some(quality_to_proto(&aex_core::QualitySpec::exact())),
+        requested_codec: aex_core::Codec::Raw.as_u32(),
     }
 }
 

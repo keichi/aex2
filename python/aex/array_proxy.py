@@ -2,8 +2,8 @@
 
 import operator
 import warnings
-from collections.abc import Callable, Iterator
-from typing import Any, Literal
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any, Literal, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -38,6 +38,10 @@ def set_fallback_threshold(nbytes: int) -> None:
 
 
 Key = tuple[Any, ...]
+
+# The server's default max_transfers_per_session: a larger batch would evict
+# its own plans before they are fetched.
+_GATHER_BATCH = 64
 
 
 class ArrayProxy:
@@ -98,6 +102,27 @@ class ArrayProxy:
         wire_key = _to_wire(key, self.shape)
         plan = self._native.prepare(self.handle, self.name, wire_key)
         self._native.fill(plan, self.handle, self.name, wire_key, out)
+
+    def gather(self, keys: Sequence[Any]) -> list[npt.NDArray[Any]]:
+        """Transfer several selections, resolving them in one round trip.
+
+        Raises the error of the first selection that fails. The results are
+        read-only.
+        """
+        results: list[npt.NDArray[Any]] = []
+        for start in range(0, len(keys), _GATHER_BATCH):
+            wire_keys = [_to_wire(key, self.shape) for key in keys[start : start + _GATHER_BATCH]]
+            plans = self._native.prepare_many(self.handle, self.name, wire_keys)
+            for plan in plans:
+                if isinstance(plan, BaseException):
+                    raise plan
+            ready = cast(list[_aex.Plan], plans)
+            outs = [np.empty(plan.shape, dtype=plan.dtype) for plan in ready]
+            self._native.fill_many(ready, self.handle, self.name, wire_keys, outs)
+            for out in outs:
+                out.flags.writeable = False
+            results.extend(outs)
+        return results
 
     def __array__(
         self, dtype: npt.DTypeLike | None = None, copy: bool | None = None
