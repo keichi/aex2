@@ -1,7 +1,8 @@
 //! End to end: what a client actually gets out of AEX2.
 //!
-//! The selection is a contiguous range of a 1-d array, read into a buffer
-//! allocated once, so that what is timed is the transfer and not an allocator.
+//! The selection is a range of a 1-d array, contiguous unless `--step` says
+//! otherwise, read into a buffer allocated once, so that what is timed is the
+//! transfer and not an allocator.
 
 use std::time::Instant;
 
@@ -44,6 +45,16 @@ struct Cli {
     /// Bytes per fetch. 0 follows the server's recommendation.
     #[arg(long, default_value_t = 0)]
     chunk: u64,
+    /// Data connections.
+    #[arg(long, default_value_t = aex_client::config::DEFAULT_STREAMS)]
+    streams: u32,
+    /// Fetches outstanding per connection.
+    #[arg(long, default_value_t = aex_client::config::DEFAULT_CREDIT)]
+    credit: u32,
+    /// Take every step-th element. Above 1 the selection is not one run, and
+    /// every element is read on its own.
+    #[arg(long, default_value_t = 1)]
+    step: u64,
     #[arg(long, default_value_t = 5)]
     reps: usize,
     #[arg(long)]
@@ -57,13 +68,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cli.url,
         ClientConfig {
             chunk_bytes: cli.chunk,
+            streams: cli.streams,
+            credit: cli.credit,
             ..ClientConfig::default()
         },
     )?;
     let handle = client.open_as(&cli.file, &cli.format)?;
 
     let elements = cli.bytes / cli.itemsize;
-    let indices = [Index::range(0, elements as i64)];
+    let indices = [Index::Slice {
+        start: Some(0),
+        stop: Some((elements * cli.step) as i64),
+        step: Some(cli.step as i64),
+    }];
     let mut dst = vec![0u8; cli.bytes as usize];
 
     let mut runs = Vec::with_capacity(cli.reps);
@@ -72,6 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started = Instant::now();
         let result = client.read_selection_into(handle, "array", &indices, &mut dst)?;
         let elapsed = started.elapsed();
+        assert_eq!(result.streams, cli.streams, "not every connection was used");
         // A retry means some of the time went somewhere the number cannot
         // explain, so the run is not one to average in.
         assert_eq!(result.retries, 0, "a fetch had to be retried");
@@ -92,12 +110,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(value_at(0), 0.0, "the transfer did not start at the start");
             assert_eq!(
                 value_at(dst.len() - 4),
-                (elements - 1) as f32,
+                ((elements - 1) * cli.step) as f32,
                 "the transfer did not end at the end"
             );
         }
         Pattern::Bytes => {
-            let wrong = dst.iter().enumerate().find(|(i, &b)| b != *i as u8);
+            let item = cli.itemsize as usize;
+            let source = |i: usize| (i / item) * cli.step as usize * item + i % item;
+            let wrong = dst.iter().enumerate().find(|(i, &b)| b != source(*i) as u8);
             assert_eq!(
                 wrong.map(|(i, _)| i),
                 None,
@@ -108,7 +128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let label = cli.label.unwrap_or_else(|| cli.file.clone());
-    report(&format!("aex {label} chunk={}", cli.chunk), &runs);
+    report(
+        &format!(
+            "aex {label} chunk={} streams={} credit={} step={}",
+            cli.chunk, cli.streams, cli.credit, cli.step
+        ),
+        &runs,
+    );
     client.disconnect()?;
     Ok(())
 }
