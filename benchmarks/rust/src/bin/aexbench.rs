@@ -59,6 +59,10 @@ struct Cli {
     reps: usize,
     #[arg(long)]
     label: Option<String>,
+    /// Touch the output buffer before timing, so a first run does not pay
+    /// the page faults a reused buffer would not.
+    #[arg(long)]
+    prefault: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -82,6 +86,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         step: Some(cli.step as i64),
     }];
     let mut dst = vec![0u8; cli.bytes as usize];
+    if cli.prefault {
+        dst.fill(1);
+    }
 
     let mut runs = Vec::with_capacity(cli.reps);
     for _ in 0..cli.reps {
