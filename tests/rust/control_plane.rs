@@ -122,7 +122,11 @@ fn a_file_can_be_opened_by_an_explicit_format() {
         client.get_item(handle, "array"),
         Ok(Item::Dataset(_))
     ));
-    // Nothing else is served yet.
+    assert_eq!(
+        error_class(client.open_as("data.bin", "zarr")),
+        ErrorClass::Request
+    );
+    // A format the server knows, but not what the file holds.
     assert_eq!(
         error_class(client.open_as("data.bin", "hdf5")),
         ErrorClass::Request

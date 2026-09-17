@@ -16,7 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # 26.04 because the HDF5 backend needs libhdf5 >= 1.14, and 24.04 ships 1.10.
+        os: [ubuntu-26.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,16 +26,20 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # protoc generates the control plane code; prost-build does not bundle it.
-      - name: install protoc (Linux)
+      # libhdf5 is for the hdf5 feature, which --all-features turns on.
+      - name: install protoc and libhdf5 (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: install protoc (macOS)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libhdf5-dev
+      - name: install protoc and libhdf5 (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf
+        run: brew install protobuf hdf5
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      # The optional features must stay optional.
+      - name: check (default features)
+        run: cargo check --all-targets
       - name: test (debug)
         run: cargo test --all-features
       # Both profiles: overflow checks make debug and release behave differently.
@@ -46,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-26.04, macos-latest]
         # The oldest supported and a current one.
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
@@ -57,12 +62,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: install protoc (Linux)
+      - name: install protoc and libhdf5 (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: install protoc (macOS)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libhdf5-dev
+      - name: install protoc and libhdf5 (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf
+        run: brew install protobuf hdf5
       - name: build and install
         run: pip install -e ".[dev]"
       - name: ruff

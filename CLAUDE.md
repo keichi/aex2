@@ -21,10 +21,13 @@ that builds and passes its tests on its own; do not bundle unrelated work.
 ```console
 $ cargo fmt --all
 $ cargo clippy --all-targets --all-features -- -D warnings
-$ cargo test && cargo test --release
+$ cargo test --all-features && cargo test --release --all-features
+$ cargo check --all-targets
 ```
 
 Run both profiles: overflow checks make debug and release behave differently.
+`--all-features` needs libhdf5 >= 1.14; the last line keeps the default build
+compiling without it.
 
 ## Layout
 

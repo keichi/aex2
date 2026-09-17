@@ -27,6 +27,9 @@ aex-wire = { path = "crates/aex-wire" }
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 getrandom = "0.4"
+# libhdf5 is only asked for metadata; data is read with pread (see backends/hdf5.rs).
+hdf5 = { package = "hdf5-metno", version = "0.14", features = ["complex", "f16"] }
+hdf5-sys = { package = "hdf5-metno-sys", version = "0.12" }
 npyz = "0.9"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }

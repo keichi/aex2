@@ -138,7 +138,8 @@ TCP を使う限り最低 2 回は必須)。読みバッファは使い回すた
 │   ┌──────────────────────────────────────────────────┐               │
 │   │  Backend (trait ArrayFile / ArrayDataset)         │               │
 │   │    NpyFile: pread + ヘッダ解析                    │               │
-│   │    (将来) Hdf5File / ZarrFile / NetCdfFile        │               │
+│   │    Hdf5File: libhdf5 はメタデータのみ + pread     │               │
+│   │    (将来) ZarrFile                                │               │
 │   └──────────────────────────────────────────────────┘               │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -170,6 +171,7 @@ aex2/
 │   │       ├── selection.rs      # Selection / SelectionLayout / Fragment
 │   │       ├── backend.rs        # ArrayFile / ArrayDataset トレイト
 │   │       ├── backends/npy.rs   # .npy バックエンド
+│   │       ├── backends/hdf5.rs  # HDF5 バックエンド (hdf5 feature)
 │   │       ├── reduce.rs         # サーバサイド集約
 │   │       └── error.rs
 │   ├── aex-wire/                 # データプレーンのフレーム定義 (server/client 共用)
@@ -873,7 +875,7 @@ ScatterBuffer { ptr, len }  ← 複数スレッドが非重複領域に書くた
 
 ### 7.1 トレイト設計
 
-初版は `.npy` のみ実装するが、トレイトは HDF5 / netCDF4 / Zarr を見据えて設計する。v1 の `BackendFile` / `BackendDataset` / `BackendGroup` を踏襲しつつ、**論理バイト列に対する範囲読み出し**をインタフェースの中心に据える。
+`.npy` と HDF5 (netCDF-4 を含む、第 7.5 節) を実装済みで、トレイトは Zarr も見据えて設計する。v1 の `BackendFile` / `BackendDataset` / `BackendGroup` を踏襲しつつ、**論理バイト列に対する範囲読み出し**をインタフェースの中心に据える。
 
 ```rust
 pub trait ArrayFile: Send + Sync {
@@ -1026,6 +1028,44 @@ decode_cache_bytes >= 同時接続数 × 最大ストレージチャンクサイ
 この下限を割る設定は警告を出す。
 
 **トレイトへの含意**: `ArrayDataset::read_range` は `&self` を取る (複数の接続スレッドが同一データセットを同時に読むため)。したがってキャッシュは**内部可変性**で実装する。ロック競合を避けるため、単一の `Mutex<LruCache>` ではなくチャンク ID でシャーディングした構造を推奨する。`.npy` バックエンドはキャッシュを持たないため、この複雑さを負担しない。
+
+### 7.5 HDF5 バックエンド
+
+`hdf5` cargo feature で有効になる (libhdf5 1.14 以降が要る)。netCDF-4 は中身が HDF5 なので同じバックエンドで開く。形式名 `hdf5` / `h5` / `he5` / `nc` / `netcdf4` と、同名の拡張子がこれに対応する。feature なしでビルドしたサーバは、これらを `REQUEST` で拒否する。
+
+**libhdf5 はメタデータにしか使わない。** libhdf5 はスレッドセーフビルドでもプロセス全体で 1 本のロックに直列化されており、データを `H5Dread` で読むと全データ接続がこのロックに並び、第 6.4 節の並列転送が無意味になる。HDF5 2.3 で入る内部スレッドプールも「1 回の読み出しの内側」を並列化するもので、複数の接続スレッドが別々に読む本設計の形ではロックは外れない。そこで、既存の実装で性能を要するもの (hidefix、pyFAI の direct chunk read、kerchunk) と同じく、次のように分担する。
+
+- libhdf5 (`hdf5-metno` クレート): 階層、dtype、shape、ストレージの形式、fill value、データのファイル内位置の取得。データセットを開くときだけ呼ぶ
+- 自前: libhdf5 とは別に開いた `File` から `read_exact_at` (pread) で読む。libhdf5 のロックに触れない
+
+`.npy` と同じく、配信中にファイルが書き換えられないことを前提とする (位置はデータセットを開いたときに一度だけ取る)。SWMR には対応しない。
+
+```rust
+pub struct Hdf5File {
+    file: hdf5::File,   // メタデータ用。呼ぶたびにグローバルロックを取る
+    raw:  Arc<File>,    // データ用。このファイルから開いた全データセットで共有
+}
+
+enum Storage {
+    Contiguous(u64),    // ファイル内の開始位置
+    Unallocated,        // 一度も書かれていない。全要素が fill value
+}
+```
+
+**ストレージの形式**:
+
+| 形式 | 扱い |
+|------|------|
+| contiguous | `H5Dget_offset` の位置から pread。開封時に `offset + データ長 <= ファイル長` を検証する |
+| contiguous (未割り当て) | fill value の繰り返しを返す。fill value が未定義なら 0 (libhdf5 と同じ) |
+| chunked | 未実装 (拒否)。次の段階で、`H5Dchunk_iter` で得たチャンク索引から pread し、deflate / shuffle / fletcher32 を自前で伸長して第 7.4 節のキャッシュに載せる |
+| compact / virtual / 外部ファイル格納 | 拒否 |
+
+**dtype の対応づけ**: 整数・浮動小数 (half を含む)・h5py の bool (enum `FALSE=0, TRUE=1`)・h5py の複素数 (compound `r`, `i`) を第 7.2 節の `DataType` へ写す。1 バイトより大きいビッグエンディアンの型、文字列、その他の compound / enum / 参照は `UnsupportedDType` とする。HDF5 2.x のネイティブ複素数型は、`hdf5-metno` が型記述に変換できないため現状は拒否される。
+
+**階層表現**: HDF5 の階層をそのまま見せる。`list_children` は名前順で、配信できない子 (未対応 dtype、壊れたリンク、名前付き型) は一覧から除外する。1 個の文字列データセットのために兄弟全部が見えなくなるのを避けるためで、そのパスを直接 `get_item` すれば理由付きのエラーが返る。
+
+**external link は辿らない。** external link はホスト上の任意のファイルを指せるため、辿るとパス制限 (データルート) の外を読めてしまう。最初のファイルを開く前に `H5Lunregister(H5L_TYPE_EXTERNAL)` でプロセス全体の external link を無効にする。soft link はファイル内に閉じるので辿る。
 
 ---
 
@@ -1596,7 +1636,9 @@ for impl in ["aex_v1", "aex_v2"]:
 
 | 項目 | 先送りの理由 | 確保済みの枠 | 再検討時期 |
 |------|-------------|-------------|-----------|
-| HDF5 / netCDF4 / Zarr | Rust クレートの成熟度に差があり実装リスクが高い。まず転送性能を確立する | `ArrayFile` / `ArrayDataset` トレイト、デコードキャッシュの設計 (第 7.4 節) | M6 以降。`zarrs` が最有力 |
+| ~~HDF5 / netCDF-4~~ | M5 の前に contiguous のみ実装済み (第 7.5 節) | — | — |
+| HDF5 の chunked (圧縮) データセット | 伸長とデコードキャッシュが要る | デコードキャッシュの設計 (第 7.4 節)、第 7.5 節の索引の方針 | HDF5 バックエンドの次の段階 |
+| netCDF-3 / Zarr | Rust クレートの成熟度に差があり実装リスクが高い。まず転送性能を確立する | `ArrayFile` / `ArrayDataset` トレイト、デコードキャッシュの設計 (第 7.4 節) | M6 以降。`zarrs` が最有力 |
 | 可逆圧縮 (LZ4 / ZSTD) | LAN では逆効果、WAN では有効と環境依存。測定基盤ができてから判断すべき | フレームヘッダの `codec`、`wire_len` と `logical_len` の分離、`ConnectReply.supported_codecs` | WAN 評価環境が整った時点 |
 | 適応品質 (キャスト / 間引き / 誤差上限) | 研究の核だが転送基盤が先 | `QualitySpec`、`TransferPlan` の dtype/shape (要求と実際の分離)、フレームヘッダの `encoding` | M6 以降 |
 | TLS | 「信頼できる環境」前提。暗号化すると受信側のゼロコピーが成立しなくなる | HELLO の `flags` にネゴシエーションビットを予約 | 公開運用を検討する時点 |

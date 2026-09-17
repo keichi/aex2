@@ -1,8 +1,8 @@
 """v1's client tests, ported onto the npy hierarchy.
 
 v1 served an HDF5 file with nested groups. A .npy is a root group holding one
-dataset named ``array``, so the datasets are separate files here, and the tests
-that need nested groups wait for a backend that has them.
+dataset named ``array``, so the datasets are separate files here. The nested
+group tests live in test_hdf5.py.
 """
 
 import numpy as np

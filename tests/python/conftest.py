@@ -28,7 +28,9 @@ def server(data_dir: Path) -> Iterator[str]:
     """Start aex-server and yield its control plane address."""
     binary = os.environ.get("AEX_SERVER_BIN")
     if binary is None:
-        subprocess.run(["cargo", "build", "-q", "-p", "aex-server"], cwd=REPO, check=True)
+        subprocess.run(
+            ["cargo", "build", "-q", "-p", "aex-server", "--features", "hdf5"], cwd=REPO, check=True
+        )
         binary = str(REPO / "target" / "debug" / "aex-server")
 
     proc = subprocess.Popen(

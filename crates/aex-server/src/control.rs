@@ -29,8 +29,11 @@ use crate::paths::PathPolicy;
 use crate::session::SessionRegistry;
 use crate::transfer::TransferRegistry;
 
-/// The one format this release serves.
 const NPY_FORMAT: &str = "npy";
+
+/// Names a client or a file extension may use for HDF5. netCDF-4 is HDF5
+/// underneath, so it is served by the same backend.
+const HDF5_FORMATS: [&str; 5] = ["hdf5", "h5", "he5", "nc", "netcdf4"];
 
 /// Not a format: a dataset with no storage behind it, for measuring what the
 /// transfer costs when reading the data costs nothing. Served only when the
@@ -93,13 +96,16 @@ impl ControlService {
         } else {
             request.format.to_ascii_lowercase()
         };
-        if format != NPY_FORMAT {
+        let file: Arc<dyn ArrayFile> = if format == NPY_FORMAT {
+            Arc::new(NpyFile::open(&path)?)
+        } else if HDF5_FORMATS.contains(&format.as_str()) {
+            open_hdf5(&path)?
+        } else {
             return Err(ServerError::BadRequest(format!(
-                "format {format:?} is not supported; this server serves {NPY_FORMAT:?} only"
+                "format {format:?} is not supported; this server serves {NPY_FORMAT:?} and {:?}",
+                HDF5_FORMATS[0]
             )));
-        }
-
-        let file: Arc<dyn ArrayFile> = Arc::new(NpyFile::open(&path)?);
+        };
         let handle = session.files().insert(file);
         tracing::debug!(
             session = %hex(session.id()),
@@ -349,6 +355,19 @@ fn unix_ms_from_now(secs: u64) -> u64 {
         .map(|since| since.as_millis() as u64)
         .unwrap_or(0)
         .saturating_add(secs.saturating_mul(1000))
+}
+
+#[cfg(feature = "hdf5")]
+fn open_hdf5(path: &std::path::Path) -> Result<Arc<dyn ArrayFile>> {
+    Ok(Arc::new(aex_core::Hdf5File::open(path)?))
+}
+
+#[cfg(not(feature = "hdf5"))]
+fn open_hdf5(_path: &std::path::Path) -> Result<Arc<dyn ArrayFile>> {
+    Err(ServerError::BadRequest(
+        "this server was built without the hdf5 feature and cannot serve HDF5 or netCDF-4"
+            .to_string(),
+    ))
 }
 
 /// The backend a file extension asks for.

@@ -71,6 +71,15 @@ pub enum AexError {
     #[error("malformed npy file: {0}")]
     MalformedNpy(String),
 
+    /// A readable HDF5 file holding something AEX cannot serve, such as a
+    /// compressed or virtual dataset.
+    #[error("unsupported HDF5 file: {0}")]
+    UnsupportedHdf5(String),
+
+    /// libhdf5 failed, or the file disagrees with its own metadata.
+    #[error("malformed HDF5 file: {0}")]
+    MalformedHdf5(String),
+
     /// A selection numpy would reject too: an index off the end, more indices
     /// than the array has axes, a zero step.
     #[error("invalid selection: {0}")]
@@ -98,18 +107,26 @@ pub enum AexError {
     Io(#[from] io::Error),
 }
 
+#[cfg(feature = "hdf5")]
+impl From<hdf5::Error> for AexError {
+    fn from(e: hdf5::Error) -> Self {
+        AexError::MalformedHdf5(e.to_string())
+    }
+}
+
 impl AexError {
     /// Map this error onto its wire class.
     pub fn class(&self) -> ErrorClass {
         match self {
             AexError::UnsupportedDType(_)
             | AexError::UnsupportedNpy(_)
+            | AexError::UnsupportedHdf5(_)
             | AexError::BadSelection(_)
             | AexError::UnsupportedSelection(_)
             | AexError::NotFound(_)
             | AexError::NotAGroup(_)
             | AexError::OutOfRange { .. } => ErrorClass::Request,
-            AexError::MalformedNpy(_) => ErrorClass::Permanent,
+            AexError::MalformedNpy(_) | AexError::MalformedHdf5(_) => ErrorClass::Permanent,
             AexError::Io(e) => match e.kind() {
                 // A missing or unreadable file is the requester's problem.
                 io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => ErrorClass::Request,
@@ -197,6 +214,14 @@ mod tests {
         assert_eq!(AexError::NotAGroup("x".into()).class(), ErrorClass::Request);
         assert_eq!(
             AexError::MalformedNpy("x".into()).class(),
+            ErrorClass::Permanent
+        );
+        assert_eq!(
+            AexError::UnsupportedHdf5("x".into()).class(),
+            ErrorClass::Request
+        );
+        assert_eq!(
+            AexError::MalformedHdf5("x".into()).class(),
             ErrorClass::Permanent
         );
     }

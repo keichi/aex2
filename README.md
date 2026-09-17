@@ -11,14 +11,15 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 
 ## 状態
 
-**M4 (並列化と I/O 最適化) まで実装済み。** Python と Rust の両方から `.npy` の
-任意の選択を取得できる。実データは protobuf を一切通らず、カーネルから呼び出し側の
-バッファ (Python では `np.empty` した配列) へ直接読み込まれる。1 クライアントが複数の
-データ接続を使い、VM 間の実ネットワークでは 16 接続で 1 接続の 8 倍 (163 Gbit/s) 出る
-([M4 の測定](docs/benchmark-m4.md))。
+**M4 (並列化と I/O 最適化) まで実装済み。** Python と Rust の両方から `.npy` と
+HDF5 (netCDF-4 を含む) の任意の選択を取得できる。実データは protobuf を一切通らず、
+カーネルから呼び出し側のバッファ (Python では `np.empty` した配列) へ直接読み込まれる。
+1 クライアントが複数のデータ接続を使い、VM 間の実ネットワークでは 16 接続で
+1 接続の 8 倍 (163 Gbit/s) 出る ([M4 の測定](docs/benchmark-m4.md))。
 
 - `aex-core` — `DType`、`ErrorClass` / `AexError`、選択の解決 (`Index` の正規化と
-  `SelectionLayout`)、`ArrayFile` / `ArrayDataset` トレイト、`.npy` バックエンド
+  `SelectionLayout`)、`ArrayFile` / `ArrayDataset` トレイト、`.npy` バックエンド、
+  HDF5 バックエンド (`hdf5` feature)
 - `aex-wire` — データプレーンのワイヤ形式。ハンドシェイク、32 バイト固定ヘッダの
   フレーム、複数接続が 1 個の出力バッファへ書き込むための `ScatterBuffer`。
   サーバとクライアントが**同一コードから**エンコード/デコードする
@@ -89,9 +90,11 @@ macOS (M4) ではメモリ上のデータで単一接続 12,048 MiB/s (iPerf3 �
 ## ビルドとテスト
 
 `protoc` が必要である (`brew install protobuf` / `apt install protobuf-compiler`)。
+HDF5 バックエンド (`hdf5` feature) には libhdf5 1.14 以降が要る
+(`brew install hdf5` / `apt install libhdf5-dev`。Ubuntu は 26.04 以降)。
 
 ```console
-$ cargo test
+$ cargo test --all-features
 $ cargo clippy --all-targets --all-features -- -D warnings
 $ cargo fmt --all -- --check
 ```
@@ -100,7 +103,7 @@ $ cargo fmt --all -- --check
 `cargo test` を両プロファイルで実行する。
 
 Python 側は拡張モジュールをビルドしてから pytest を実行する。テストは
-`aex-server` を自分でビルドして起動する。
+`aex-server` を `hdf5` feature 付きで自分でビルドして起動する。
 
 ```console
 $ pip install -e ".[dev]"        # maturin で aex._aex をビルド
@@ -115,9 +118,14 @@ Ubuntu 22.04 の `protobuf-compiler` は 3.12 なので、
 ## 使い方
 
 ```console
+$ cargo install --path crates/aex-server --features hdf5   # HDF5 が不要なら --features なし
 $ aex-server --control-addr 127.0.0.1:50051 --data-addr 127.0.0.1:50052 \
     --root /path/to/data
 ```
+
+形式はファイルの拡張子で決まる (`.npy`、`.h5` / `.hdf5` / `.he5` / `.nc`)。
+拡張子で判別できないファイルは、Rust クライアントの `open_as` で形式名
+(`npy`、`hdf5`、`netcdf4` など) を明示して開く。
 
 設定ファイルを渡すこともできる (指定しなかった項目は既定値のまま)。項目は
 SPEC §8.2 を参照のこと。
@@ -169,9 +177,11 @@ ssh トンネルなどでサーバが広告するデータプレーンのポー�
 ## 前提と制約
 
 - 対象 OS は Linux (最適化対象) と macOS。`pread` を使うため Unix 系に限る
-- `.npy` のみ対応。HDF5 / netCDF4 / Zarr は将来課題 (SPEC §14.1)
+- 対応形式は `.npy` と HDF5 (netCDF-4 を含む)。netCDF-3 と Zarr は将来課題 (SPEC §14.1)
+- HDF5 は contiguous なデータセットのみ。chunked・compact・virtual・外部ファイル格納の
+  データセットと external link は非対応 (SPEC §7.5)
 - 読み出し専用
-- fortran order とビッグエンディアンの `.npy` は非対応 (SPEC §7.2)
+- fortran order の `.npy` と、ビッグエンディアンのデータは非対応 (SPEC §7.2, §7.5)
 - データプレーンは平文。認証はセッショントークンと転送ごとの ticket のみで、
   「少数クライアント・信頼できる環境」を前提とする。厳密なマルチテナント制御や
   暗号化は行わない (TLS は HELLO の `flags` に枠のみ確保)
@@ -183,7 +193,7 @@ ssh トンネルなどでサーバが広告するデータプレーンのポー�
 ```
 protos/aex.proto   コントロールプレーンの定義
 crates/aex-core/   共通型・選択の解決・バックエンド (tokio / tonic に依存しない)
-                   `.npy` と、転送経路の測定用の合成バックエンド
+                   `.npy`、HDF5、転送経路の測定用の合成バックエンド
 crates/aex-wire/   データプレーンのワイヤ形式 (サーバとクライアントで共用)
 crates/aex-proto/  aex.proto から生成されるコードと型変換
 crates/aex-server/ サーバ (両プレーン)

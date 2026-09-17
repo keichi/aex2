@@ -16,6 +16,8 @@ pub mod quality;
 pub mod selection;
 
 pub use backend::{ArrayDataset, ArrayFile, Item};
+#[cfg(feature = "hdf5")]
+pub use backends::hdf5::{Hdf5Dataset, Hdf5File};
 pub use backends::npy::{NpyDataset, NpyFile};
 pub use backends::null::{NullDataset, NullFile};
 pub use dtype::{DType, ALL_DTYPES};

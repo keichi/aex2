@@ -11,6 +11,15 @@ repository.workspace = true
 # its data-reading API, not by header parsing.
 npyz.workspace = true
 thiserror.workspace = true
+hdf5 = { workspace = true, optional = true }
+hdf5-sys = { workspace = true, optional = true }
+
+[features]
+# Needs libhdf5 >= 1.14 at build time.
+hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 
 [dev-dependencies]
+# Element types the HDF5 tests write.
+half = "2"
+num-complex = "0.4"
 tempfile.workspace = true

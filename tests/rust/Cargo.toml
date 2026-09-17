@@ -14,6 +14,13 @@ autolib = false
 autobins = false
 autotests = false
 
+[features]
+hdf5 = ["dep:hdf5", "aex-server/hdf5"]
+
+[dependencies]
+# Writes the fixtures for the HDF5 tests.
+hdf5 = { workspace = true, optional = true }
+
 [dev-dependencies]
 aex-client.workspace = true
 aex-core.workspace = true
@@ -40,3 +47,8 @@ path = "parallel.rs"
 [[test]]
 name = "faults"
 path = "faults.rs"
+
+[[test]]
+name = "hdf5"
+path = "hdf5.rs"
+required-features = ["hdf5"]
