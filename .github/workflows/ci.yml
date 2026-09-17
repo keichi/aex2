@@ -40,11 +40,14 @@ jobs:
       # The optional features must stay optional.
       - name: check (default features)
         run: cargo check --all-targets
+      # aex-py is left out: it has no tests of its own, and linking its test
+      # binary needs a libpython the runner does not ship. The python job below
+      # builds and exercises it through maturin.
       - name: test (debug)
-        run: cargo test --all-features
+        run: cargo test --all-features --workspace --exclude aex-py
       # Both profiles: overflow checks make debug and release behave differently.
       - name: test (release)
-        run: cargo test --release --all-features
+        run: cargo test --release --all-features --workspace --exclude aex-py
 
   python:
     name: python ${{ matrix.python }} (${{ matrix.os }})
