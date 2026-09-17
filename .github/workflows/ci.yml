@@ -41,9 +41,34 @@ jobs:
       - name: test (release)
         run: cargo test --release --all-features
 
-  # NOTE: the Python layer (python/aex) and the extension module (crates/aex-py)
-  # arrive in M3. Enable these jobs then:
-  #   - maturin build && pip install
-  #   - pytest tests/python
-  #   - mypy python/aex
-  #   - ruff check
+  python:
+    name: python ${{ matrix.python }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # The oldest supported and a current one.
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: build and install
+        run: pip install -e ".[dev]"
+      - name: ruff
+        run: ruff check python tests/python benchmarks && ruff format --check python tests/python benchmarks
+      - name: mypy
+        run: mypy
+      # The fixtures build and start aex-server themselves.
+      - name: pytest
+        run: pytest

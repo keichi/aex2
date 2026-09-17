@@ -11,9 +11,9 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 
 ## 状態
 
-**M2 (データプレーン最小構成) まで実装済み。** Rust クライアントから `.npy` の
-選択を取得できる。実データは protobuf を一切通らず、カーネルから呼び出し側の
-バッファへ直接読み込まれる。
+**M3 (Python バインディング) まで実装済み。** Python と Rust の両方から `.npy` の
+任意の選択を取得できる。実データは protobuf を一切通らず、カーネルから呼び出し側の
+バッファ (Python では `np.empty` した配列) へ直接読み込まれる。
 
 - `aex-core` — `DType`、`ErrorClass` / `AexError`、選択の解決 (`Index` の正規化と
   `SelectionLayout`)、`ArrayFile` / `ArrayDataset` トレイト、`.npy` バックエンド
@@ -25,19 +25,25 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 - `aex-server` — コントロールプレーン (セッション、ファイル、メタデータ、
   `PrepareSelection`)、`TransferRegistry`、接続ごとに読みスレッドと送りスレッドを
   持つデータプレーン
-- `aex-client` — 同期 API の Rust クライアント。`read_selection_into` /
-  `read_selection` / `read_selection_as`
+- `aex-client` — 同期 API の Rust クライアント。`prepare` / `fill`、
+  `read_selection_into` / `read_selection` / `read_selection_as`
+- `aex-py` — PyO3 による拡張モジュール `aex._aex`。ネットワーク待ちの間は GIL を解放し、
+  出力配列を検証してから直接書き込む
+- `python/aex` — v1 と同じ API (`Client` / `FileProxy` / `GroupProxy` / `ArrayProxy`)。
+  v1 にない `arr[..., 0]`、`arr[:, None]`、boolean mask にも対応
 
-Python バインディング (`aex-py` と `python/`) はまだない。`PrepareSelections`
-(gather) と `ApplyFunction` は `UNIMPLEMENTED` を返す。
+`PrepareSelections` (gather) と `ApplyFunction` は `UNIMPLEMENTED` を返す。
 
 ### この時点での制限
 
 M4 以降で解消する予定の、**実装上の**制限 (プロトコルの制限ではない)。
 
-- **連続な選択のみ**。`arr[:]` / `arr[5]` / `arr[10:20]` / `arr[[8,9,10]]` のように
-  ソース上で 1 個の連続領域になる選択を扱う。`arr[:, 0:50]` や `arr[::2]` のような
-  ストライド選択・断片的選択は `ErrorClass::Request` で明示的に拒否する
+- **非連続な選択は要素ごとに読む**。ソース上で 1 個の連続領域になる選択は
+  `pread` 1 回で済む。`arr[:, 0:50]` のような選択は行ごとに 1 回、`arr[::2]` の
+  ようなストライド選択は要素ごとに 1 回読むため遅い
+- **numpy 関数はすべてクライアントで計算する**。`np.sum(arr)` なども配列全体を
+  転送してから計算する (64 MiB を超えると `AexFallbackWarning`)。サーバ側の集約は M5
+- **多次元の整数インデックス配列は非対応**。1 次元にして送り、結果を reshape すること
 - **データ接続は 1 本**。チャンク分割はクライアントが行い、1 本の接続で逐次
   フェッチする。並列ストリーム・ワークスティーリング・credit パイプラインは未実装。
   なお localhost では単一接続で既にマシンの限界に達しており、接続を増やしても
@@ -46,7 +52,7 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
   (起動時に警告を出す)
 
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
-([M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
+([v1 との比較](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
 [sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、VM 2 台を実ネットワークで
@@ -90,6 +96,15 @@ $ cargo fmt --all -- --check
 デバッグとリリースで挙動が変わる箇所 (オーバーフロー検査) があるため、CI は
 `cargo test` を両プロファイルで実行する。
 
+Python 側は拡張モジュールをビルドしてから pytest を実行する。テストは
+`aex-server` を自分でビルドして起動する。
+
+```console
+$ pip install -e ".[dev]"        # maturin で aex._aex をビルド
+$ pytest
+$ mypy && ruff check python tests/python benchmarks
+```
+
 `protoc` は **3.15 以降**が要る (proto3 の optional フィールドを使うため)。
 Ubuntu 22.04 の `protobuf-compiler` は 3.12 なので、
 [公式リリース](https://github.com/protocolbuffers/protobuf/releases) から入れること。
@@ -130,6 +145,19 @@ client.read_selection_into(handle, "array", &[], &mut buf)?;
 client.disconnect()?;
 ```
 
+Python からは v1 と同じ書き方で使える。
+
+```python
+import aex
+import numpy as np
+
+with aex.Client("127.0.0.1:50051") as client:
+    arr = client.open("ocean.npy")["array"]   # ArrayProxy
+    arr[10:20, ::2]                           # 読み取り専用の ndarray
+    arr[arr[:, 0] > 0]                        # boolean mask
+    np.mean(arr, axis=0)                      # 現状はクライアントで計算
+```
+
 ベンチマークのパラメータ掃引のため、主要な設定は環境変数でも上書きできる
 (`AEX_STREAMS`、`AEX_CHUNK_BYTES`、`AEX_MAX_RETRIES`、`AEX_TCP_NODELAY` ほか)。
 
@@ -155,9 +183,10 @@ crates/aex-wire/   データプレーンのワイヤ形式 (サーバとクラ�
 crates/aex-proto/  aex.proto から生成されるコードと型変換
 crates/aex-server/ サーバ (両プレーン)
 crates/aex-client/ Rust クライアント
-benchmarks/        転送性能の測定 (基準値の iperf3 / pread と、端から端まで)
+crates/aex-py/     Python 拡張モジュール aex._aex
+python/aex/        Python 層 (v1 互換の API)
+benchmarks/        転送性能の測定 (基準値の iperf3 / pread、端から端まで、v1 との比較)
 docs/              測定結果
 tests/rust/        サーバとクライアントを同一プロセスで動かす統合テスト
+tests/python/      v1 から移植した pytest と numpy との差分テスト
 ```
-
-M3 で `aex-py` と `python/` が加わる (SPEC §4)。
