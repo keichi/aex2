@@ -233,6 +233,9 @@ impl Drop for Threaded {
 }
 
 fn read_loop(work: &Receiver<ReadRequest>, pieces: &Sender<Piece>, free: &Receiver<Vec<u8>>) {
+    // The buffer of a failed read never went out, so it is kept here for the
+    // next one; dropping it would shrink the pool until the reader starves.
+    let mut spare: Option<Vec<u8>> = None;
     while let Ok(request) = work.recv() {
         let mut offset = request.offset;
         let mut remaining = request.len;
@@ -243,7 +246,13 @@ fn read_loop(work: &Receiver<ReadRequest>, pieces: &Sender<Piece>, free: &Receiv
             }
             // Blocks until the connection thread has written one out, which is
             // what keeps the reader from running ahead without bound.
-            let Ok(mut bytes) = free.recv() else { return };
+            let mut bytes = match spare.take() {
+                Some(bytes) => bytes,
+                None => match free.recv() {
+                    Ok(bytes) => bytes,
+                    Err(_) => return,
+                },
+            };
 
             // The buffer keeps its full length; only this much of it is read
             // into. Shrinking it and growing it back would zero the difference
@@ -254,6 +263,7 @@ fn read_loop(work: &Receiver<ReadRequest>, pieces: &Sender<Piece>, free: &Receiv
                 offset,
                 &mut bytes[..piece],
             ) {
+                spare = Some(bytes);
                 break Piece::Failed(e);
             }
 
@@ -403,6 +413,21 @@ mod tests {
         assert_eq!(pieces.len(), 2, "nothing past the piece that failed");
         // The reader stopped rather than carrying on through the range.
         assert_eq!(dataset.reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn failed_reads_do_not_use_up_the_buffers() {
+        let (entry, _) = entry_of(1000, Some(0));
+        let pipeline = ReadPipeline::start(2, 256).expect("start");
+        // More failures than there are buffers; a leak would hang here.
+        for _ in 0..5 {
+            pipeline.request(entry.clone(), 0, 100).expect("request");
+            assert!(drain(&pipeline).1.is_some());
+        }
+        pipeline.request(entry, 256, 600).expect("request");
+        let (pieces, failure) = drain(&pipeline);
+        assert!(failure.is_none());
+        assert_eq!(pieces.len(), 3);
     }
 
     #[test]
