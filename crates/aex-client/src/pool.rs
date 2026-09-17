@@ -468,11 +468,17 @@ impl Transfer<'_> {
             *held = None;
             if let ClientError::Io(_) = error {
                 let mut exhausted = false;
-                for InFlight { chunk, slice, .. } in flight.drain(..) {
+                let oldest = flight.len().saturating_sub(1);
+                // Newest first, so that each lands in front of the last and
+                // they go out again in their original order.
+                for (i, InFlight { chunk, slice, .. }) in flight.drain(..).rev().enumerate() {
                     // Released before it is queued, or another connection
                     // could find the range still claimed.
                     drop(slice);
-                    exhausted |= !self.retry(chunk);
+                    // Only the oldest was being answered; the rest were just
+                    // queued behind it, and deeper credit must not make a
+                    // break more likely to fail the transfer.
+                    exhausted |= !self.retry(chunk, i == oldest);
                 }
                 if exhausted {
                     self.fail(error);
@@ -558,7 +564,7 @@ impl Transfer<'_> {
                         header.offset, header.request_id, chunk.offset
                     )));
                 }
-                if !(error.is_retryable() && self.retry(chunk)) {
+                if !(error.is_retryable() && self.retry(chunk, true)) {
                     self.fail(error);
                 }
             }
@@ -582,10 +588,10 @@ impl Transfer<'_> {
         }
     }
 
-    /// Put a failed chunk back at the front of the queue. False once it has
-    /// used up its retries.
-    fn retry(&self, mut chunk: Chunk) -> bool {
-        chunk.attempts += 1;
+    /// Put a chunk back at the front of the queue, counting it against its
+    /// retries if `charge`. False once it has used them up.
+    fn retry(&self, mut chunk: Chunk, charge: bool) -> bool {
+        chunk.attempts += u32::from(charge);
         if chunk.attempts > self.spec.max_retries {
             return false;
         }

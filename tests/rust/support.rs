@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use aex_client::{Client, ClientConfig, ClientError};
@@ -205,6 +205,18 @@ impl TestServer {
     }
 }
 
+/// What a [`Proxy`] does to the connections it carries.
+#[derive(Debug, Clone, Copy)]
+pub enum Fault {
+    None,
+    /// Tear each connection down once it has carried this many bytes towards
+    /// the client, mid-frame if need be.
+    CutAfter(u64),
+    /// Answer the first fetch on each connection with a TRANSIENT error
+    /// instead of passing it on. Being first, it cannot land inside a frame.
+    FailFirstFetch,
+}
+
 /// A TCP proxy in front of the data plane that can break connections.
 ///
 /// Threads are left to die with the sockets; a test process is short-lived.
@@ -215,9 +227,7 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    /// Forward to `target`. With `cut_after`, each connection is torn down once
-    /// it has carried that many bytes towards the client, mid-frame if need be.
-    pub fn start(target: SocketAddr, cut_after: Option<u64>) -> Proxy {
+    pub fn start(target: SocketAddr, fault: Fault) -> Proxy {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
         let addr = listener.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -230,14 +240,14 @@ impl Proxy {
                     return;
                 };
                 a.fetch_add(1, Ordering::Relaxed);
+                // Both directions write to the client under this lock, so an
+                // injected frame never lands inside a forwarded one.
+                let down = Arc::new(Mutex::new(client.try_clone().unwrap()));
+                let (up_from, up_to) = (client, server.try_clone().unwrap());
+                let d = down.clone();
+                std::thread::spawn(move || pump_up(up_from, up_to, &d, fault));
                 let cuts = c.clone();
-                let (mut up_from, mut up_to) =
-                    (client.try_clone().unwrap(), server.try_clone().unwrap());
-                std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut up_from, &mut up_to);
-                    let _ = up_to.shutdown(Shutdown::Write);
-                });
-                std::thread::spawn(move || pump_down(server, client, cut_after, &cuts));
+                std::thread::spawn(move || pump_down(server, &down, fault, &cuts));
             }
         });
         Proxy {
@@ -263,13 +273,42 @@ impl Proxy {
     }
 }
 
-fn pump_down(
-    mut server: TcpStream,
-    mut client: TcpStream,
-    cut_after: Option<u64>,
-    cuts: &AtomicUsize,
-) {
-    let mut left = cut_after.unwrap_or(u64::MAX);
+fn pump_up(mut client: TcpStream, mut server: TcpStream, down: &Mutex<TcpStream>, fault: Fault) {
+    if let Fault::FailFirstFetch = fault {
+        let mut hello = [0u8; aex_wire::HELLO_LEN];
+        let mut header = [0u8; aex_wire::HEADER_LEN];
+        let mut ticket = [0u8; aex_wire::TICKET_LEN];
+        if client.read_exact(&mut hello).is_err()
+            || server.write_all(&hello).is_err()
+            || client.read_exact(&mut header).is_err()
+            || client.read_exact(&mut ticket).is_err()
+        {
+            return;
+        }
+        let fetch = aex_wire::FrameHeader::decode(&header).expect("a fetch");
+        let payload =
+            aex_wire::ErrorPayload::new(ErrorClass::Transient, "injected by the test proxy")
+                .encode();
+        let error = aex_wire::FrameHeader::error(
+            fetch.request_id,
+            fetch.offset,
+            fetch.logical_len,
+            payload.len() as u64,
+        );
+        let mut down = down.lock().unwrap();
+        if aex_wire::write_frame(&mut *down, &error, &payload).is_err() {
+            return;
+        }
+    }
+    let _ = std::io::copy(&mut client, &mut server);
+    let _ = server.shutdown(Shutdown::Write);
+}
+
+fn pump_down(mut server: TcpStream, down: &Mutex<TcpStream>, fault: Fault, cuts: &AtomicUsize) {
+    let mut left = match fault {
+        Fault::CutAfter(bytes) => bytes,
+        _ => u64::MAX,
+    };
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = match server.read(&mut buf) {
@@ -277,6 +316,7 @@ fn pump_down(
             Ok(n) => n,
         };
         let pass = (n as u64).min(left) as usize;
+        let mut client = down.lock().unwrap();
         if client.write_all(&buf[..pass]).is_err() {
             break;
         }
@@ -288,7 +328,7 @@ fn pump_down(
             return;
         }
     }
-    let _ = client.shutdown(Shutdown::Write);
+    let _ = down.lock().unwrap().shutdown(Shutdown::Write);
 }
 
 /// The class of a server error, or a failure if the call did not fail.

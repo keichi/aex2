@@ -17,7 +17,7 @@ use aex_wire::{
 #[path = "support.rs"]
 mod support;
 
-use support::{Proxy, TestServer};
+use support::{Fault, Proxy, TestServer};
 
 /// Connect to the data plane, with a timeout so a hung test fails rather than
 /// hangs.
@@ -570,7 +570,7 @@ fn the_synthetic_backend_serves_the_pattern_it_promises() {
 fn the_data_plane_can_be_reached_at_a_pinned_endpoint() {
     let server = TestServer::start();
     let expected = server.write_counting_npy("ocean.npy", &[1000, 200]);
-    let proxy = Proxy::start(server.data_addr, None);
+    let proxy = Proxy::start(server.data_addr, Fault::None);
 
     // What a tunnel looks like: the server advertises one port, the client has
     // to use another.

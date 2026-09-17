@@ -36,3 +36,7 @@ path = "data_plane.rs"
 [[test]]
 name = "parallel"
 path = "parallel.rs"
+
+[[test]]
+name = "faults"
+path = "faults.rs"
