@@ -789,7 +789,7 @@ tokio の本来の利点は「読みと送りを重ねられる」ことだが�
 ### 6.6 受信パス (クライアント) のゼロコピー
 
 ```
-np.empty(shape, dtype) で出力バッファを確保 (Python 層)
+np.empty(plan.shape, plan.dtype) で出力バッファを確保 (Python 層、§10.5)
   ↓ PyO3 で raw pointer + len を取得、GIL 解放
 ScatterBuffer { ptr, len }  ← 複数スレッドが非重複領域に書くための薄い抽象
   ↓
@@ -1129,15 +1129,27 @@ impl Client {
     pub fn get_item(&self, h: FileHandle, name: &str) -> Result<Item>;
     pub fn list_children(&self, h: FileHandle, name: &str) -> Result<Vec<(String, Item)>>;
 
-    /// 選択を取得し、呼び出し側が用意したバッファへ書き込む。
+    /// 選択をサーバに解決させ、転送計画を得る (1 往復)。
+    pub fn prepare(&self, h: FileHandle, name: &str, sel: &Selection,
+                   quality: &QualitySpec) -> Result<Plan>;
+
+    /// 解決済みの plan を dst へ流し込む。
+    /// plan が失効していたら選択から一度だけ解決し直すため、選択も受け取る。
+    pub fn fill(&self, plan: &Plan, h: FileHandle, name: &str, sel: &Selection,
+                dst: &mut [u8]) -> Result<TransferResult>;
+
+    /// prepare して確保済みのバッファへ fill する。Rust から使うときの近道。
     pub fn read_selection_into(
         &self, h: FileHandle, name: &str, sel: &Selection,
         quality: &QualitySpec, dst: &mut [u8],
     ) -> Result<TransferResult>;
 
-    /// 複数の選択をまとめて要求する (RTT 隠蔽)。
-    pub fn read_many_into(&self, reqs: &[SelectionRequest], dsts: &mut [&mut [u8]])
-        -> Result<Vec<TransferResult>>;
+    /// 複数の選択をまとめて解決する (RTT 隠蔽)。要素ごとに plan かエラーを返す。
+    pub fn prepare_many(&self, reqs: &[SelectionRequest]) -> Result<Vec<Result<Plan>>>;
+
+    /// 解決済みの plan 群を 1 つのチャンクキューへまとめて投入する。
+    pub fn fill_many(&self, plans: &[Plan], reqs: &[SelectionRequest],
+                     dsts: &mut [&mut [u8]]) -> Result<Vec<TransferResult>>;
 
     pub fn apply_function(&self, h: FileHandle, name: &str, sel: &Selection,
                           func: &str, kwargs: &Kwargs) -> Result<ScalarResult>;
@@ -1146,13 +1158,29 @@ impl Client {
 }
 ```
 
-**`read_selection_into` が出力バッファを引数に取る**のが設計の要点である。クライアントライブラリ側で確保して返す形にすると、Python の numpy 配列へ渡す際にコピーが 1 回入る。呼び出し側 (= Python の `np.empty`) が確保したメモリに直接書くことで、これを避ける。
+```rust
+/// 解決済みの選択。
+pub struct Plan {
+    pub dtype:       DType,   // サーバが返した実際の値。要求と異なりうる
+    pub shape:       Vec<u64>,
+    pub total_bytes: u64,
+    pub is_inline:   bool,
+    // request_id / ticket / inline_data は内部
+}
+```
+
+**転送関数が出力バッファを引数に取る**のが設計の要点である。クライアントライブラリ側で確保して返す形にすると、Python の numpy 配列へ渡す際にコピーが 1 回入る。呼び出し側 (= Python の `np.empty`) が確保したメモリに直接書くことで、これを避ける。
+
+**`prepare` と `fill` を分けて公開する**のは、出力バッファの shape と dtype をサーバの答えで決めるためである (§10.5)。往復回数は変わらない — `read_selection_into` も内部で `prepare` を 1 回呼ぶだけであり、分割は確保処理をその間に挟む口を開けるだけである。分けない場合、呼び出し側は選択結果の shape を自分で計算して確保することになり、サーバ側の正規化と二重実装になる。さらに、適応品質を要求すると `Plan` の dtype と shape は要求と異なりうるため、確保の前に plan を見られなければ `at(dtype=...)` を載せられない。
 
 ### 9.2 転送の流れ
 
 ```
-read_selection_into(dst):
+prepare(sel):
   1. gRPC PrepareSelection → TransferPlan
+     呼び出し側は plan.dtype / plan.shape / plan.total_bytes を見て出力バッファを確保する
+
+fill(plan, dst):
   2. dst.len() == plan.total_bytes を検証
   3. plan.inline_data が非空なら (小さい選択、§5.6.2):
        dst へコピーして即 return。データプレーンを使わない
@@ -1171,7 +1199,7 @@ read_selection_into(dst):
 
 転送の終わりにサーバへ通知することはしない (§5.6.1)。plan は TTL と LRU で回収される。
 
-`read_many_into` (gather) は step 1 を `PrepareSelections` の 1 往復に置き換え、得られた plan のうち inline でないものだけを 1 つのチャンクキューへまとめて投入する。これにより N 個の選択が N × RTT ではなく 1 往復 + 転送で完了し、かつ全接続を N 個の選択にまたがって使い切れる。
+`prepare_many` / `fill_many` (gather) は step 1 を `PrepareSelections` の 1 往復に置き換え、得られた plan のうち inline でないものだけを 1 つのチャンクキューへまとめて投入する。これにより N 個の選択が N × RTT ではなく 1 往復 + 転送で完了し、かつ全接続を N 個の選択にまたがって使い切れる。
 
 ### 9.3 クライアント設定
 
@@ -1305,11 +1333,48 @@ aex.set_fallback_threshold(64 * 1024 * 1024)   # 既定 64 MiB
 |------|-----|
 | `__getitem__` のキー解析 (slice / Ellipsis / newaxis / mask 展開) | Python |
 | `__array_function__` のディスパッチと警告 | Python |
-| 出力配列の確保 (`np.empty`) と shape/dtype の決定 | Python |
+| 出力配列の確保 (`np.empty`) | Python |
+| 出力配列の shape / dtype の決定 | Rust (サーバ)。`Plan` を見てから確保する |
 | gRPC 通信、データプレーン転送、チャンクスケジューリング | Rust |
 | 選択の正規化と検証 (最終的な正しさ) | Rust (サーバ) |
 
 キー解析を Python に置くのは、numpy のインデックス構文が複雑で、Python の型システムと密結合しているためである。ただし**正しさの最終的な保証はサーバ側の正規化**で行い、Python 側は「素直な変換」に留める。二重に実装した正規化ロジックが食い違うのを避けるため。
+
+同じ理由で、**出力配列の shape と dtype は Python 側で計算せず、`prepare` が返した `Plan` の値をそのまま使う** (§9.1)。取得の流れは次のようになる。
+
+```python
+def __getitem__(self, key):
+    indices, newaxes = parse_key(key, self.shape)          # Python 層
+    plan = _aex.prepare(self._handle, self._name, indices)  # 1 往復。GIL 解放
+    out = np.empty(plan.shape, dtype=plan.dtype)            # サーバの答えで確保
+    _aex.fill(plan, self._handle, self._name, indices, out) # GIL 解放
+    return out.reshape(with_newaxes(plan.shape, newaxes))
+```
+
+`None` (newaxis) と、単一インデックスで軸が落ちる場合の最終的な shape だけは Python 側の情報でしか決まらないため、受信後の `reshape` で与える。`reshape` はビューを返すのでコピーは発生しない。
+
+### 10.6 メモリ管理と寿命
+
+出力配列のメモリは Python が確保し、Python が解放する。Rust は書き込むだけで、所有権を持たない。`aex-client` の `read_selection` のように `Vec` を返す API は Rust 単体利用とテストのためのものであり、**バインディングからは使わない** (numpy 配列へ渡す際にコピーが 1 回増えるため)。
+
+**生ポインタを渡す前の検証**は、バインディング層の責務である。`ScatterBuffer` はバッファ長と非重複しか見ないので、numpy 配列に固有の前提はここで弾く。
+
+| 条件 | 違反時 |
+|------|--------|
+| C 連続 (`is_c_contiguous`) | `AexValueError` |
+| 書き込み可能 | `AexValueError` |
+| dtype が `plan.dtype` と一致し、リトルエンディアン | `AexValueError` |
+| `nbytes == plan.total_bytes` | `AexValueError` |
+
+`read_into` (§10.3) で条件を満たさないバッファを渡されたとき、**暗黙に一時バッファを挟んでコピーするフォールバックはしない**。ゼロコピーのための API で黙ってコピーしては目的を失うため、エラーにして呼び出し側に `np.ascontiguousarray` を書かせる。`__getitem__` の経路は自分で `np.empty` するので、これらの条件は常に満たされる。
+
+同一バッファを指す別の numpy ビューが同時に書かれるのを防ぐため、生ポインタは `rust-numpy` の `PyReadwriteArray` 経由で取り出し、実行時の借用チェックを効かせる。
+
+**GIL の扱い**: ネットワーク I/O は `py.allow_threads` で囲む。このクロージャには Python の型を持ち込めない (`Ungil` 制約) ため、渡すのは `&mut [u8]` だけとし、`PyReadwriteArray` のガードはクロージャの外で保持する。同期呼び出しである限り、呼び出し元のフレームとこのガードの両方が参照を持つので、GIL を離している間に配列が回収されることはない。
+
+**転送が失敗したとき**、出力バッファの内容は不定である。`__getitem__` は例外を投げて配列を返さないので影響はないが、`read_into` はユーザのバッファなので「失敗時の内容は未定義」を docstring に明記する。
+
+**`get_async` の寿命** (M5): 呼び出しが返った後もバッファが生き続ける必要があるため、Future オブジェクトが Rust 側で `Py<PyArray>` の強参照を保持する。Python 側で `del` されても参照数は落ちない。さらに §6.3 の drain 規則により、中断時もバッファの解放は drain 完了より後でなければならない。したがって Future の `Drop` と `cancel` は drain の完了を待つ (待っている間は GIL を離す)。
 
 ---
 
@@ -1480,10 +1545,12 @@ for impl in ["aex_v1", "aex_v2"]:
 
 ### M3: Python バインディング
 
+- `aex-client` に `Plan` / `prepare` / `fill` を公開 (§9.1)。出力配列を plan の shape と dtype で確保するため
 - PyO3 + maturin、`aex._aex` 拡張モジュール
 - Python 層: `Client` / `FileProxy` / `GroupProxy` / `ArrayProxy`
 - `__getitem__` のキー解析 (Ellipsis / newaxis / mask を含む)
 - `__array_function__` とフォールバック警告
+- 出力バッファの検証と GIL 解放 (§10.6)
 - v1 の pytest 移植、numpy 差分テスト
 
 **完了条件**: v1 のテストスイートが v2 で通る。`benchmarks/run_benchmarks.py` が v2 で動く
@@ -1561,7 +1628,7 @@ for impl in ["aex_v1", "aex_v2"]:
 
 1. **`pread` + `writev` で何 GB/s 出るか** — M2 の前に、`.npy` を `pread` で読んで `writev` でソケットへ流すだけの 50 行程度のプログラムを書き、localhost と LAN で測る。**ホットキャッシュとコールドキャッシュの両方**で測り、後者ではディスク律速かどうかを確認する。ここで 10 GbE を飽和できないなら、設計の前提が崩れる
 2. **ダブルバッファリングの効果** — 上記を「逐次」と「読み/送り分離」の 2 通りで実装して比較する。コールドキャッシュでの差が、6.5.3 の複雑さに見合うかを判断する
-3. **PyO3 で `np.empty` のバッファへ複数スレッドから書く経路が成立するか** — `ScatterBuffer` の最小実装を先に書き、Miri で検証する
+3. **PyO3 で `np.empty` のバッファへ複数スレッドから書く経路が成立するか** — `ScatterBuffer` の最小実装を先に書き、Miri で検証する。Miri は PyO3 の FFI 越しには回らないため、バインディングを通した経路は接続数を掃引した繰り返しテストと ASan で確認する
 4. **専用スレッドモデルのスレッド数** — 読み/送り分離により接続あたり 2 本になるため、接続数 16 × クライアント 4 × 2 = 128 スレッドで問題が出ないことを確認する
 
 ---
