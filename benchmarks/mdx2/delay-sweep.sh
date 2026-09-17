@@ -2,6 +2,10 @@
 #
 # Sweep added RTT between the VMs with netem and time AEX2 and iPerf3 at each.
 #
+# iPerf3 runs twice: for 10 s, the link's capacity, and for the same 4 GiB as
+# AEX2, which pays the same slow start. AEX2 prefaults its buffer, since
+# iPerf3 reuses one and never pays the page faults.
+#
 # Half the delay goes on each side, so ACKs are late too, and only traffic to
 # the peer is delayed, so ssh stays fast. Each pass visits every condition once,
 # because the shared link drifts over the day.
@@ -60,11 +64,16 @@ for r in $(seq "$REPS"); do
                 flush_metrics
                 ssh $CLIENT "bash -lc 'cd aex2 && target/release/aexbench \
                     http://$SERVER_IP:50191 mem.npy --bytes \$((4<<30)) \
-                    --streams $s --reps 1 --label \"aex $label\"'"
+                    --streams $s --reps 1 --prefault --label \"aex $label\"'"
                 flush_metrics
                 gbit=$(ssh $CLIENT "iperf3 -c $SERVER_IP -t 10 -Z -R -P $s -J" |
                     jq '.end.sum_received.bits_per_second / 1e9')
                 printf 'iperf %-40s %.2f Gbit/s\n' "$label" "$gbit"
+                flush_metrics
+                # Intervals time the end to 0.1 s, the finest iperf3 allows; else whole seconds.
+                gbit=$(ssh $CLIENT "iperf3 -c $SERVER_IP -n 4G -i 0.1 -Z -R -P $s -J" |
+                    jq '.end.sum_received.bits_per_second / 1e9')
+                printf 'iperf4g %-38s %.2f Gbit/s\n' "$label" "$gbit"
             done
         done
     done
