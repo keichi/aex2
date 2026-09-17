@@ -52,7 +52,7 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
   (起動時に警告を出す)
 
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
-([v1 との比較](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
+([v1 との比較 (Mac・VM)](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
 [sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、VM 2 台を実ネットワークで
