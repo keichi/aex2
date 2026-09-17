@@ -49,7 +49,8 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 ([M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
 [sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
-[docs/benchmark-linux.md](docs/benchmark-linux.md) にある。
+[docs/benchmark-linux.md](docs/benchmark-linux.md)、VM 2 台を実ネットワークで
+繋いだ測定は [docs/benchmark-vm.md](docs/benchmark-vm.md) にある。
 
 macOS (M4) ではメモリ上のデータで単一接続 12,048 MiB/s (iPerf3 の 62 %)、Linux
 (Ryzen 9 5900X) では 6,694 MiB/s (iPerf3 単一ストリームは 5,863 MiB/s)。どちらでもダブルバッファリングが 50 % 以上効く。
