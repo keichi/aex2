@@ -88,6 +88,17 @@ class ArrayProxy:
         out.flags.writeable = False
         return out
 
+    def read_into(self, out: npt.NDArray[Any], key: Any = Ellipsis) -> None:
+        """Transfer a selection into ``out`` without allocating.
+
+        ``out`` must be C-contiguous, writable, of the array's dtype and exactly
+        the selection's size; nothing is copied to make it fit. If the transfer
+        fails, the contents of ``out`` are undefined.
+        """
+        wire_key = _to_wire(key, self.shape)
+        plan = self._native.prepare(self.handle, self.name, wire_key)
+        self._native.fill(plan, self.handle, self.name, wire_key, out)
+
     def __array__(
         self, dtype: npt.DTypeLike | None = None, copy: bool | None = None
     ) -> npt.NDArray[Any]:

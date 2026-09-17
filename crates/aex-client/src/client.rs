@@ -11,7 +11,7 @@
 //! [`Client::read_selection_into`] takes the buffer rather than returning one.
 
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use aex_core::{DType, Index};
@@ -27,7 +27,7 @@ use tonic::transport::{Channel, Endpoint};
 use crate::config::ClientConfig;
 use crate::error::{ClientError, Result};
 use crate::pool::{ConnSettings, DataPool, FetchSpec};
-use crate::transfer::{ArrayData, Element, Plan, TransferResult, TypedArray};
+use crate::transfer::{ArrayData, ClientStats, Element, Plan, TransferResult, TypedArray};
 
 /// The data plane frame version this client speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -140,6 +140,7 @@ pub struct Client {
     pool: DataPool,
     session: SessionInfo,
     config: ClientConfig,
+    stats: Mutex<ClientStats>,
 }
 
 impl std::fmt::Debug for Client {
@@ -182,6 +183,7 @@ impl Client {
             .max_decoding_message_size(config.max_message_bytes)
             .max_encoding_message_size(config.max_message_bytes);
 
+        let started = Instant::now();
         let reply = runtime
             .block_on(control.connect(ConnectRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -189,6 +191,7 @@ impl Client {
                 client_name: config.client_name.clone(),
             }))?
             .into_inner();
+        let rtt = started.elapsed();
 
         if reply.protocol_version != PROTOCOL_VERSION {
             return Err(ClientError::Protocol(format!(
@@ -242,12 +245,18 @@ impl Client {
             session.granted_streams,
         )?;
 
+        let stats = Mutex::new(ClientStats {
+            streams: pool.streams(),
+            rtt,
+            ..ClientStats::default()
+        });
         Ok(Client {
             control,
             runtime,
             pool,
             session,
             config,
+            stats,
         })
     }
 
@@ -257,6 +266,11 @@ impl Client {
 
     pub fn config(&self) -> &ClientConfig {
         &self.config
+    }
+
+    /// Totals over every transfer this client has made.
+    pub fn stats(&self) -> ClientStats {
+        self.stats.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Open a file, letting the server infer the format from the name.
@@ -434,6 +448,22 @@ impl Client {
         indices: &[Index],
         dst: &mut [u8],
     ) -> Result<TransferResult> {
+        let result = self.fill_once(plan, handle, name, indices, dst)?;
+        self.stats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add(&result);
+        Ok(result)
+    }
+
+    fn fill_once(
+        &self,
+        plan: &Plan,
+        handle: FileHandle,
+        name: &str,
+        indices: &[Index],
+        dst: &mut [u8],
+    ) -> Result<TransferResult> {
         if plan.total_bytes != dst.len() as u64 {
             return Err(ClientError::BadRequest(format!(
                 "the selection is {} bytes and the buffer is {}",
@@ -529,7 +559,11 @@ impl Client {
     {
         // The generated client wants &mut self; cloning it is cheap and shares
         // the one connection.
+        let started = Instant::now();
         let response = self.runtime.block_on(rpc(self.control.clone()))?;
+        let took = started.elapsed();
+        let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
+        stats.rtt = stats.rtt.min(took);
         Ok(response.into_inner())
     }
 }

@@ -2,7 +2,7 @@
 
 from collections.abc import Iterator
 from types import TracebackType
-from typing import Self
+from typing import Any, Self
 
 from . import _aex
 from .array_proxy import ArrayProxy
@@ -24,6 +24,14 @@ class Client:
 
     def open(self, path: str) -> "FileProxy":
         return FileProxy(self._native, self._native.open(path))
+
+    def stats(self) -> dict[str, Any]:
+        """Totals over every transfer this client has made.
+
+        ``rtt_ms`` is the fastest control plane call so far, an upper bound on
+        the round trip.
+        """
+        return self._native.stats()
 
     def close(self) -> None:
         """End the session. The proxies it produced stop working."""

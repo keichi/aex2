@@ -146,6 +146,37 @@ impl TransferResult {
     }
 }
 
+/// What a client has transferred since it connected.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClientStats {
+    pub bytes: u64,
+    /// Time spent filling buffers, summed over transfers.
+    pub elapsed: Duration,
+    pub chunks: u64,
+    pub retries: u64,
+    /// Data connections held.
+    pub streams: u32,
+    /// Fastest control plane call seen, which bounds the round trip from above.
+    pub rtt: Duration,
+}
+
+impl ClientStats {
+    pub(crate) fn add(&mut self, transfer: &TransferResult) {
+        self.bytes += transfer.bytes;
+        self.elapsed += transfer.elapsed;
+        self.chunks += u64::from(transfer.chunks);
+        self.retries += u64::from(transfer.retries);
+    }
+
+    pub fn throughput_mib_per_sec(&self) -> f64 {
+        let seconds = self.elapsed.as_secs_f64();
+        if seconds <= 0.0 {
+            return 0.0;
+        }
+        self.bytes as f64 / seconds / (1024.0 * 1024.0)
+    }
+}
+
 /// An array fetched from a server, as raw bytes.
 ///
 /// C order, little-endian: the logical byte stream exactly as it travelled.
@@ -321,6 +352,26 @@ mod tests {
             ..result
         };
         assert_eq!(instant.throughput_mib_per_sec(), 0.0);
+    }
+
+    #[test]
+    fn stats_add_up_transfers() {
+        let transfer = TransferResult {
+            bytes: 1024 * 1024,
+            elapsed: Duration::from_millis(250),
+            chunks: 3,
+            streams: 2,
+            retries: 1,
+            inline: false,
+        };
+        let mut stats = ClientStats::default();
+        assert_eq!(stats.throughput_mib_per_sec(), 0.0);
+        stats.add(&transfer);
+        stats.add(&transfer);
+        assert_eq!(stats.bytes, 2 * 1024 * 1024);
+        assert_eq!(stats.chunks, 6);
+        assert_eq!(stats.retries, 2);
+        assert!((stats.throughput_mib_per_sec() - 4.0).abs() < 1e-9);
     }
 
     #[test]

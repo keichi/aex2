@@ -18,4 +18,4 @@ pub use client::{Client, DatasetInfo, FileHandle, Item, SessionInfo, PROTOCOL_VE
 pub use config::ClientConfig;
 pub use error::{ClientError, Result};
 pub use tonic::Code;
-pub use transfer::{ArrayData, Element, Plan, TransferResult, TypedArray};
+pub use transfer::{ArrayData, ClientStats, Element, Plan, TransferResult, TypedArray};

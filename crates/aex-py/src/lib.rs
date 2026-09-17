@@ -15,7 +15,7 @@ use numpy::{
 };
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PySlice, PyTuple};
+use pyo3::types::{PyDict, PySlice, PyTuple};
 
 /// Raise a client error as the `aex.errors` exception for its class.
 fn to_py(err: ClientError) -> PyErr {
@@ -245,6 +245,20 @@ impl Client {
             Float16 => f16, Float32 => f32, Float64 => f64,
             Complex64 => Complex32, Complex128 => Complex64,
         )
+    }
+
+    /// Totals over every transfer, for benchmarks and tuning.
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let stats = self.get()?.stats();
+        let dict = PyDict::new(py);
+        dict.set_item("bytes", stats.bytes)?;
+        dict.set_item("elapsed", stats.elapsed.as_secs_f64())?;
+        dict.set_item("throughput_mibps", stats.throughput_mib_per_sec())?;
+        dict.set_item("streams", stats.streams)?;
+        dict.set_item("chunks", stats.chunks)?;
+        dict.set_item("retries", stats.retries)?;
+        dict.set_item("rtt_ms", stats.rtt.as_secs_f64() * 1e3)?;
+        Ok(dict)
     }
 
     /// End the session. Later calls fail.
