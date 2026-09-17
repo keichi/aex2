@@ -330,7 +330,8 @@ TOTAL = 100 * (200 * 199 // 2) + (100 * 99 // 2) * 200 * 200
 def test_numpy_sum_full_reduction(array_proxy):
     result = np.sum(array_proxy)
     assert np.ndim(result) == 0
-    assert result == np.sum(np.asarray(array_proxy))
+    # The server adds in stream order and numpy pairwise, so float32 sums differ.
+    assert np.isclose(result, np.sum(np.asarray(array_proxy)), rtol=1e-6)
     assert np.isclose(float(result), TOTAL)
 
 

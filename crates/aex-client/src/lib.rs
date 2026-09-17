@@ -13,8 +13,10 @@ pub mod error;
 pub mod pool;
 pub mod transfer;
 
-pub use aex_core::{DType, Encoding, ErrorClass, Index, QualitySpec};
-pub use client::{Client, DatasetInfo, FileHandle, Item, Selection, SessionInfo, PROTOCOL_VERSION};
+pub use aex_core::{DType, Encoding, ErrorClass, Index, QualitySpec, Reduced};
+pub use client::{
+    Client, DatasetInfo, FileHandle, FunctionArg, Item, Selection, SessionInfo, PROTOCOL_VERSION,
+};
 pub use config::ClientConfig;
 pub use error::{ClientError, Result};
 pub use tonic::Code;

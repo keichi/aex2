@@ -8,8 +8,8 @@
 use std::sync::{Arc, RwLock};
 
 use aex_client::{
-    ClientConfig, ClientError, DType, Encoding, ErrorClass, FileHandle, Index, Item, QualitySpec,
-    Selection,
+    ClientConfig, ClientError, DType, Encoding, ErrorClass, FileHandle, FunctionArg, Index, Item,
+    QualitySpec, Selection,
 };
 use half::f16;
 use numpy::{
@@ -18,7 +18,7 @@ use numpy::{
 };
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PySlice, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PySlice, PyTuple};
 
 /// Raise a client error as the `aex.errors` exception for its class.
 fn to_py(err: ClientError) -> PyErr {
@@ -323,6 +323,42 @@ impl Client {
         )
     }
 
+    /// Reduce a selection on the server. Returns `(dtype, shape, bytes)`.
+    ///
+    /// `kwargs` values are None, bool, int, float or a tuple of ints.
+    #[allow(clippy::type_complexity)]
+    fn apply_function<'py>(
+        &self,
+        py: Python<'py>,
+        handle: u64,
+        name: String,
+        key: &Bound<'_, PyTuple>,
+        function: String,
+        kwargs: &Bound<'_, PyDict>,
+    ) -> PyResult<(&'static str, Vec<u64>, Bound<'py, PyBytes>)> {
+        let indices = indices_from_py(key)?;
+        let kwargs = kwargs
+            .iter()
+            .map(|(k, v)| Ok((k.extract::<String>()?, function_arg(&v)?)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let reduced = self.call(py, |c| {
+            let kwargs: Vec<_> = kwargs
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            c.apply_function(
+                &Selection::exact(FileHandle::from_u64(handle), &name, &indices),
+                &function,
+                &kwargs,
+            )
+        })?;
+        Ok((
+            reduced.dtype.descr(),
+            reduced.shape,
+            PyBytes::new(py, &reduced.data),
+        ))
+    }
+
     /// Totals over every transfer, for benchmarks and tuning.
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let stats = self.get()?.stats();
@@ -353,6 +389,26 @@ fn item_to_py(item: Item) -> Option<(&'static str, Vec<u64>)> {
         Item::Dataset(info) => Some((info.dtype.descr(), info.shape)),
         Item::Group => None,
     }
+}
+
+fn function_arg(value: &Bound<'_, PyAny>) -> PyResult<FunctionArg> {
+    // bool before int: Python's bool is an int.
+    Ok(if value.is_none() {
+        FunctionArg::None
+    } else if let Ok(b) = value.cast::<PyBool>() {
+        FunctionArg::Bool(b.is_true())
+    } else if let Ok(i) = value.extract::<i64>() {
+        FunctionArg::Int(i)
+    } else if let Ok(f) = value.cast::<PyFloat>() {
+        FunctionArg::Float(f.value())
+    } else if let Ok(t) = value.cast::<PyTuple>() {
+        FunctionArg::Ints(t.extract()?)
+    } else {
+        return Err(PyTypeError::new_err(format!(
+            "cannot send {} as a function argument",
+            value.get_type().name()?
+        )));
+    })
 }
 
 fn indices_from_py(key: &Bound<'_, PyTuple>) -> PyResult<Vec<Index>> {

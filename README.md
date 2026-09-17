@@ -26,18 +26,20 @@ HDF5 (netCDF-4 を含む) の任意の選択を取得できる。実データは
 - `aex-proto` — `protos/aex.proto` から tonic/prost が生成するコードと、
   生成型とコア型の相互変換
 - `aex-server` — コントロールプレーン (セッション、ファイル、メタデータ、
-  `PrepareSelection`)、`TransferRegistry`、接続ごとに読みスレッドと送りスレッドを
+  `PrepareSelection` / `PrepareSelections`、`ApplyFunction` による集約)、`TransferRegistry`、接続ごとに読みスレッドと送りスレッドを
   持つデータプレーン
 - `aex-client` — 同期 API の Rust クライアント。`prepare` / `fill`、
+  `prepare_many` / `fill_many`、`apply_function`、`stats`、
   `read_selection_into` / `read_selection` / `read_selection_as`。転送は
   `granted_streams` 本の接続へワークスティーリングで配り、各接続は credit 個まで
   `FETCH` を先行投入する。切れた接続のチャンクだけを別接続で再取得する
 - `aex-py` — PyO3 による拡張モジュール `aex._aex`。ネットワーク待ちの間は GIL を解放し、
   出力配列を検証してから直接書き込む
 - `python/aex` — v1 と同じ API (`Client` / `FileProxy` / `GroupProxy` / `ArrayProxy`)。
-  v1 にない `arr[..., 0]`、`arr[:, None]`、boolean mask にも対応
-
-`PrepareSelections` (gather) と `ApplyFunction` は `UNIMPLEMENTED` を返す。
+  v1 にない `arr[..., 0]`、`arr[:, None]`、boolean mask にも対応。性能用 API として
+  `read_into` / `gather` / `get_async` / `at()` (適応品質の枠) / `client.stats()`。
+  `np.sum` などの集約 (SPEC §5.8) はサーバで計算し、`arr.view[0:100]` で転送せずに
+  選択へ集約できる
 
 ### この時点での制限
 
@@ -46,8 +48,12 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 - **非連続な選択は連続読みより遅い**。近接した断片はまとめて `pread` する
   (隙間 4 KiB 以下、1 回 1 MiB まで) が、切り出しは要素単位で歩くため、
   `arr[::2]` (float32) は 1 接続で約 600 MiB/s に留まる
-- **numpy 関数はすべてクライアントで計算する**。`np.sum(arr)` なども配列全体を
-  転送してから計算する (64 MiB を超えると `AexFallbackWarning`)。サーバ側の集約は M5
+- **集約以外の numpy 関数はクライアントで計算する**。配列全体を転送してから計算する
+  (64 MiB を超えると `AexFallbackWarning`)。集約でも結果が 64 KiB を超えるもの、
+  `dtype` / `out` / `where` / `initial` を指定したものは同様にローカルで計算する
+- **サーバの集約は 1 スレッドで逐次読む**。float の総和は numpy (pairwise) と
+  ビット単位では一致しない
+- **適応品質は未実装**。`at()` は常に EXACT で返し、`AexQualityWarning` を出す
 - **多次元の整数インデックス配列は非対応**。1 次元にして送り、結果を reshape すること
 - **credit は固定値** (既定 4、`AEX_CREDIT`)。RTT と帯域から自動で決める処理は
   M6 の測定後に入れる

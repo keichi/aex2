@@ -14,13 +14,15 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aex_core::{DType, ErrorClass, Index, QualitySpec};
+use aex_core::{DType, ErrorClass, Index, QualitySpec, Reduced};
 use aex_proto::aex_control_client::AexControlClient;
 use aex_proto::convert::{check_fancy_limit, indices_to_proto, quality_to_proto};
+use aex_proto::function_argument::Value;
 use aex_proto::transfer_plan_or_error;
 use aex_proto::{
-    CloseFileRequest, ConnectRequest, DisconnectRequest, GetItemRequest, ListChildrenRequest,
-    OpenFileRequest, PrepareSelectionRequest, PrepareSelectionsRequest,
+    ApplyFunctionRequest, CloseFileRequest, ConnectRequest, DisconnectRequest, FunctionArgument,
+    GetItemRequest, IntTuple, ListChildrenRequest, OpenFileRequest, PrepareSelectionRequest,
+    PrepareSelectionsRequest,
 };
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
@@ -73,6 +75,29 @@ impl<'a> Selection<'a> {
             indices,
             quality: &EXACT,
         }
+    }
+}
+
+/// A keyword argument to [`Client::apply_function`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionArg {
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Ints(Vec<i64>),
+}
+
+impl FunctionArg {
+    fn to_proto(&self) -> FunctionArgument {
+        let value = match self {
+            FunctionArg::None => Value::NoneValue(true),
+            FunctionArg::Bool(b) => Value::BoolValue(*b),
+            FunctionArg::Int(i) => Value::IntValue(*i),
+            FunctionArg::Float(f) => Value::FloatValue(*f),
+            FunctionArg::Ints(v) => Value::TupleInt(IntTuple { values: v.clone() }),
+        };
+        FunctionArgument { value: Some(value) }
     }
 }
 
@@ -501,6 +526,57 @@ impl Client {
                 },
             })
             .collect()
+    }
+
+    /// Reduce a selection on the server, as `numpy.<function>` would.
+    ///
+    /// `kwargs` are numpy's keyword arguments; the server takes `axis`,
+    /// `keepdims` and `ddof`. A result too large to come back inline is
+    /// refused, and is the caller's to compute.
+    pub fn apply_function(
+        &self,
+        selection: &Selection<'_>,
+        function: &str,
+        kwargs: &[(&str, FunctionArg)],
+    ) -> Result<Reduced> {
+        check_fancy_limit(selection.indices, self.session.max_fancy_indices)
+            .map_err(|e| ClientError::BadRequest(e.to_string()))?;
+        let request = ApplyFunctionRequest {
+            session_id: self.session.id.clone(),
+            handle: selection.handle.0,
+            name: selection.name.to_string(),
+            function_name: function.to_string(),
+            kwargs: kwargs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_proto()))
+                .collect(),
+            indices: indices_to_proto(selection.indices),
+        };
+        let reply =
+            self.call(|mut control| async move { control.apply_function(request).await })?;
+
+        let dtype =
+            DType::from_i32(reply.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
+        let shape = reply
+            .shape
+            .iter()
+            .map(|&n| {
+                u64::try_from(n)
+                    .map_err(|_| ClientError::Protocol(format!("negative axis length {n}")))
+            })
+            .collect::<Result<Vec<u64>>>()?;
+        let expected = shape.iter().product::<u64>() * dtype.itemsize();
+        if reply.data.len() as u64 != expected {
+            return Err(ClientError::Protocol(format!(
+                "a {dtype} result of shape {shape:?} came back as {} bytes",
+                reply.data.len()
+            )));
+        }
+        Ok(Reduced {
+            dtype,
+            shape,
+            data: reply.data,
+        })
     }
 
     /// Fill `dst` from a plan, preparing again once if the plan has gone.

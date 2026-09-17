@@ -39,6 +39,14 @@ class Client:
         key: tuple[Any, ...],
         out: np.ndarray[Any, Any],
     ) -> None: ...
+    def apply_function(
+        self,
+        handle: int,
+        name: str,
+        key: tuple[Any, ...],
+        function: str,
+        kwargs: dict[str, Any],
+    ) -> tuple[str, list[int], bytes]: ...
     def stats(self) -> dict[str, Any]: ...
     def prepare_many(
         self, handle: int, name: str, keys: list[tuple[Any, ...]]

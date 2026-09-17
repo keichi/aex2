@@ -1,5 +1,7 @@
 """ArrayProxy: a remote array that indexes like a numpy array."""
 
+import inspect
+import math
 import operator
 import warnings
 from collections.abc import Callable, Iterator, Sequence
@@ -47,9 +49,44 @@ Key = tuple[Any, ...]
 # its own plans before they are fetched.
 _GATHER_BATCH = 64
 
+# The server's default inline_limit_bytes, past which it refuses a reduction.
+_INLINE_LIMIT = 64 * 1024
+
+# numpy functions the server computes, by the name it knows them by.
+_SERVER_FUNCTIONS: dict[Callable[..., Any], str] = {
+    getattr(np, name): name
+    for name in (
+        "sum",
+        "prod",
+        "mean",
+        "max",
+        "min",
+        "std",
+        "var",
+        "all",
+        "any",
+        "argmax",
+        "argmin",
+        "nansum",
+        "nanmean",
+        "nanmax",
+        "nanmin",
+    )
+}
+_SERVER_FUNCTIONS[np.amax] = "max"
+_SERVER_FUNCTIONS[np.amin] = "min"
+_SERVER_ARGUMENTS = {"axis", "keepdims", "ddof"}
+
+# Returned by a reduction that has to run locally instead.
+_LOCAL = object()
+
 
 class ArrayProxy:
-    """An array on the server. Indexing it transfers the selection."""
+    """An array on the server. Indexing it transfers the selection.
+
+    ``arr.view[key]`` is a proxy for a selection that transfers nothing, so
+    that ``np.sum(arr.view[0:100])`` reads 100 rows on the server.
+    """
 
     def __init__(
         self,
@@ -58,6 +95,7 @@ class ArrayProxy:
         name: str,
         dtype: str,
         shape: tuple[int, ...],
+        key: Key | None = None,
     ) -> None:
         self._client = client
         self._native = client._native
@@ -65,6 +103,14 @@ class ArrayProxy:
         self.name = name
         self.dtype = np.dtype(dtype)
         self.shape = shape
+        # The selection of the array this is a view of, in wire form.
+        self._key = key
+
+    @property
+    def view(self) -> "_Viewer":
+        """Select without transferring: ``arr.view[key]``."""
+        self._require_base("view")
+        return _Viewer(self)
 
     @property
     def ndim(self) -> int:
@@ -84,15 +130,32 @@ class ArrayProxy:
         return self.shape[0]
 
     def __iter__(self) -> Iterator[npt.NDArray[Any]]:
+        if self._key is not None:
+            yield from self[...]
+            return
         for i in range(len(self)):
             yield self[i]
 
     def __getitem__(self, key: Any) -> npt.NDArray[Any]:
-        """Transfer a selection. The result is read-only."""
+        """Transfer a selection. The result is read-only.
+
+        A view is transferred whole and ``key`` applied to it here, since the
+        server cannot select from a selection.
+        """
+        if self._key is not None:
+            _check_fallback(f"indexing {self!r}", self.nbytes)
+            return np.asarray(self._fetch_all()[key])
         return self._read(key, None)[0]
 
     def _read(self, key: Any, quality: dict[str, Any] | None) -> tuple[npt.NDArray[Any], _aex.Plan]:
-        wire_key = _to_wire(key, self.shape)
+        return self._fetch(_to_wire(key, self.shape), quality)
+
+    def _fetch_all(self) -> npt.NDArray[Any]:
+        return self._fetch((Ellipsis,) if self._key is None else self._key, None)[0]
+
+    def _fetch(
+        self, wire_key: Key, quality: dict[str, Any] | None
+    ) -> tuple[npt.NDArray[Any], _aex.Plan]:
         plan = self._native.prepare(self.handle, self.name, wire_key, quality)
         # Shape and dtype are the server's answer, not worked out here.
         out = np.empty(plan.shape, dtype=plan.dtype)
@@ -115,6 +178,7 @@ class ArrayProxy:
         compression. A server that cannot do it sends the exact data and the
         view warns; ``applied_quality`` says what was done.
         """
+        self._require_base("at")
         quality: dict[str, Any] = {}
         if dtype is not None:
             quality["dtype"] = np.dtype(dtype).newbyteorder("<").str
@@ -136,6 +200,7 @@ class ArrayProxy:
         the selection's size; nothing is copied to make it fit. If the transfer
         fails, the contents of ``out`` are undefined.
         """
+        self._require_base("read_into")
         wire_key = _to_wire(key, self.shape)
         plan = self._native.prepare(self.handle, self.name, wire_key)
         self._native.fill(plan, self.handle, self.name, wire_key, out)
@@ -154,6 +219,7 @@ class ArrayProxy:
         Raises the error of the first selection that fails. The results are
         read-only.
         """
+        self._require_base("gather")
         results: list[npt.NDArray[Any]] = []
         for start in range(0, len(keys), _GATHER_BATCH):
             wire_keys = [_to_wire(key, self.shape) for key in keys[start : start + _GATHER_BATCH]]
@@ -172,7 +238,7 @@ class ArrayProxy:
     def __array__(
         self, dtype: npt.DTypeLike | None = None, copy: bool | None = None
     ) -> npt.NDArray[Any]:
-        data = self[...]
+        data = self._fetch_all()
         if dtype is not None:
             data = data.astype(dtype, copy=False)
         return data.copy() if copy else data
@@ -184,17 +250,104 @@ class ArrayProxy:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
-        # ponytail: every function runs locally until the server can reduce
-        # (ApplyFunction); dispatch the supported ones there then.
+        name = _SERVER_FUNCTIONS.get(func)
+        if name is not None:
+            result = self._reduce(func, name, args, kwargs)
+            if result is not _LOCAL:
+                return result
         args, kwargs = _download(func, (args, kwargs))
         return func(*args, **kwargs)
+
+    def _reduce(
+        self, func: Callable[..., Any], name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Any:
+        """Run a reduction on the server, or return _LOCAL if it cannot."""
+        try:
+            params = dict(inspect.signature(func).bind(*args, **kwargs).arguments)
+        except TypeError:
+            return _LOCAL
+        if params.pop("a", None) is not self:
+            return _LOCAL
+        for default_only in ("dtype", "out"):
+            if params.get(default_only, 0) is None:
+                del params[default_only]
+        if not params.keys() <= _SERVER_ARGUMENTS:
+            return _LOCAL
+
+        # numpy itself checks the arguments and names the result's dtype, on an
+        # array of the same rank and type with one element.
+        with warnings.catch_warnings(), np.errstate(all="ignore"):
+            warnings.simplefilter("ignore")
+            probe = np.asarray(func(np.zeros((1,) * self.ndim, self.dtype), **params))
+        axis = params.get("axis")
+        if axis is None:
+            reduced = set(range(self.ndim))
+        else:
+            axes = axis if isinstance(axis, tuple) else (axis,)
+            reduced = {operator.index(a) % self.ndim for a in axes}
+        cells = math.prod(n for d, n in enumerate(self.shape) if d not in reduced)
+        if cells * probe.dtype.itemsize > _INLINE_LIMIT:
+            return _LOCAL
+
+        wire: dict[str, Any] = {}
+        if axis is not None:
+            wire["axis"] = (
+                tuple(operator.index(a) for a in axis)
+                if isinstance(axis, tuple)
+                else operator.index(axis)
+            )
+        if "keepdims" in params:
+            wire["keepdims"] = bool(params["keepdims"])
+        ddof = params.get("ddof", 0)
+        if "ddof" in params:
+            wire["ddof"] = int(ddof) if isinstance(ddof, (int, np.integer)) else float(ddof)
+
+        key = () if self._key is None else self._key
+        descr, shape, data = self._native.apply_function(self.handle, self.name, key, name, wire)
+        out = np.frombuffer(data, dtype=descr).reshape(shape)
+        _warn_as_numpy(name, out, self.size // cells if cells else 1, ddof)
+        return out[()] if out.ndim == 0 else out.copy()
+
+    def _require_base(self, what: str) -> None:
+        if self._key is not None:
+            raise TypeError(f"{what} is not supported on a view; use the array it came from")
 
     def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any) -> Any:
         inputs, kwargs = _download(ufunc, (inputs, kwargs))
         return getattr(ufunc, method)(*inputs, **kwargs)
 
     def __repr__(self) -> str:
-        return f'<ArrayProxy name "{self.name}", shape {self.shape}, type {self.dtype}>'
+        kind = "ArrayProxy" if self._key is None else "ArrayProxy view"
+        return f'<{kind} name "{self.name}", shape {self.shape}, type {self.dtype}>'
+
+
+class _Viewer:
+    """What ``ArrayProxy.view`` returns; indexing it makes a view."""
+
+    def __init__(self, array: ArrayProxy) -> None:
+        self._array = array
+
+    def __getitem__(self, key: Any) -> ArrayProxy:
+        array = self._array
+        wire_key = _to_wire(key, array.shape)
+        # The server resolves the selection, so it says what shape it has.
+        plan = array._native.prepare(array.handle, array.name, wire_key)
+        return ArrayProxy(
+            array._client, array.handle, array.name, plan.dtype, tuple(plan.shape), wire_key
+        )
+
+
+def _warn_as_numpy(name: str, out: npt.NDArray[Any], count: int, ddof: Any) -> None:
+    """Warn where numpy would have, which the server cannot."""
+    message = None
+    if name in ("mean", "var", "std") and count == 0:
+        message = "Mean of empty slice."
+    elif name in ("var", "std") and count - ddof <= 0:
+        message = "Degrees of freedom <= 0 for slice"
+    elif name in ("nanmax", "nanmin", "nanmean") and np.isnan(out).any():
+        message = "All-NaN slice encountered"
+    if message is not None:
+        warnings.warn(message, RuntimeWarning, stacklevel=4)
 
 
 class QualityView:
@@ -302,23 +455,26 @@ def _download(func: Any, tree: Any) -> Any:
     proxies: list[ArrayProxy] = []
     _collect(tree, proxies)
     nbytes = sum(p.nbytes for p in {id(p): p for p in proxies}.values())
-    name = f"np.{getattr(func, '__name__', func)}"
+    _check_fallback(f"np.{getattr(func, '__name__', func)}", nbytes, stacklevel=4)
+    return _replace(tree)
 
+
+def _check_fallback(what: str, nbytes: int, stacklevel: int = 3) -> None:
+    """Refuse or warn about a download, as the policy says."""
     if _fallback_policy == "error":
         raise AexFallbackError(
-            f"{name} is not supported server-side, and the fallback policy forbids "
+            f"{what} is not supported server-side, and the fallback policy forbids "
             f"downloading {nbytes / 2**20:.1f} MiB to compute locally.",
             "REQUEST",
         )
     if _fallback_policy == "warn" and nbytes > _fallback_threshold:
         warnings.warn(
-            f"{name} is not supported server-side.\n"
+            f"{what} is not supported server-side.\n"
             f"  Downloading {nbytes / 2**20:.1f} MiB to compute locally.\n"
             "  Use arr[...] explicitly to silence, or set aex.set_fallback_policy(...).",
             AexFallbackWarning,
-            stacklevel=3,
+            stacklevel=stacklevel,
         )
-    return _replace(tree)
 
 
 def _collect(tree: Any, found: list[ArrayProxy]) -> None:
@@ -334,7 +490,7 @@ def _collect(tree: Any, found: list[ArrayProxy]) -> None:
 
 def _replace(tree: Any) -> Any:
     if isinstance(tree, ArrayProxy):
-        return tree[...]
+        return tree._fetch_all()
     if isinstance(tree, (list, tuple)):
         return type(tree)(_replace(item) for item in tree)
     if isinstance(tree, dict):

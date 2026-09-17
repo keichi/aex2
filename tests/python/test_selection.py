@@ -193,13 +193,13 @@ def policy():
 def test_small_fallback_is_silent(policy, proxy):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        np.sum(proxy)
+        np.median(proxy)
 
 
 def test_fallback_over_the_threshold_warns(policy, proxy):
     policy.set_fallback_threshold(0)
-    with pytest.warns(aex.AexFallbackWarning, match=r"(?s)np\.sum .*MiB") as record:
-        np.sum(proxy)
+    with pytest.warns(aex.AexFallbackWarning, match=r"(?s)np\.median .*MiB") as record:
+        np.median(proxy)
     # Pointing at the caller, not at aex.
     assert record[0].filename == __file__
     with pytest.warns(aex.AexFallbackWarning, match=r"np\.sqrt"):
@@ -211,13 +211,13 @@ def test_fallback_can_be_allowed(policy, proxy):
     policy.set_fallback_policy("allow")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        np.sum(proxy)
+        np.median(proxy)
 
 
 def test_fallback_can_be_forbidden(policy, proxy):
     policy.set_fallback_policy("error")
     with pytest.raises(aex.AexFallbackError):
-        np.sum(proxy)
+        np.median(proxy)
     # Indexing is explicit, so it is still allowed.
     assert np.sum(proxy[...]) == np.sum(np.arange(np.prod(SHAPE)))
 

@@ -56,3 +56,7 @@ required-features = ["hdf5"]
 [[test]]
 name = "gather"
 path = "gather.rs"
+
+[[test]]
+name = "reduce"
+path = "reduce.rs"
