@@ -11,8 +11,11 @@
 // Each test binary uses part of this.
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use aex_client::{Client, ClientConfig, ClientError};
@@ -145,6 +148,92 @@ impl Drop for TestServer {
             let _ = thread.join();
         }
     }
+}
+
+/// A TCP proxy in front of the data plane that can break connections.
+///
+/// Threads are left to die with the sockets; a test process is short-lived.
+pub struct Proxy {
+    pub addr: SocketAddr,
+    accepted: Arc<AtomicUsize>,
+    cuts: Arc<AtomicUsize>,
+}
+
+impl Proxy {
+    /// Forward to `target`. With `cut_after`, each connection is torn down once
+    /// it has carried that many bytes towards the client, mid-frame if need be.
+    pub fn start(target: SocketAddr, cut_after: Option<u64>) -> Proxy {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let cuts = Arc::new(AtomicUsize::new(0));
+        let (a, c) = (accepted.clone(), cuts.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(client) = client else { return };
+                let Ok(server) = TcpStream::connect(target) else {
+                    return;
+                };
+                a.fetch_add(1, Ordering::Relaxed);
+                let cuts = c.clone();
+                let (mut up_from, mut up_to) =
+                    (client.try_clone().unwrap(), server.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut up_from, &mut up_to);
+                    let _ = up_to.shutdown(Shutdown::Write);
+                });
+                std::thread::spawn(move || pump_down(server, client, cut_after, &cuts));
+            }
+        });
+        Proxy {
+            addr,
+            accepted,
+            cuts,
+        }
+    }
+
+    /// `host:port`, as `ClientConfig::data_endpoint` takes it.
+    pub fn endpoint(&self) -> String {
+        self.addr.to_string()
+    }
+
+    /// Connections accepted so far.
+    pub fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Connections torn down so far.
+    pub fn cuts(&self) -> usize {
+        self.cuts.load(Ordering::Relaxed)
+    }
+}
+
+fn pump_down(
+    mut server: TcpStream,
+    mut client: TcpStream,
+    cut_after: Option<u64>,
+    cuts: &AtomicUsize,
+) {
+    let mut left = cut_after.unwrap_or(u64::MAX);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match server.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let pass = (n as u64).min(left) as usize;
+        if client.write_all(&buf[..pass]).is_err() {
+            break;
+        }
+        left -= pass as u64;
+        if left == 0 {
+            cuts.fetch_add(1, Ordering::Relaxed);
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = server.shutdown(Shutdown::Both);
+            return;
+        }
+    }
+    let _ = client.shutdown(Shutdown::Write);
 }
 
 /// The class of a server error, or a failure if the call did not fail.

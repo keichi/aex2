@@ -206,10 +206,10 @@ impl Client {
                 endpoint.port
             ))
         })?;
-        let host = if endpoint.host.is_empty() {
-            strip_brackets(&control_host).to_string()
-        } else {
-            endpoint.host.clone()
+        let (host, port) = match &config.data_endpoint {
+            Some(pinned) => parse_endpoint(pinned)?,
+            None if endpoint.host.is_empty() => (strip_brackets(&control_host).to_string(), port),
+            None => (endpoint.host.clone(), port),
         };
 
         let session = SessionInfo {
@@ -583,6 +583,17 @@ fn as_16_bytes(bytes: &[u8], what: &str) -> Result<[u8; 16]> {
         .map_err(|_| ClientError::Protocol(format!("{what} is {} bytes, expected 16", bytes.len())))
 }
 
+/// Split `host:port`, accepting `[v6]:port` too.
+fn parse_endpoint(endpoint: &str) -> Result<(String, u16)> {
+    endpoint
+        .rsplit_once(':')
+        .and_then(|(host, port)| Some((strip_brackets(host).to_string(), port.parse().ok()?)))
+        .filter(|(host, _)| !host.is_empty())
+        .ok_or_else(|| {
+            ClientError::BadRequest(format!("data endpoint {endpoint:?} is not host:port"))
+        })
+}
+
 /// Strip the brackets a URI puts around an IPv6 host.
 ///
 /// The data plane connects with a socket address, not a URI, so it needs the
@@ -711,5 +722,15 @@ mod tests {
         assert_eq!(strip_brackets("example.org"), "example.org");
         // Brackets around something that is not an address are left alone.
         assert_eq!(strip_brackets("[host]"), "[host]");
+    }
+
+    #[test]
+    fn a_pinned_data_endpoint_is_host_and_port() {
+        let parsed = |s| parse_endpoint(s).ok();
+        assert_eq!(parsed("tunnel:6000"), Some(("tunnel".to_string(), 6000)));
+        assert_eq!(parsed("[::1]:6000"), Some(("::1".to_string(), 6000)));
+        assert_eq!(parsed("tunnel"), None);
+        assert_eq!(parsed(":6000"), None);
+        assert_eq!(parsed("tunnel:port"), None);
     }
 }

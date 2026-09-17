@@ -17,7 +17,7 @@ use aex_wire::{
 #[path = "support.rs"]
 mod support;
 
-use support::TestServer;
+use support::{Proxy, TestServer};
 
 /// Connect to the data plane, with a timeout so a hung test fails rather than
 /// hangs.
@@ -591,4 +591,25 @@ fn the_synthetic_backend_serves_the_pattern_it_promises() {
         client.open_as("not a dataset", "null").unwrap_err().class(),
         Some(ErrorClass::Request)
     );
+}
+
+#[test]
+fn the_data_plane_can_be_reached_at_a_pinned_endpoint() {
+    let server = TestServer::start();
+    let expected = server.write_counting_npy("ocean.npy", &[1000, 200]);
+    let proxy = Proxy::start(server.data_addr, None);
+
+    // What a tunnel looks like: the server advertises one port, the client has
+    // to use another.
+    let client = server.connect_with(ClientConfig {
+        data_endpoint: Some(proxy.endpoint()),
+        ..ClientConfig::default()
+    });
+    assert_eq!(client.session().data_endpoint.1, proxy.addr.port());
+    let handle = client.open("ocean.npy").expect("open");
+    let array = client
+        .read_selection_as::<f32>(handle, "array", &[])
+        .expect("read");
+    assert_eq!(array.data, expected);
+    assert!(proxy.accepted() >= 1);
 }

@@ -159,6 +159,8 @@ with aex.Client("127.0.0.1:50051") as client:
 
 ベンチマークのパラメータ掃引のため、主要な設定は環境変数でも上書きできる
 (`AEX_STREAMS`、`AEX_CHUNK_BYTES`、`AEX_MAX_RETRIES`、`AEX_TCP_NODELAY` ほか)。
+ssh トンネルなどでサーバが広告するデータプレーンのポートに直接届かない場合は、
+`AEX_DATA_ENDPOINT=host:port` で接続先を指定する。
 
 ## 前提と制約
 

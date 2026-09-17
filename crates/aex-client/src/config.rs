@@ -32,6 +32,9 @@ pub struct ClientConfig {
     /// `SO_RCVBUF` for the data connections. `None` leaves the OS to tune it,
     /// which caps the window below what a high bandwidth-delay link needs.
     pub rcvbuf: Option<usize>,
+    /// `host:port` to reach the data plane at instead of what the server
+    /// advertises, for when the path goes through a tunnel or a proxy.
+    pub data_endpoint: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -45,6 +48,7 @@ impl Default for ClientConfig {
             max_retries: 3,
             tcp_nodelay: true,
             rcvbuf: None,
+            data_endpoint: None,
         }
     }
 }
@@ -84,6 +88,9 @@ impl ClientConfig {
         }
         if let Some(bytes) = lookup("AEX_RCVBUF").and_then(|v| v.parse().ok()) {
             self.rcvbuf = Some(bytes);
+        }
+        if let Some(endpoint) = lookup("AEX_DATA_ENDPOINT") {
+            self.data_endpoint = Some(endpoint);
         }
         self
     }
