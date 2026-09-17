@@ -1,6 +1,9 @@
 //! Several selections resolved in one round trip and fetched as one batch.
 
-use aex_client::{Client, ClientError, ErrorClass, FileHandle, Index, Plan, Selection};
+use aex_client::{
+    Client, ClientError, DType, ErrorClass, FileHandle, Index, Plan, QualitySpec, Selection,
+};
+use aex_core::Encoding;
 
 #[path = "support.rs"]
 mod support;
@@ -39,11 +42,7 @@ fn fill_all(
 
 fn selections<'a>(handle: FileHandle, keys: &'a [Vec<Index>]) -> Vec<Selection<'a>> {
     keys.iter()
-        .map(|indices| Selection {
-            handle,
-            name: "array",
-            indices,
-        })
+        .map(|indices| Selection::exact(handle, "array", indices))
         .collect()
 }
 
@@ -139,6 +138,30 @@ fn evicted_plans_in_a_batch_are_prepared_again() {
     assert_eq!(data[0], expected[..10 * ROW]);
     assert_eq!(data[1], expected[10 * ROW..20 * ROW]);
     assert!(transfer.retries >= 1);
+}
+
+#[test]
+fn a_quality_the_server_lacks_falls_back_to_exact() {
+    let server = TestServer::start();
+    let expected = server.write_counting_npy("grid.npy", &[64, ROW]);
+    let client = server.connect();
+    let handle = client.open("grid.npy").expect("open");
+
+    let half = QualitySpec {
+        encoding: Encoding::DtypeCast,
+        cast_dtype: Some(DType::Float16),
+        ..QualitySpec::exact()
+    };
+    let indices = rows(0, 10);
+    let selection = Selection {
+        quality: &half,
+        ..Selection::exact(handle, "array", &indices)
+    };
+    let plan = client.prepare_selection(&selection).expect("prepare");
+    assert!(plan.applied_quality.is_exact());
+    assert_eq!(plan.dtype, DType::Float32);
+    let (data, _) = fill_all(&client, &[plan], &[selection]).expect("fill");
+    assert_eq!(data[0], expected[..10 * ROW]);
 }
 
 #[test]

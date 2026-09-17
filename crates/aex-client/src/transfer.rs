@@ -9,7 +9,8 @@
 
 use std::time::Duration;
 
-use aex_core::DType;
+use aex_core::{DType, QualitySpec};
+use aex_proto::convert::quality_from_proto;
 use aex_wire::{Ticket, TICKET_LEN};
 
 use crate::error::{ClientError, Result};
@@ -26,6 +27,9 @@ pub struct Plan {
     pub dtype: DType,
     pub shape: Vec<u64>,
     pub total_bytes: u64,
+    /// What the server did to the elements, which may be less than asked.
+    pub applied_quality: QualitySpec,
+    pub(crate) requested_quality: QualitySpec,
     pub(crate) inline_data: Vec<u8>,
 }
 
@@ -44,7 +48,10 @@ impl std::fmt::Debug for Plan {
 
 impl Plan {
     /// Read a plan off the wire.
-    pub(crate) fn from_proto(plan: aex_proto::TransferPlan) -> Result<Self> {
+    pub(crate) fn from_proto(
+        plan: aex_proto::TransferPlan,
+        requested_quality: &QualitySpec,
+    ) -> Result<Self> {
         let dtype =
             DType::from_i32(plan.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
         let shape = plan
@@ -75,6 +82,8 @@ impl Plan {
             dtype,
             shape,
             total_bytes: plan.total_bytes,
+            applied_quality: quality_from_proto(plan.applied_quality.as_ref()),
+            requested_quality: requested_quality.clone(),
             inline_data: plan.inline_data,
         };
         plan.check()?;
@@ -247,7 +256,8 @@ mod tests {
 
     #[test]
     fn a_plan_arrives_with_its_shape_and_ticket() {
-        let plan = Plan::from_proto(proto_plan(4000, vec![10, 100])).expect("plan");
+        let plan =
+            Plan::from_proto(proto_plan(4000, vec![10, 100]), &QualitySpec::exact()).expect("plan");
         assert_eq!(plan.request_id, 7);
         assert_eq!(plan.ticket, [9u8; TICKET_LEN]);
         assert_eq!(plan.shape, vec![10, 100]);
@@ -256,16 +266,33 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_says_what_quality_was_applied() {
+        let requested = QualitySpec {
+            encoding: aex_core::Encoding::Subsample,
+            subsample_step: vec![2, 2],
+            ..QualitySpec::exact()
+        };
+        let mut proto = proto_plan(4000, vec![10, 100]);
+        proto.applied_quality = Some(aex_proto::convert::quality_to_proto(&QualitySpec::exact()));
+        let plan = Plan::from_proto(proto, &requested).expect("plan");
+        assert!(plan.applied_quality.is_exact());
+        assert_eq!(plan.requested_quality, requested);
+    }
+
+    #[test]
     fn a_small_selection_arrives_with_its_data() {
-        let plan = Plan::from_proto(aex_proto::TransferPlan {
-            request_id: 0,
-            ticket: Vec::new(),
-            dtype: DType::Int32.as_i32(),
-            shape: vec![4],
-            total_bytes: 16,
-            inline_data: vec![1u8; 16],
-            ..aex_proto::TransferPlan::default()
-        })
+        let plan = Plan::from_proto(
+            aex_proto::TransferPlan {
+                request_id: 0,
+                ticket: Vec::new(),
+                dtype: DType::Int32.as_i32(),
+                shape: vec![4],
+                total_bytes: 16,
+                inline_data: vec![1u8; 16],
+                ..aex_proto::TransferPlan::default()
+            },
+            &QualitySpec::exact(),
+        )
         .expect("plan");
         assert!(plan.is_inline());
         assert_eq!(plan.inline_data, vec![1u8; 16]);
@@ -277,14 +304,15 @@ mod tests {
     fn a_plan_that_contradicts_itself_is_refused() {
         // The length has to follow from the shape and the dtype; if it does not,
         // the client would allocate one size and be sent another.
-        let err = Plan::from_proto(proto_plan(4001, vec![10, 100])).unwrap_err();
+        let err =
+            Plan::from_proto(proto_plan(4001, vec![10, 100]), &QualitySpec::exact()).unwrap_err();
         assert!(matches!(err, ClientError::Protocol(_)), "{err}");
 
         // A ticket of the wrong length means the two sides disagree about the
         // handshake, not that this one transfer is unlucky.
         let mut short = proto_plan(4000, vec![10, 100]);
         short.ticket = vec![1, 2, 3];
-        assert!(Plan::from_proto(short).is_err());
+        assert!(Plan::from_proto(short, &QualitySpec::exact()).is_err());
 
         // Inline data that is not all there.
         let truncated = aex_proto::TransferPlan {
@@ -296,19 +324,23 @@ mod tests {
             inline_data: vec![0u8; 4],
             ..aex_proto::TransferPlan::default()
         };
-        assert!(Plan::from_proto(truncated).is_err());
+        assert!(Plan::from_proto(truncated, &QualitySpec::exact()).is_err());
 
         // A dtype from a newer server.
         let mut unknown = proto_plan(4000, vec![10, 100]);
         unknown.dtype = 99;
-        assert!(Plan::from_proto(unknown).is_err());
+        assert!(Plan::from_proto(unknown, &QualitySpec::exact()).is_err());
     }
 
     #[test]
     fn chunks_cover_the_stream_exactly_once() {
         for total in [0u64, 1, 255, 256, 257, 1024] {
             for chunk_bytes in [1u64, 7, 256, 4096] {
-                let plan = Plan::from_proto(proto_plan(total * 4, vec![total as i64])).unwrap();
+                let plan = Plan::from_proto(
+                    proto_plan(total * 4, vec![total as i64]),
+                    &QualitySpec::exact(),
+                )
+                .unwrap();
                 let chunks: Vec<_> = plan.chunks(chunk_bytes).collect();
 
                 let mut next = 0;
@@ -330,7 +362,7 @@ mod tests {
 
     #[test]
     fn an_empty_selection_has_nothing_to_fetch() {
-        let plan = Plan::from_proto(proto_plan(0, vec![0])).unwrap();
+        let plan = Plan::from_proto(proto_plan(0, vec![0]), &QualitySpec::exact()).unwrap();
         assert_eq!(plan.chunks(4096).count(), 0);
     }
 

@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aex_core::{DType, ErrorClass, Index};
+use aex_core::{DType, ErrorClass, Index, QualitySpec};
 use aex_proto::aex_control_client::AexControlClient;
 use aex_proto::convert::{check_fancy_limit, indices_to_proto, quality_to_proto};
 use aex_proto::transfer_plan_or_error;
@@ -52,12 +52,28 @@ impl FileHandle {
     }
 }
 
-/// A selection of a dataset, as a batch names it.
+/// A selection of a dataset, and how it should be encoded.
 #[derive(Debug, Clone, Copy)]
 pub struct Selection<'a> {
     pub handle: FileHandle,
     pub name: &'a str,
     pub indices: &'a [Index],
+    /// Only read when preparing: a plan prepared again keeps what it asked for.
+    pub quality: &'a QualitySpec,
+}
+
+static EXACT: QualitySpec = QualitySpec::exact();
+
+impl<'a> Selection<'a> {
+    /// A lossless selection.
+    pub fn exact(handle: FileHandle, name: &'a str, indices: &'a [Index]) -> Self {
+        Selection {
+            handle,
+            name,
+            indices,
+            quality: &EXACT,
+        }
+    }
 }
 
 /// What lives at a path in a file.
@@ -421,20 +437,21 @@ impl Client {
     /// The plan says what the result will be, so the caller can allocate for
     /// it before [`Client::fill`].
     pub fn prepare(&self, handle: FileHandle, name: &str, indices: &[Index]) -> Result<Plan> {
+        self.prepare_selection(&Selection::exact(handle, name, indices))
+    }
+
+    /// [`Client::prepare`] with a quality to ask for. The plan says what the
+    /// server applied.
+    pub fn prepare_selection(&self, selection: &Selection<'_>) -> Result<Plan> {
         // Checked here so that a selection too large to travel does not cost a
         // round trip to be told so.
-        check_fancy_limit(indices, self.session.max_fancy_indices)
+        check_fancy_limit(selection.indices, self.session.max_fancy_indices)
             .map_err(|e| ClientError::BadRequest(e.to_string()))?;
 
-        let selection = Selection {
-            handle,
-            name,
-            indices,
-        };
-        let request = prepare_request(self.session.id.clone(), &selection);
+        let request = prepare_request(self.session.id.clone(), selection);
         let reply =
             self.call(|mut control| async move { control.prepare_selection(request).await })?;
-        Plan::from_proto(reply)
+        Plan::from_proto(reply, selection.quality)
     }
 
     /// Ask the server to resolve several selections in one round trip.
@@ -466,10 +483,13 @@ impl Client {
         let mut replies = reply.results.into_iter();
         results
             .into_iter()
-            .map(|result| match result {
+            .zip(selections)
+            .map(|(result, selection)| match result {
                 Some(local) => Ok(local),
                 None => match replies.next().and_then(|r| r.result) {
-                    Some(transfer_plan_or_error::Result::Plan(plan)) => Ok(Plan::from_proto(plan)),
+                    Some(transfer_plan_or_error::Result::Plan(plan)) => {
+                        Ok(Plan::from_proto(plan, selection.quality))
+                    }
                     Some(transfer_plan_or_error::Result::Error(e)) => Ok(Err(ClientError::Data {
                         class: ErrorClass::from_u8(u8::try_from(e.klass).unwrap_or(u8::MAX)),
                         message: e.message,
@@ -497,11 +517,7 @@ impl Client {
         indices: &[Index],
         dst: &mut [u8],
     ) -> Result<TransferResult> {
-        let selection = Selection {
-            handle,
-            name,
-            indices,
-        };
+        let selection = Selection::exact(handle, name, indices);
         self.fill_many(std::slice::from_ref(plan), &[selection], &mut [dst])
     }
 
@@ -594,7 +610,13 @@ impl Client {
                 }
                 Err(e) if e.needs_reprepare() && retries == 0 => {
                     retries += 1;
-                    let again: Vec<_> = remote.iter().map(|(i, _)| selections[*i]).collect();
+                    let again: Vec<_> = remote
+                        .iter()
+                        .map(|(i, plan)| Selection {
+                            quality: &plan.requested_quality,
+                            ..selections[*i]
+                        })
+                        .collect();
                     let fresh = self.prepare_many(&again)?;
                     let mut still = Vec::new();
                     for ((i, old), fresh) in remote.into_iter().zip(fresh) {
@@ -680,9 +702,8 @@ fn prepare_request(session_id: Vec<u8>, selection: &Selection<'_>) -> PrepareSel
         handle: selection.handle.0,
         name: selection.name.to_string(),
         indices: indices_to_proto(selection.indices),
-        // Lossless and uncompressed: nothing else is implemented on either
-        // side yet, and the plan says what was applied.
-        requested_quality: Some(quality_to_proto(&aex_core::QualitySpec::exact())),
+        requested_quality: Some(quality_to_proto(selection.quality)),
+        // Uncompressed: the data plane reads straight into the caller's buffer.
         requested_codec: aex_core::Codec::Raw.as_u32(),
     }
 }

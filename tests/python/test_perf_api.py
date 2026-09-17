@@ -1,4 +1,6 @@
-"""The performance APIs: read_into, gather, get_async, stats."""
+"""The performance APIs: read_into, gather, get_async, at, stats."""
+
+import warnings
 
 import numpy as np
 import pytest
@@ -119,6 +121,47 @@ def test_close_waits_for_pending_transfers(server, ds_paths):
     client.close()
     for future in futures:
         np.testing.assert_array_equal(future.result(timeout=0), expected_ds1())
+
+
+# ============================================================
+# at
+# ============================================================
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"dtype": np.float16}, {"step": (2, 2)}, {"abs_error": 1e-3}, {"rel_error": 1e-2}],
+)
+def test_at_falls_back_to_exact_and_warns(array_proxy, kwargs):
+    view = array_proxy.at(**kwargs)
+    assert view.applied_quality is None
+    with pytest.warns(aex.AexQualityWarning):
+        data = view[0:10]
+    np.testing.assert_array_equal(data, expected_ds1()[0:10])
+    assert data.dtype == np.float32
+    assert view.applied_quality == {"encoding": "exact"}
+
+
+def test_at_warns_once_per_view(array_proxy):
+    view = array_proxy.at(dtype="f2")
+    with pytest.warns(aex.AexQualityWarning):
+        view[0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        view[1]
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"dtype": "f2", "step": (2,)}])
+def test_at_takes_exactly_one_kind_of_quality(array_proxy, kwargs):
+    with pytest.raises(ValueError):
+        array_proxy.at(**kwargs)
+
+
+def test_at_accepts_both_error_bounds(array_proxy):
+    assert array_proxy.at(abs_error=1, rel_error=0.1).quality == {
+        "abs_error": 1.0,
+        "rel_error": 0.1,
+    }
 
 
 # ============================================================

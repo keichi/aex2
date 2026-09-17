@@ -128,8 +128,14 @@ pub struct QualitySpec {
 
 impl QualitySpec {
     /// Lossless, which is what every transfer in this release gets.
-    pub fn exact() -> Self {
-        QualitySpec::default()
+    pub const fn exact() -> Self {
+        QualitySpec {
+            encoding: Encoding::Exact,
+            cast_dtype: None,
+            subsample_step: Vec::new(),
+            abs_error_bound: None,
+            rel_error_bound: None,
+        }
     }
 
     pub fn is_exact(&self) -> bool {

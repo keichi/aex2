@@ -42,3 +42,7 @@ class AexFallbackError(AexError):
 
 class AexFallbackWarning(UserWarning):
     """A numpy function is downloading the array to compute locally."""
+
+
+class AexQualityWarning(UserWarning):
+    """The server sent the data at a different quality than was asked for."""

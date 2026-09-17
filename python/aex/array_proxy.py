@@ -10,12 +10,12 @@ import numpy as np
 import numpy.typing as npt
 
 from . import _aex
-from .errors import AexFallbackError, AexFallbackWarning
+from .errors import AexFallbackError, AexFallbackWarning, AexQualityWarning
 
 if TYPE_CHECKING:
     from .client import Client
 
-__all__ = ["ArrayProxy", "set_fallback_policy", "set_fallback_threshold"]
+__all__ = ["ArrayProxy", "QualityView", "set_fallback_policy", "set_fallback_threshold"]
 
 FallbackPolicy = Literal["warn", "allow", "error"]
 
@@ -89,13 +89,45 @@ class ArrayProxy:
 
     def __getitem__(self, key: Any) -> npt.NDArray[Any]:
         """Transfer a selection. The result is read-only."""
+        return self._read(key, None)[0]
+
+    def _read(self, key: Any, quality: dict[str, Any] | None) -> tuple[npt.NDArray[Any], _aex.Plan]:
         wire_key = _to_wire(key, self.shape)
-        plan = self._native.prepare(self.handle, self.name, wire_key)
+        plan = self._native.prepare(self.handle, self.name, wire_key, quality)
         # Shape and dtype are the server's answer, not worked out here.
         out = np.empty(plan.shape, dtype=plan.dtype)
         self._native.fill(plan, self.handle, self.name, wire_key, out)
         out.flags.writeable = False
-        return out
+        return out, plan
+
+    def at(
+        self,
+        *,
+        dtype: npt.DTypeLike | None = None,
+        step: tuple[int, ...] | None = None,
+        abs_error: float | None = None,
+        rel_error: float | None = None,
+    ) -> "QualityView":
+        """A view that asks the server for a cheaper encoding of the data.
+
+        Give one of: ``dtype`` to narrow the elements, ``step`` to take every
+        n-th element per axis, or ``abs_error`` / ``rel_error`` for lossy
+        compression. A server that cannot do it sends the exact data and the
+        view warns; ``applied_quality`` says what was done.
+        """
+        quality: dict[str, Any] = {}
+        if dtype is not None:
+            quality["dtype"] = np.dtype(dtype).newbyteorder("<").str
+        if step is not None:
+            quality["step"] = tuple(operator.index(n) for n in step)
+        if abs_error is not None:
+            quality["abs_error"] = float(abs_error)
+        if rel_error is not None:
+            quality["rel_error"] = float(rel_error)
+        kinds = {"error" if k.endswith("_error") else k for k in quality}
+        if len(kinds) != 1:
+            raise ValueError("give exactly one of dtype, step, or abs_error / rel_error")
+        return QualityView(self, quality)
 
     def read_into(self, out: npt.NDArray[Any], key: Any = Ellipsis) -> None:
         """Transfer a selection into ``out`` without allocating.
@@ -163,6 +195,32 @@ class ArrayProxy:
 
     def __repr__(self) -> str:
         return f'<ArrayProxy name "{self.name}", shape {self.shape}, type {self.dtype}>'
+
+
+class QualityView:
+    """An array read at a requested quality. Made by ``ArrayProxy.at``."""
+
+    def __init__(self, array: ArrayProxy, quality: dict[str, Any]) -> None:
+        self.array = array
+        self.quality = quality
+        # What the server applied on the last read; None before one.
+        self.applied_quality: dict[str, Any] | None = None
+
+    def __getitem__(self, key: Any) -> npt.NDArray[Any]:
+        """Transfer a selection at this view's quality. The result is read-only."""
+        out, plan = self.array._read(key, self.quality)
+        applied = plan.applied_quality
+        if applied["encoding"] == "exact" and self.applied_quality is None:
+            warnings.warn(
+                f"the server cannot apply {self.quality}; the data is exact",
+                AexQualityWarning,
+                stacklevel=2,
+            )
+        self.applied_quality = applied
+        return out
+
+    def __repr__(self) -> str:
+        return f"<QualityView of {self.array!r}, quality {self.quality}>"
 
 
 def _to_wire(key: Any, shape: tuple[int, ...]) -> Key:

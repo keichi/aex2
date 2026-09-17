@@ -8,7 +8,8 @@
 use std::sync::{Arc, RwLock};
 
 use aex_client::{
-    ClientConfig, ClientError, DType, ErrorClass, FileHandle, Index, Item, Selection,
+    ClientConfig, ClientError, DType, Encoding, ErrorClass, FileHandle, Index, Item, QualitySpec,
+    Selection,
 };
 use half::f16;
 use numpy::{
@@ -99,6 +100,12 @@ impl Plan {
     #[getter]
     fn total_bytes(&self) -> u64 {
         self.0.total_bytes
+    }
+
+    /// What the server did to the elements, as a dict naming the encoding.
+    #[getter]
+    fn applied_quality<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        quality_to_py(py, &self.0.applied_quality)
     }
 
     /// Whether the data came back with the plan.
@@ -203,16 +210,22 @@ impl Client {
 
     /// Resolve a selection. `key` is a tuple of int, slice, `...`, `None` and
     /// 1-d int64 arrays, as `aex.array_proxy` prepares it.
+    #[pyo3(signature = (handle, name, key, quality=None))]
     fn prepare(
         &self,
         py: Python<'_>,
         handle: u64,
         name: String,
         key: &Bound<'_, PyTuple>,
+        quality: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Plan> {
         let indices = indices_from_py(key)?;
+        let quality = quality_from_py(quality)?;
         self.call(py, |c| {
-            c.prepare(FileHandle::from_u64(handle), &name, &indices)
+            c.prepare_selection(&Selection {
+                quality: &quality,
+                ..Selection::exact(FileHandle::from_u64(handle), &name, &indices)
+            })
         })
         .map(Plan)
     }
@@ -401,12 +414,62 @@ fn selections<'a>(
 ) -> Vec<Selection<'a>> {
     indices
         .iter()
-        .map(|indices| Selection {
-            handle,
-            name,
-            indices,
-        })
+        .map(|indices| Selection::exact(handle, name, indices))
         .collect()
+}
+
+/// A quality request as `aex.array_proxy` spells it: a dict holding one of
+/// `dtype`, `step`, or `abs_error` / `rel_error`. `None` is lossless.
+fn quality_from_py(quality: Option<&Bound<'_, PyDict>>) -> PyResult<QualitySpec> {
+    let mut spec = QualitySpec::exact();
+    let Some(quality) = quality else {
+        return Ok(spec);
+    };
+    if let Some(dtype) = quality.get_item("dtype")? {
+        spec.encoding = Encoding::DtypeCast;
+        spec.cast_dtype = Some(
+            DType::from_descr(&dtype.extract::<String>()?)
+                .map_err(|e| value_error(e.to_string()))?,
+        );
+    } else if let Some(step) = quality.get_item("step")? {
+        spec.encoding = Encoding::Subsample;
+        spec.subsample_step = step.extract()?;
+    } else {
+        spec.abs_error_bound = quality
+            .get_item("abs_error")?
+            .map(|v| v.extract())
+            .transpose()?;
+        spec.rel_error_bound = quality
+            .get_item("rel_error")?
+            .map(|v| v.extract())
+            .transpose()?;
+        if spec.abs_error_bound.is_some() || spec.rel_error_bound.is_some() {
+            spec.encoding = Encoding::ErrorBound;
+        }
+    }
+    Ok(spec)
+}
+
+/// The inverse of `quality_from_py`, with the encoding named.
+fn quality_to_py<'py>(py: Python<'py>, spec: &QualitySpec) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    let encoding = match spec.encoding {
+        Encoding::Exact => "exact",
+        Encoding::DtypeCast => "dtype_cast",
+        Encoding::Subsample => "subsample",
+        Encoding::ErrorBound => "error_bound",
+    };
+    dict.set_item("encoding", encoding)?;
+    match spec.encoding {
+        Encoding::Exact => {}
+        Encoding::DtypeCast => dict.set_item("dtype", spec.cast_dtype.map(DType::descr))?,
+        Encoding::Subsample => dict.set_item("step", PyTuple::new(py, &spec.subsample_step)?)?,
+        Encoding::ErrorBound => {
+            dict.set_item("abs_error", spec.abs_error_bound)?;
+            dict.set_item("rel_error", spec.rel_error_bound)?;
+        }
+    }
+    Ok(dict)
 }
 
 /// A batch whose buffers have been checked against their plans.
