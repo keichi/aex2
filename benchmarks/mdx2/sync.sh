@@ -25,7 +25,8 @@ done
 
 # A login shell, because .bashrc stops before it puts cargo on PATH.
 # The extension is rebuilt too, so Python never imports a stale one.
-build='cd aex2 && cargo build --release &&
+# The server gets the hdf5 feature; the VMs have libhdf5 in /usr/local.
+build='cd aex2 && cargo build --release --features aex-server/hdf5 &&
     if [ -d .venv ]; then . .venv/bin/activate && maturin develop --release -q; fi'
 pids=()
 for h in "$@"; do

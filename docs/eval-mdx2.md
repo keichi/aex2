@@ -49,6 +49,22 @@ Python 環境はリポジトリのコピーを送ったあとに作る (`.venv` 
 $ cd ~/aex2 && uv venv --python 3.13 && uv pip install maturin numpy pytest
 ```
 
+HDF5 バックエンドには libhdf5 1.14 以降が要るが、Ubuntu 24.04 の apt は 1.10 なので、
+Mac と同じ 2.2.0 をソースから `/usr/local` に入れる (共有ライブラリのみ、zlib 付き)。
+fixture は h5py で作るので、venv に h5py も足す。
+
+```console
+$ sudo apt-get install -y cmake zlib1g-dev pkg-config
+$ mkdir -p ~/src && cd ~/src && curl -sSLO https://github.com/HDFGroup/hdf5/releases/download/2.2.0/hdf5-2.2.0.tar.gz
+$ tar xzf hdf5-2.2.0.tar.gz && cd hdf5-2.2.0
+$ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF -DHDF5_ONLY_SHARED_LIBS=ON \
+    -DHDF5_ENABLE_ZLIB_SUPPORT=ON -DHDF5_BUILD_TOOLS=OFF -DHDF5_BUILD_HL_LIB=OFF \
+    -DHDF5_BUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF
+$ cmake --build build -j16 && sudo cmake --install build && sudo ldconfig
+$ cd ~/aex2 && uv pip install h5py
+```
+
 v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `uv sync` する。
 
 ### ツールのバージョン
@@ -58,6 +74,7 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | Rust | 1.98.1 | Mac と同じ。上げるときは両方同時に |
 | Python | 3.13.15 (uv 管理) | CI の新しい方 |
 | numpy | 2.5.3 | — |
+| libhdf5 | 2.2.0 (ソースから `/usr/local`) | Mac (Homebrew) と同じ |
 | protoc | 3.21.12 (apt) | — |
 
 測定結果にはこの表の値を「条件」として書く。
@@ -71,6 +88,9 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/mem.npy` | 4 GiB (2^30 要素)、float32、メモリ常駐 | `target/release/mknpy /mnt/aexram/mem.npy 1073741824` |
 | `/mnt/aexram/m3/` | Python ベンチ用の 10M / 100M / 1G | `.venv/bin/python benchmarks/create_benchmark_data.py --output-dir /mnt/aexram/m3 --sizes 10M 100M 1G --dtypes float32` |
 | `~/disk/disk.npy` | 4 GiB (2^30 要素)、float32、virtio ディスク | `target/release/mknpy ~/disk/disk.npy 1073741824` |
+| `/mnt/aexram/mem.h5` | `mem.npy` と同じ中身の HDF5 (contiguous) | `.venv/bin/python benchmarks/mdx2/mkh5.py /mnt/aexram/mem.h5 1073741824 contiguous counting` |
+| `/mnt/aexram/mem-gzip.h5` | 同じ中身を 4 MiB チャンク・shuffle + gzip 1 で圧縮 (約 1 %) | `... mem-gzip.h5 1073741824 gzip counting` |
+| `/mnt/aexram/mem-gzip-noisy.h5` | 圧縮の効きにくい中身 (`i % 1000` + 0〜15 の乱数) を同じ設定で圧縮。`--pattern none` で読む | `... mem-gzip-noisy.h5 1073741824 gzip noisy` |
 
 - `mknpy` の第 2 引数はバイト数ではなく**要素数**
 - 揃っているかは `ssh aex2-eval1 'ls -l /mnt/aexram /mnt/aexram/m3 ~/disk'` で確かめる。
