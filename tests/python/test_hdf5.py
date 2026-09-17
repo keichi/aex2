@@ -108,6 +108,48 @@ def test_every_dtype_round_trips(dtype, client, data_dir):
         np.testing.assert_array_equal(actual, array[key])
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"chunks": (7, 3)},
+        {"chunks": (40, 30), "compression": "gzip"},
+        {"chunks": (16, 30), "compression": "gzip", "shuffle": True, "fletcher32": True},
+        {"maxshape": (None, 30)},
+    ],
+    ids=repr,
+)
+def test_chunked_datasets_match_numpy(options, client, data_dir):
+    rng = np.random.default_rng(1)
+    array = rng.random((40, 30))
+    path = data_dir / f"chunked_{abs(hash(repr(options)))}.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("data", data=array, **options)
+
+    proxy = client.open(str(path))["data"]
+    for key in [slice(None), (slice(3, 30, 4), [29, 0, 7]), 17, (Ellipsis, 2)]:
+        np.testing.assert_array_equal(proxy[key], array[key])
+
+
+def test_partly_written_chunks_read_as_the_fill_value(client, data_dir):
+    path = data_dir / "partial.h5"
+    with h5py.File(path, "w") as f:
+        ds = f.create_dataset(
+            "data", (50, 20), dtype=np.int32, chunks=(10, 10), compression="gzip", fillvalue=9
+        )
+        ds[12:18, 5:15] = 1
+    with h5py.File(path, "r") as f:
+        expected = f["data"][()]
+    np.testing.assert_array_equal(client.open(str(path))["data"][:], expected)
+
+
+def test_unknown_filters_are_refused(client, data_dir):
+    path = data_dir / "lzf.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("data", data=np.arange(100), compression="lzf")
+    with pytest.raises(ValueError):
+        client.open(str(path))["data"]
+
+
 def test_big_endian_is_refused(client, data_dir):
     path = data_dir / "big.h5"
     with h5py.File(path, "w") as f:

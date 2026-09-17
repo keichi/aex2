@@ -48,6 +48,11 @@ pub struct ControlService {
     /// The port the data plane really bound, which is not the configured one
     /// when that was 0.
     data_port: u16,
+    /// Shared by every HDF5 file this server opens.
+    #[cfg(feature = "hdf5")]
+    decode_cache: Arc<aex_core::DecodeCache>,
+    /// Whether the cache has been reported too small, so it is said once.
+    warned_small_cache: std::sync::atomic::AtomicBool,
 }
 
 impl ControlService {
@@ -62,8 +67,13 @@ impl ControlService {
             sessions,
             transfers,
             paths,
+            #[cfg(feature = "hdf5")]
+            decode_cache: Arc::new(aex_core::DecodeCache::new(
+                config.transfer.decode_cache_bytes,
+            )),
             config,
             data_port,
+            warned_small_cache: Default::default(),
         }
     }
 
@@ -99,7 +109,7 @@ impl ControlService {
         let file: Arc<dyn ArrayFile> = if format == NPY_FORMAT {
             Arc::new(NpyFile::open(&path)?)
         } else if HDF5_FORMATS.contains(&format.as_str()) {
-            open_hdf5(&path)?
+            self.open_hdf5(&path)?
         } else {
             return Err(ServerError::BadRequest(format!(
                 "format {format:?} is not supported; this server serves {NPY_FORMAT:?} and {:?}",
@@ -146,6 +156,7 @@ impl ControlService {
             .unwrap_or(Codec::Raw);
 
         let layout = dataset.layout(&indices, &applied)?;
+        self.check_decode_cache(&*dataset, session.granted_streams());
 
         if layout.total_bytes <= self.config.transfer.inline_limit_bytes {
             let mut inline_data = vec![0u8; layout.total_bytes as usize];
@@ -357,17 +368,45 @@ fn unix_ms_from_now(secs: u64) -> u64 {
         .saturating_add(secs.saturating_mul(1000))
 }
 
-#[cfg(feature = "hdf5")]
-fn open_hdf5(path: &std::path::Path) -> Result<Arc<dyn ArrayFile>> {
-    Ok(Arc::new(aex_core::Hdf5File::open(path)?))
-}
+impl ControlService {
+    #[cfg(feature = "hdf5")]
+    fn open_hdf5(&self, path: &std::path::Path) -> Result<Arc<dyn ArrayFile>> {
+        Ok(Arc::new(aex_core::Hdf5File::open(
+            path,
+            self.decode_cache.clone(),
+        )?))
+    }
 
-#[cfg(not(feature = "hdf5"))]
-fn open_hdf5(_path: &std::path::Path) -> Result<Arc<dyn ArrayFile>> {
-    Err(ServerError::BadRequest(
-        "this server was built without the hdf5 feature and cannot serve HDF5 or netCDF-4"
-            .to_string(),
-    ))
+    #[cfg(not(feature = "hdf5"))]
+    fn open_hdf5(&self, _path: &std::path::Path) -> Result<Arc<dyn ArrayFile>> {
+        Err(ServerError::BadRequest(
+            "this server was built without the hdf5 feature and cannot serve HDF5 or netCDF-4"
+                .to_string(),
+        ))
+    }
+
+    /// Warn once if streams reading one dataset would evict each other's
+    /// chunks, which makes every chunk decode many times over.
+    fn check_decode_cache(&self, dataset: &dyn ArrayDataset, streams: u32) {
+        let Some(chunk_bytes) = dataset.decoded_chunk_bytes() else {
+            return;
+        };
+        let wanted = chunk_bytes.saturating_mul(u64::from(streams));
+        let capacity = self.config.transfer.decode_cache_bytes;
+        if wanted > capacity
+            && !self
+                .warned_small_cache
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                chunk_bytes,
+                streams,
+                decode_cache_bytes = capacity,
+                "transfer.decode_cache_bytes cannot hold one decoded chunk per stream; \
+                 chunks will be decoded repeatedly"
+            );
+        }
+    }
 }
 
 /// The backend a file extension asks for.

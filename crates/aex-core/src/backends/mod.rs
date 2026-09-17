@@ -7,6 +7,8 @@
 //! The traits they implement live in [`crate::backend`].
 
 #[cfg(feature = "hdf5")]
+pub mod decode_cache;
+#[cfg(feature = "hdf5")]
 pub mod hdf5;
 pub mod npy;
 pub mod null;

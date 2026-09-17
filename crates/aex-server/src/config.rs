@@ -89,7 +89,8 @@ pub struct Transfer {
     /// Selections at most this large come back inside the transfer plan, which
     /// keeps an interactive read at one round trip.
     pub inline_limit_bytes: u64,
-    /// LRU for decompressed storage chunks. Unused while only `.npy` is served.
+    /// LRU for decompressed storage chunks, shared by every file. It wants
+    /// room for at least one chunk per stream.
     pub decode_cache_bytes: u64,
 }
 
@@ -148,7 +149,7 @@ impl Default for Transfer {
             read_buffer_bytes: 512 * 1024,
             max_fetch_bytes: 16 * 1024 * 1024,
             inline_limit_bytes: 64 * 1024,
-            decode_cache_bytes: 0,
+            decode_cache_bytes: 1 << 30,
         }
     }
 }
@@ -247,6 +248,7 @@ mod tests {
         assert_eq!(cfg.transfer.inline_limit_bytes, 64 * 1024);
         assert_eq!(cfg.transfer.read_buffers, 3);
         assert_eq!(cfg.transfer.read_buffer_bytes, 512 * 1024);
+        assert_eq!(cfg.transfer.decode_cache_bytes, 1 << 30);
         assert!(cfg.tcp.nodelay);
         assert!(!cfg.enable_null_backend, "synthetic data is opt-in");
         cfg.validate().expect("the defaults must be valid");

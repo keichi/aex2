@@ -178,8 +178,8 @@ ssh トンネルなどでサーバが広告するデータプレーンのポー�
 
 - 対象 OS は Linux (最適化対象) と macOS。`pread` を使うため Unix 系に限る
 - 対応形式は `.npy` と HDF5 (netCDF-4 を含む)。netCDF-3 と Zarr は将来課題 (SPEC §14.1)
-- HDF5 は contiguous なデータセットのみ。chunked・compact・virtual・外部ファイル格納の
-  データセットと external link は非対応 (SPEC §7.5)
+- HDF5 の圧縮フィルタは deflate / shuffle / fletcher32 のみ。compact・virtual・
+  外部ファイル格納のデータセットと external link は非対応 (SPEC §7.5)
 - 読み出し専用
 - fortran order の `.npy` と、ビッグエンディアンのデータは非対応 (SPEC §7.2, §7.5)
 - データプレーンは平文。認証はセッショントークンと転送ごとの ticket のみで、

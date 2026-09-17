@@ -5,23 +5,37 @@
 //! for metadata: where a dataset's bytes are, and what they mean. The bytes
 //! themselves are `pread` from a descriptor of our own, as with `.npy`.
 //!
+//! Chunked datasets are decoded here too: the chunk index comes from libhdf5,
+//! the compressed bytes from `pread`, and the filters are undone by us, with
+//! the result kept in a [`DecodeCache`].
+//!
 //! Like the `.npy` backend, this assumes nobody writes to a file while it is
 //! served: the offsets are taken once, when a dataset is opened.
 
+use std::collections::HashMap;
 use std::fs::File;
+use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use hdf5::dataset::{FillValue, Layout};
 use hdf5::datatype::ByteOrder;
+use hdf5::filters::Filter;
 use hdf5::types::{CompoundType, FloatSize, IntSize, TypeDescriptor};
 use hdf5::LocationType;
 
 use crate::backend::{normalize_path, ArrayDataset, ArrayFile, Item};
+use crate::backends::decode_cache::DecodeCache;
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
-use crate::selection::SelectionLayout;
+use crate::quality::QualitySpec;
+use crate::selection::{Index, SelectionLayout};
+
+/// More chunks than this and the index alone would take gigabytes.
+// ponytail: the index is a dense table. A sparse one would lift this.
+const MAX_CHUNKS: u64 = 1 << 26;
 
 /// An HDF5 file opened for reading.
 pub struct Hdf5File {
@@ -29,10 +43,15 @@ pub struct Hdf5File {
     file: hdf5::File,
     /// For data. Shared by every dataset opened from this file.
     raw: Arc<File>,
+    cache: Arc<DecodeCache>,
+    /// Opened once per path, so a chunk index is built once and the decoded
+    /// chunks of one plan serve the next.
+    datasets: Mutex<HashMap<String, Arc<Hdf5Dataset>>>,
 }
 
 impl Hdf5File {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    /// Open `path`, decoding chunks into `cache`.
+    pub fn open(path: impl AsRef<Path>, cache: Arc<DecodeCache>) -> Result<Self> {
         let path = path.as_ref();
         disable_external_links();
         // Opened first so a missing or unreadable file is reported as such,
@@ -44,7 +63,12 @@ impl Hdf5File {
                 path.display()
             ))
         })?;
-        Ok(Hdf5File { file, raw })
+        Ok(Hdf5File {
+            file,
+            raw,
+            cache,
+            datasets: Mutex::default(),
+        })
     }
 
     fn item(&self, path: &str) -> Result<Item> {
@@ -57,17 +81,25 @@ impl Hdf5File {
             .map_err(|_| AexError::NotFound(path.to_string()))?;
         match info.loc_type {
             LocationType::Group => Ok(Item::Group),
-            LocationType::Dataset => {
-                let dataset = self.file.dataset(path)?;
-                Ok(Item::Dataset(Arc::new(Hdf5Dataset::open(
-                    &dataset,
-                    self.raw.clone(),
-                )?)))
-            }
+            LocationType::Dataset => Ok(Item::Dataset(self.dataset(path)?)),
             other => Err(AexError::NotFound(format!(
                 "{path:?} is a {other:?}, not a group or a dataset"
             ))),
         }
+    }
+
+    fn dataset(&self, path: &str) -> Result<Arc<Hdf5Dataset>> {
+        let mut datasets = self.datasets.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(dataset) = datasets.get(path) {
+            return Ok(dataset.clone());
+        }
+        let dataset = Arc::new(Hdf5Dataset::open(
+            self.file.dataset(path)?,
+            self.raw.clone(),
+            self.cache.clone(),
+        )?);
+        datasets.insert(path.to_string(), dataset.clone());
+        Ok(dataset)
     }
 }
 
@@ -117,12 +149,13 @@ impl ArrayFile for Hdf5File {
 }
 
 /// Where a dataset's bytes are.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum Storage {
     /// One run of the file starting here.
     Contiguous(u64),
     /// Never written: every element reads as the fill value.
     Unallocated,
+    Chunked(Box<Chunked>),
 }
 
 /// One dataset of an HDF5 file.
@@ -137,7 +170,7 @@ pub struct Hdf5Dataset {
 }
 
 impl Hdf5Dataset {
-    fn open(dataset: &hdf5::Dataset, raw: Arc<File>) -> Result<Self> {
+    fn open(dataset: hdf5::Dataset, raw: Arc<File>, cache: Arc<DecodeCache>) -> Result<Self> {
         let name = dataset.name();
         let dtype = dtype_of(&dataset.dtype()?)
             .map_err(|e| AexError::UnsupportedDType(format!("{name}: {e}")))?;
@@ -165,9 +198,33 @@ impl Hdf5Dataset {
                 Some(offset) => Storage::Contiguous(offset),
                 None => Storage::Unallocated,
             },
+            Layout::Chunked => {
+                let chunk_shape = dcpl
+                    .chunk()
+                    .ok_or_else(|| AexError::MalformedHdf5(format!("{name} has no chunk shape")))?;
+                let filters = dataset.filters();
+                if let Some(filter) = filters.iter().find(|f| {
+                    !matches!(f, Filter::Deflate(_) | Filter::Shuffle | Filter::Fletcher32)
+                }) {
+                    return Err(AexError::UnsupportedHdf5(format!(
+                        "{name} uses the {filter:?} filter; only deflate, shuffle and \
+                         fletcher32 are decoded"
+                    )));
+                }
+                let chunk_shape: Vec<u64> = chunk_shape.iter().map(|&n| n as u64).collect();
+                Storage::Chunked(Box::new(Chunked::new(
+                    dataset.clone(),
+                    &name,
+                    &shape,
+                    dtype,
+                    chunk_shape,
+                    filters,
+                    cache,
+                )?))
+            }
             other => {
                 return Err(AexError::UnsupportedHdf5(format!(
-                    "{name} has {other:?} layout; only contiguous datasets are served"
+                    "{name} has {other:?} layout, which is not served"
                 )))
             }
         };
@@ -185,7 +242,7 @@ impl Hdf5Dataset {
             }
         }
 
-        let fill = fill_value(dataset, &dcpl, dtype)?;
+        let fill = fill_value(&dataset, &dcpl, dtype)?;
         Ok(Hdf5Dataset {
             raw,
             dtype,
@@ -205,8 +262,17 @@ impl ArrayDataset for Hdf5Dataset {
         &self.shape
     }
 
+    /// Builds the chunk index here, on the control plane, so the data plane
+    /// never waits on libhdf5 and a bad index fails the request that met it.
+    fn layout(&self, indices: &[Index], quality: &QualitySpec) -> Result<SelectionLayout> {
+        if let Storage::Chunked(chunked) = &self.storage {
+            chunked.index(&self.raw)?;
+        }
+        SelectionLayout::resolve(&self.shape, self.dtype, indices, quality)
+    }
+
     fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()> {
-        match self.storage {
+        match &self.storage {
             Storage::Contiguous(base) => layout.read_with(offset, dst, |at, buf| {
                 Ok(self.raw.read_exact_at(buf, base + at)?)
             }),
@@ -214,8 +280,324 @@ impl ArrayDataset for Hdf5Dataset {
                 fill_from(&self.fill, at, buf);
                 Ok(())
             }),
+            Storage::Chunked(chunked) => {
+                layout.read_with(offset, dst, |at, buf| chunked.read(self, at, buf))
+            }
         }
     }
+
+    fn decoded_chunk_bytes(&self) -> Option<u64> {
+        match &self.storage {
+            Storage::Chunked(chunked) if !chunked.filters.is_empty() => Some(chunked.chunk_bytes),
+            _ => None,
+        }
+    }
+}
+
+/// Where one chunk is stored.
+#[derive(Debug, Clone, Copy)]
+struct ChunkEntry {
+    addr: u64,
+    size: u64,
+    /// Bit `i` set: filter `i` of the pipeline was skipped for this chunk.
+    filter_mask: u32,
+}
+
+impl ChunkEntry {
+    /// A chunk never written, which reads as the fill value.
+    const MISSING: ChunkEntry = ChunkEntry {
+        addr: u64::MAX,
+        size: 0,
+        filter_mask: 0,
+    };
+}
+
+/// A chunked dataset: a regular grid of chunks, each stored on its own.
+#[derive(Debug)]
+struct Chunked {
+    /// Where the index comes from.
+    dataset: hdf5::Dataset,
+    shape: Vec<u64>,
+    itemsize: u64,
+    chunk_shape: Vec<u64>,
+    /// Chunks along each axis.
+    grid: Vec<u64>,
+    /// Bytes of a whole chunk, decoded. Edge chunks are stored whole too.
+    chunk_bytes: u64,
+    /// Every axis after this one is covered by one chunk with no padding, so
+    /// a run of elements carries on across them within a chunk.
+    run_axis: usize,
+    /// In the order they were applied when writing.
+    filters: Vec<Filter>,
+    /// By chunk number in C order; built on first use.
+    index: OnceLock<Vec<ChunkEntry>>,
+    cache: Arc<DecodeCache>,
+    /// Tells this dataset's chunks apart from others' in the shared cache.
+    cache_key: u64,
+}
+
+impl Chunked {
+    fn new(
+        dataset: hdf5::Dataset,
+        name: &str,
+        shape: &[u64],
+        dtype: DType,
+        chunk_shape: Vec<u64>,
+        filters: Vec<Filter>,
+        cache: Arc<DecodeCache>,
+    ) -> Result<Self> {
+        static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
+        let malformed = || {
+            AexError::MalformedHdf5(format!(
+                "{name}: chunks of {chunk_shape:?} do not fit an array of {shape:?}"
+            ))
+        };
+        if chunk_shape.len() != shape.len() || chunk_shape.contains(&0) {
+            return Err(malformed());
+        }
+        let grid: Vec<u64> = shape
+            .iter()
+            .zip(&chunk_shape)
+            .map(|(n, c)| n.div_ceil(*c))
+            .collect();
+        let chunks = grid
+            .iter()
+            .try_fold(1u64, |acc, &n| acc.checked_mul(n))
+            .ok_or_else(malformed)?;
+        if chunks > MAX_CHUNKS {
+            return Err(AexError::UnsupportedHdf5(format!(
+                "{name} has {chunks} chunks; at most {MAX_CHUNKS} are served"
+            )));
+        }
+        let chunk_bytes = chunk_shape
+            .iter()
+            .try_fold(dtype.itemsize(), |acc, &n| acc.checked_mul(n))
+            .filter(|&n| usize::try_from(n).is_ok())
+            .ok_or_else(malformed)?;
+        let mut run_axis = shape.len() - 1;
+        while run_axis > 0 && chunk_shape[run_axis] == shape[run_axis] {
+            run_axis -= 1;
+        }
+        Ok(Chunked {
+            dataset,
+            shape: shape.to_vec(),
+            itemsize: dtype.itemsize(),
+            chunk_shape,
+            grid,
+            chunk_bytes,
+            run_axis,
+            filters,
+            index: OnceLock::new(),
+            cache,
+            cache_key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    /// The chunk index, reading it from libhdf5 the first time.
+    fn index(&self, raw: &File) -> Result<&[ChunkEntry]> {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let name = self.dataset.name();
+        let file_len = raw.metadata()?.len();
+        let chunks = self.grid.iter().product::<u64>() as usize;
+        let mut index = vec![ChunkEntry::MISSING; chunks];
+        let mut bad = None;
+        self.dataset.chunks_visit(|chunk| {
+            let coords = chunk
+                .offset
+                .iter()
+                .zip(&self.chunk_shape)
+                .map(|(o, c)| o / c);
+            // A chunk left behind by shrinking the dataset is not part of it.
+            let Some(number) = linear(coords, &self.grid) else {
+                return 0;
+            };
+            let entry = ChunkEntry {
+                addr: chunk.addr,
+                size: chunk.size,
+                filter_mask: chunk.filter_mask,
+            };
+            let unfiltered = self.filters.is_empty() && entry.size != self.chunk_bytes;
+            if unfiltered
+                || entry
+                    .addr
+                    .checked_add(entry.size)
+                    .is_none_or(|end| end > file_len)
+            {
+                bad = Some(entry);
+                return -1;
+            }
+            index[number] = entry;
+            0
+        })?;
+        if let Some(entry) = bad {
+            return Err(AexError::MalformedHdf5(format!(
+                "{name}: a chunk of {} bytes at {} does not fit the file ({file_len} bytes) \
+                 or the chunk shape",
+                entry.size, entry.addr
+            )));
+        }
+        Ok(self.index.get_or_init(|| index))
+    }
+
+    /// Read `[at, at + dst.len())` of the dataset's C-order bytes.
+    fn read(&self, dataset: &Hdf5Dataset, mut at: u64, mut dst: &mut [u8]) -> Result<()> {
+        let index = self.index(&dataset.raw)?;
+        let ndim = self.shape.len();
+        let mut pos = vec![0u64; ndim];
+        while !dst.is_empty() {
+            let element = at / self.itemsize;
+            let skip = at % self.itemsize;
+            let mut rest = element;
+            for axis in (0..ndim).rev() {
+                pos[axis] = rest % self.shape[axis];
+                rest /= self.shape[axis];
+            }
+
+            let chunk = linear(
+                pos.iter().zip(&self.chunk_shape).map(|(p, c)| p / c),
+                &self.grid,
+            )
+            .expect("an in-range element is in some chunk");
+            let within = linear_unchecked(
+                pos.iter().zip(&self.chunk_shape).map(|(p, c)| p % c),
+                &self.chunk_shape,
+            );
+
+            // Elements from here to the end of this chunk along the run axis,
+            // less those of the trailing axes already behind us.
+            let j = self.run_axis;
+            let trailing: u64 = self.shape[j + 1..].iter().product();
+            let behind = linear_unchecked(pos[j + 1..].iter().copied(), &self.shape[j + 1..]);
+            let along =
+                (self.chunk_shape[j] - pos[j] % self.chunk_shape[j]).min(self.shape[j] - pos[j]);
+            let run = along * trailing - behind;
+
+            let start = within * self.itemsize + skip;
+            let len = (run * self.itemsize - skip).min(dst.len() as u64) as usize;
+            let (out, tail) = dst.split_at_mut(len);
+            let entry = index[chunk];
+            if entry.addr == ChunkEntry::MISSING.addr {
+                fill_from(&dataset.fill, skip, out);
+            } else if self.filters.is_empty() {
+                dataset.raw.read_exact_at(out, entry.addr + start)?;
+            } else {
+                let decoded = self
+                    .cache
+                    .get_or_decode((self.cache_key, chunk as u64), || {
+                        self.decode(&dataset.raw, entry)
+                    })?;
+                out.copy_from_slice(&decoded[start as usize..start as usize + len]);
+            }
+            at += len as u64;
+            dst = tail;
+        }
+        Ok(())
+    }
+
+    /// Read one chunk and undo its filters.
+    fn decode(&self, raw: &File, entry: ChunkEntry) -> Result<Vec<u8>> {
+        let malformed =
+            |what: &str| AexError::MalformedHdf5(format!("chunk at byte {}: {what}", entry.addr));
+        let mut bytes = vec![0u8; entry.size as usize];
+        raw.read_exact_at(&mut bytes, entry.addr)?;
+        for (i, filter) in self.filters.iter().enumerate().rev() {
+            if entry.filter_mask & (1 << i) != 0 {
+                continue;
+            }
+            bytes = match filter {
+                Filter::Fletcher32 => strip_fletcher32(bytes)
+                    .ok_or_else(|| malformed("fletcher32 checksum mismatch"))?,
+                Filter::Deflate(_) => inflate(&bytes, self.chunk_bytes)
+                    .ok_or_else(|| malformed("deflate stream is corrupt"))?,
+                Filter::Shuffle => unshuffle(&bytes, self.itemsize as usize),
+                other => unreachable!("{other:?} was rejected when the dataset was opened"),
+            };
+        }
+        if bytes.len() as u64 != self.chunk_bytes {
+            return Err(malformed(&format!(
+                "decodes to {} bytes instead of {}",
+                bytes.len(),
+                self.chunk_bytes
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
+/// The C-order number of `coords` in a grid of `dims`, if it lies inside.
+fn linear(coords: impl Iterator<Item = u64>, dims: &[u64]) -> Option<usize> {
+    let mut n = 0u64;
+    for (c, d) in coords.zip(dims) {
+        if c >= *d {
+            return None;
+        }
+        n = n * d + c;
+    }
+    Some(n as usize)
+}
+
+/// [`linear`] for coordinates known to be inside.
+fn linear_unchecked(coords: impl Iterator<Item = u64>, dims: &[u64]) -> u64 {
+    coords.zip(dims).fold(0, |n, (c, d)| n * d + c)
+}
+
+/// Undo zlib, refusing to produce more than `limit` bytes.
+fn inflate(bytes: &[u8], limit: u64) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(limit as usize);
+    flate2::read::ZlibDecoder::new(bytes)
+        .take(limit + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+/// Undo HDF5's shuffle: byte `b` of every element was moved to block `b`.
+fn unshuffle(bytes: &[u8], itemsize: usize) -> Vec<u8> {
+    let elements = bytes.len() / itemsize;
+    let mut out = bytes.to_vec();
+    if itemsize > 1 {
+        for b in 0..itemsize {
+            let block = &bytes[b * elements..(b + 1) * elements];
+            for (e, &byte) in block.iter().enumerate() {
+                out[e * itemsize + b] = byte;
+            }
+        }
+    }
+    out
+}
+
+/// Check and drop the trailing checksum HDF5's fletcher32 filter appends.
+fn strip_fletcher32(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
+    let body = bytes.len().checked_sub(4)?;
+    let stored = u32::from_le_bytes(bytes[body..].try_into().unwrap());
+    let sum = fletcher32(&bytes[..body]);
+    // Before 1.6.3, libhdf5 wrote each half of the sum byte-swapped on
+    // little-endian machines, and it still accepts both.
+    let swapped = ((sum & 0x00ff_00ff) << 8) | ((sum >> 8) & 0x00ff_00ff);
+    if stored != sum && stored != swapped {
+        return None;
+    }
+    bytes.truncate(body);
+    Some(bytes)
+}
+
+/// libhdf5's Fletcher-32: big-endian 16-bit words, an odd byte padded.
+fn fletcher32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (0u32, 0u32);
+    // 360 words keep the sums inside u32 between reductions.
+    for block in data.chunks(720) {
+        for word in block.chunks(2) {
+            a += u32::from(word[0]) << 8 | u32::from(*word.get(1).unwrap_or(&0));
+            b += a;
+        }
+        a = (a & 0xffff) + (a >> 16);
+        b = (b & 0xffff) + (b >> 16);
+    }
+    a = (a & 0xffff) + (a >> 16);
+    b = (b & 0xffff) + (b >> 16);
+    (b << 16) | a
 }
 
 /// Fill `dst` with the bytes at `[at, at + dst.len())` of an array made of
@@ -329,6 +711,10 @@ mod tests {
     use crate::quality::QualitySpec;
     use crate::selection::{Index, LayoutKind};
 
+    fn open(path: impl AsRef<Path>) -> Result<Hdf5File> {
+        Hdf5File::open(path, Arc::new(DecodeCache::new(1 << 20)))
+    }
+
     fn read_all(dataset: &dyn ArrayDataset, indices: &[Index]) -> (SelectionLayout, Vec<u8>) {
         let layout = dataset.layout(indices, &QualitySpec::default()).unwrap();
         let mut out = vec![0u8; layout.total_bytes as usize];
@@ -403,7 +789,7 @@ mod tests {
         case!("b1", bool, DType::Bool, |i| i % 3 == 0);
         drop(h5);
 
-        let file = Hdf5File::open(&path).unwrap();
+        let file = open(&path).unwrap();
         for (name, dtype, bytes) in expected {
             let d = dataset(&file, name);
             assert_eq!(d.dtype(), dtype, "{name}");
@@ -423,7 +809,7 @@ mod tests {
         write(&h5, "a", &values, &[10, 7]);
         drop(h5);
 
-        let file = Hdf5File::open(&path).unwrap();
+        let file = open(&path).unwrap();
         let d = dataset(&file, "a");
 
         // Row 3: one run of the file.
@@ -472,7 +858,7 @@ mod tests {
         h5.new_dataset::<u8>().shape([4]).create("zeros").unwrap();
         drop(h5);
 
-        let file = Hdf5File::open(&path).unwrap();
+        let file = open(&path).unwrap();
         let (_, out) = read_all(&*dataset(&file, "scalar"), &[]);
         assert_eq!(out, 2.5f64.to_le_bytes());
 
@@ -512,7 +898,7 @@ mod tests {
         h5.link_soft("/nowhere", "dangling").unwrap();
         drop(h5);
 
-        let file = Hdf5File::open(&path).unwrap();
+        let file = open(&path).unwrap();
         for p in ["", "/", "outer", "/outer/inner/", "outer/inner/a", "alias"] {
             assert!(file.contains(p), "{p}");
         }
@@ -571,7 +957,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let file = Hdf5File::open(dir.path().join("t.h5")).unwrap();
+        let file = open(dir.path().join("t.h5")).unwrap();
         assert!(!file.contains("leak"));
         assert!(matches!(
             file.get_item("leak").unwrap_err(),
@@ -605,7 +991,8 @@ mod tests {
         h5.new_dataset::<u8>()
             .shape([4])
             .chunk([2])
-            .create("chunked")
+            .nbit()
+            .create("nbit")
             .unwrap();
         h5.new_dataset_builder()
             .with_data(&[1u8, 2])
@@ -614,10 +1001,10 @@ mod tests {
             .unwrap();
         drop(h5);
 
-        let file = Hdf5File::open(&path).unwrap();
+        let file = open(&path).unwrap();
         let err = |p: &str| file.get_item(p).unwrap_err();
         assert!(matches!(err("big"), AexError::UnsupportedDType(_)));
-        assert!(matches!(err("chunked"), AexError::UnsupportedHdf5(_)));
+        assert!(matches!(err("nbit"), AexError::UnsupportedHdf5(_)));
         assert!(matches!(err("compact"), AexError::UnsupportedHdf5(_)));
         assert_eq!(err("compact").class(), crate::ErrorClass::Request);
     }
@@ -628,10 +1015,10 @@ mod tests {
         let path = dir.path().join("t.nc");
         std::fs::write(&path, b"CDF\x01 not HDF5 at all").unwrap();
         assert!(matches!(
-            Hdf5File::open(&path).unwrap_err(),
+            open(&path).unwrap_err(),
             AexError::UnsupportedHdf5(_)
         ));
-        let missing = Hdf5File::open(dir.path().join("missing.h5")).unwrap_err();
+        let missing = open(dir.path().join("missing.h5")).unwrap_err();
         assert_eq!(missing.class(), crate::ErrorClass::Request);
     }
 
@@ -644,7 +1031,7 @@ mod tests {
         let bytes = write(&h5, "a", &values, &[values.len()]);
         drop(h5);
 
-        let file = Hdf5File::open(&path).unwrap();
+        let file = open(&path).unwrap();
         let d = dataset(&file, "a");
         let layout = d.layout(&[], &QualitySpec::default()).unwrap();
         let piece = 4096 + 3;
@@ -661,6 +1048,218 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// Every C-order byte range of `d` that a transfer could ask for, checked
+    /// against `bytes`.
+    fn check_ranges(d: &dyn ArrayDataset, bytes: &[u8]) {
+        let layout = d.layout(&[], &QualitySpec::default()).unwrap();
+        for piece in [1, 3, 7, 64, bytes.len()] {
+            let mut at = 0;
+            while at < bytes.len() {
+                let len = piece.min(bytes.len() - at);
+                let mut out = vec![0u8; len];
+                d.read_range(&layout, at as u64, &mut out).unwrap();
+                assert_eq!(out, bytes[at..at + len], "piece {piece} at {at}");
+                at += len;
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_datasets_read_back_under_every_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.h5");
+        let h5 = hdf5::File::create(&path).unwrap();
+        // Shapes whose chunks leave edges, cover a trailing axis exactly, or both.
+        let shapes: [(&[usize], &[usize]); 5] = [
+            (&[10, 7], &[3, 4]),
+            (&[10, 7], &[3, 7]),
+            (&[4, 5, 6], &[3, 5, 6]),
+            (&[4, 5, 6], &[4, 2, 6]),
+            (&[9], &[4]),
+        ];
+        let mut cases = Vec::new();
+        for (s, (shape, chunk)) in shapes.iter().enumerate() {
+            let n: usize = shape.iter().product();
+            let values: Vec<u32> = (0..n as u32)
+                .map(|i| i.wrapping_mul(2_654_435_761))
+                .collect();
+            for (f, filters) in ["none", "deflate", "shuffle+deflate", "fletcher32", "all"]
+                .iter()
+                .enumerate()
+            {
+                let name = format!("d{s}_{f}");
+                let mut builder = h5.new_dataset::<u32>().shape(*shape).chunk(*chunk);
+                builder = match *filters {
+                    "none" => builder,
+                    "deflate" => builder.deflate(6),
+                    "shuffle+deflate" => builder.shuffle().deflate(1),
+                    "fletcher32" => builder.fletcher32(),
+                    _ => builder.shuffle().deflate(9).fletcher32(),
+                };
+                builder
+                    .create(name.as_str())
+                    .unwrap()
+                    .write_raw(&values)
+                    .unwrap();
+                cases.push((name, filters.to_string(), bytes_of(&values)));
+            }
+        }
+        drop(h5);
+
+        let file = open(&path).unwrap();
+        for (name, filters, bytes) in cases {
+            let d = dataset(&file, &name);
+            let (_, out) = read_all(&*d, &[]);
+            assert_eq!(out, bytes, "{name} {filters}");
+            check_ranges(&*d, &bytes);
+            assert_eq!(
+                d.decoded_chunk_bytes().is_some(),
+                filters != "none",
+                "{name}"
+            );
+        }
+
+        // A gathered selection across chunk boundaries.
+        let d = dataset(&file, "d0_2");
+        let step = Index::Slice {
+            start: Some(1),
+            stop: None,
+            step: Some(3),
+        };
+        let (layout, out) = read_all(&*d, &[step, Index::Fancy(vec![6, 0, 3])]);
+        assert!(matches!(layout.kind, LayoutKind::Gathered(_)));
+        let values: Vec<u32> = (0..70u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+        let expected: Vec<u32> = [1, 4, 7]
+            .iter()
+            .flat_map(|r| [6, 0, 3].map(|c| values[r * 7 + c]))
+            .collect();
+        assert_eq!(out, bytes_of(&expected));
+    }
+
+    #[test]
+    fn unwritten_chunks_read_as_the_fill_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.h5");
+        let h5 = hdf5::File::create(&path).unwrap();
+        for (name, deflate) in [("plain", false), ("deflated", true)] {
+            let mut builder = h5
+                .new_dataset::<i16>()
+                .shape([10])
+                .chunk([4])
+                .fill_value(-2i16);
+            if deflate {
+                builder = builder.deflate(1);
+            }
+            builder
+                .create(name)
+                .unwrap()
+                .write_slice(&[5i16, 6, 7][..], 4..7)
+                .unwrap();
+        }
+        drop(h5);
+
+        let file = open(&path).unwrap();
+        let expected = bytes_of(&[-2i16, -2, -2, -2, 5, 6, 7, -2, -2, -2]);
+        for name in ["plain", "deflated"] {
+            let d = dataset(&file, name);
+            assert_eq!(read_all(&*d, &[]).1, expected, "{name}");
+            check_ranges(&*d, &expected);
+        }
+    }
+
+    #[test]
+    fn a_corrupt_chunk_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.h5");
+        let h5 = hdf5::File::create(&path).unwrap();
+        let values: Vec<u64> = (0..64).collect();
+        let d = h5
+            .new_dataset::<u64>()
+            .shape([64])
+            .chunk([16])
+            .fletcher32()
+            .create("d")
+            .unwrap();
+        d.write_raw(&values).unwrap();
+        let chunk = d.chunk_info(1).unwrap();
+        drop((d, h5));
+
+        let raw = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        raw.write_all_at(&[0xff], chunk.addr + 3).unwrap();
+        drop(raw);
+
+        let file = open(&path).unwrap();
+        let d = dataset(&file, "d");
+        let layout = d.layout(&[], &QualitySpec::default()).unwrap();
+        let mut out = vec![0u8; 8 * 16];
+        // Chunk 0 is intact, chunk 1 is not.
+        d.read_range(&layout, 0, &mut out).unwrap();
+        assert_eq!(out, bytes_of(&values[..16]));
+        let err = d.read_range(&layout, 8 * 16, &mut out).unwrap_err();
+        assert!(matches!(err, AexError::MalformedHdf5(_)), "{err}");
+        assert_eq!(err.class(), crate::ErrorClass::Permanent);
+    }
+
+    #[test]
+    fn many_threads_share_a_small_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.h5");
+        let h5 = hdf5::File::create(&path).unwrap();
+        let values: Vec<f64> = (0..1 << 15).map(|i| (i as f64).sin()).collect();
+        h5.new_dataset::<f64>()
+            .shape([values.len()])
+            .chunk([1000])
+            .shuffle()
+            .deflate(4)
+            .create("d")
+            .unwrap()
+            .write_raw(&values)
+            .unwrap();
+        drop(h5);
+        let bytes = bytes_of(&values);
+
+        // Room for three chunks among eight threads: constant eviction.
+        let file = Hdf5File::open(&path, Arc::new(DecodeCache::new(3 * 8000))).unwrap();
+        let d = dataset(&file, "d");
+        let layout = d.layout(&[], &QualitySpec::default()).unwrap();
+        let piece = 3001u64;
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let (d, layout, bytes) = (&d, &layout, &bytes);
+                s.spawn(move || {
+                    for k in 0..40 {
+                        let at = (k * 7919 + t * 104_729) % (bytes.len() as u64 - piece);
+                        let mut out = vec![0u8; piece as usize];
+                        d.read_range(layout, at, &mut out).unwrap();
+                        assert_eq!(out, bytes[at as usize..(at + piece) as usize]);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn a_dataset_is_opened_once_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.h5");
+        let h5 = hdf5::File::create(&path).unwrap();
+        write(&h5, "a", &[1u8], &[1]);
+        drop(h5);
+        let file = open(&path).unwrap();
+        assert!(Arc::ptr_eq(&dataset(&file, "a"), &dataset(&file, "/a/")));
+    }
+
+    #[test]
+    fn filters_undo_what_libhdf5_does() {
+        // Two words and an odd byte.
+        assert_eq!(fletcher32(&[0x01, 0x02, 0x03, 0x04, 0x05]), 0x0e0e_0906);
+        let shuffled = [1, 3, 5, 2, 4, 6];
+        assert_eq!(unshuffle(&shuffled, 2), [1, 2, 3, 4, 5, 6]);
+        // A trailing partial element is left in place.
+        assert_eq!(unshuffle(&[1, 3, 2, 4, 9], 2), [1, 2, 3, 4, 9]);
+        assert!(inflate(b"not zlib", 10).is_none());
     }
 
     #[test]

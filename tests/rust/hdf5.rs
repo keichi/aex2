@@ -10,15 +10,26 @@ use support::{error_class, TestServer};
 const ROWS: usize = 300;
 const COLS: usize = 1000;
 
-/// Write `/group/grid` holding 0, 1, 2, ... and return the values.
+/// Write `/group/grid` holding 0, 1, 2, ... and return the values, along with
+/// `/group/packed`, the same values compressed in chunks.
 fn write_grid(server: &TestServer, name: &str) -> Vec<f32> {
     let values: Vec<f32> = (0..ROWS * COLS).map(|i| i as f32).collect();
     let file = hdf5::File::create(server.root().join(name)).expect("create");
-    file.create_group("group")
-        .expect("group")
+    let group = file.create_group("group").expect("group");
+    group
         .new_dataset::<f32>()
         .shape([ROWS, COLS])
         .create("grid")
+        .expect("dataset")
+        .write_raw(&values)
+        .expect("write");
+    group
+        .new_dataset::<f32>()
+        .shape([ROWS, COLS])
+        .chunk([64, 300])
+        .shuffle()
+        .deflate(4)
+        .create("packed")
         .expect("dataset")
         .write_raw(&values)
         .expect("write");
@@ -47,15 +58,17 @@ fn a_dataset_arrives_whole_over_every_stream_count() {
             ..ClientConfig::default()
         });
         let handle = client.open("grid.h5").expect("open");
-        let array = client
-            .read_selection_as::<f32>(handle, "/group/grid", &[])
-            .expect("read");
-        assert_eq!(array.shape, [ROWS as u64, COLS as u64]);
-        assert!(array.data == all, "streams={streams}");
-        let array = client
-            .read_selection_as::<f32>(handle, "group/grid", &every_other_row)
-            .expect("read");
-        assert!(array.data == odd_rows, "streams={streams}");
+        for name in ["/group/grid", "group/packed"] {
+            let array = client
+                .read_selection_as::<f32>(handle, name, &[])
+                .expect("read");
+            assert_eq!(array.shape, [ROWS as u64, COLS as u64]);
+            assert!(array.data == all, "{name} streams={streams}");
+            let array = client
+                .read_selection_as::<f32>(handle, name, &every_other_row)
+                .expect("read");
+            assert!(array.data == odd_rows, "{name} streams={streams}");
+        }
         client.disconnect().expect("disconnect");
     }
 }
@@ -67,6 +80,9 @@ fn the_hierarchy_is_browsable() {
     let client = server.connect();
     let handle = client.open("grid.h5").expect("open");
 
+    let children = client.list_children(handle, "group").expect("list group");
+    let names: Vec<&str> = children.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["grid", "packed"]);
     let root = client.list_children(handle, "/").expect("list /");
     assert_eq!(root.len(), 1);
     assert_eq!(root[0].0, "group");

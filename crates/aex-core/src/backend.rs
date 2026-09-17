@@ -86,6 +86,13 @@ pub trait ArrayDataset: Send + Sync {
     /// the same dataset at once. A backend needing state does so with interior
     /// mutability.
     fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()>;
+
+    /// Size of one decoded storage chunk, for a backend that decodes whole
+    /// chunks into a shared cache. The server warns when the cache cannot hold
+    /// one per stream, since the streams would then evict each other.
+    fn decoded_chunk_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Strip the leading and trailing slashes of a path.
