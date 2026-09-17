@@ -12,9 +12,9 @@
 //! received on any connection, in any order, and still land in the right place.
 //!
 //! A selection that is one run of bytes in the source is served with a single
-//! read. Anything else is gathered element by element in output order, which is
-//! correct for every selection numpy accepts; reading strided selections in
-//! spans rather than elements comes with the parallel transfer path.
+//! read. Anything else is gathered in output order, reading nearby runs as one
+//! span: a read is a syscall, and a strided selection would otherwise cost one
+//! per element.
 
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
@@ -708,9 +708,6 @@ impl Gathered {
 
     /// Call `f(source element, count)` for each run of consecutive source
     /// elements behind output elements `[first, first + count)`, in order.
-    ///
-    // ponytail: a strided row yields one run per element, so one read each;
-    // reading the row's span once and picking from it is the upgrade.
     fn for_each_run(
         &self,
         first: u64,
@@ -789,19 +786,118 @@ impl Gathered {
             &mut aside
         };
 
-        let mut pos = 0usize;
+        // Runs close together in the source are read as one span, then cut
+        // out of it by walking the same runs again.
+        // ponytail: the walk is per element (~600 MiB/s for every other f32);
+        // copying a strided innermost dimension in one loop is the upgrade.
+        let mut span: Option<Span> = None;
+        let mut next = first;
         self.for_each_run(first, count, |element, len| {
-            let bytes = (len * itemsize) as usize;
-            read_src(element * itemsize, &mut out[pos..pos + bytes])?;
-            pos += bytes;
+            let joined = span
+                .as_mut()
+                .is_some_and(|w| w.join(element, len, itemsize));
+            if !joined {
+                if let Some(w) = span.take() {
+                    self.read_span(&w, first, itemsize, out, &mut read_src)?;
+                }
+                span = Some(Span::new(element, len, next));
+            }
+            next += len;
             Ok(())
         })?;
+        if let Some(w) = span {
+            self.read_span(&w, first, itemsize, out, &mut read_src)?;
+        }
 
         if !aligned {
             let len = dst.len();
             dst.copy_from_slice(&aside[skip..skip + len]);
         }
         Ok(())
+    }
+}
+
+/// Runs further apart than this are read separately: the bytes between them
+/// would cost more to read than the syscall they save.
+const SPAN_GAP_BYTES: u64 = 4096;
+
+/// Ceiling on one span read, which is also the scratch buffer it needs.
+const SPAN_MAX_BYTES: u64 = 1 << 20;
+
+thread_local! {
+    // Kept per thread so that a transfer in progress does not allocate.
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Source elements `[lo, hi)` holding output elements `[out_first, +out_count)`.
+struct Span {
+    lo: u64,
+    hi: u64,
+    out_first: u64,
+    out_count: u64,
+    runs: u32,
+}
+
+impl Span {
+    fn new(element: u64, len: u64, out_first: u64) -> Self {
+        Span {
+            lo: element,
+            hi: element + len,
+            out_first,
+            out_count: len,
+            runs: 1,
+        }
+    }
+
+    /// Take in the next run if it lies close enough, in either direction.
+    fn join(&mut self, element: u64, len: u64, itemsize: u64) -> bool {
+        let gap = SPAN_GAP_BYTES / itemsize;
+        let (lo, hi) = (self.lo.min(element), self.hi.max(element + len));
+        let near = element + len + gap >= self.lo && element <= self.hi + gap;
+        if !near || (hi - lo) * itemsize > SPAN_MAX_BYTES {
+            return false;
+        }
+        (self.lo, self.hi) = (lo, hi);
+        self.out_count += len;
+        self.runs += 1;
+        true
+    }
+}
+
+impl Gathered {
+    /// Read the elements of `span` into `out`, whose first element is output
+    /// element `out_base`.
+    fn read_span(
+        &self,
+        span: &Span,
+        out_base: u64,
+        itemsize: u64,
+        out: &mut [u8],
+        read_src: &mut impl FnMut(u64, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        let at = ((span.out_first - out_base) * itemsize) as usize;
+        let bytes = (span.out_count * itemsize) as usize;
+        if span.runs == 1 {
+            return read_src(span.lo * itemsize, &mut out[at..at + bytes]);
+        }
+
+        SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let len = ((span.hi - span.lo) * itemsize) as usize;
+            if scratch.len() < len {
+                scratch.resize(len, 0);
+            }
+            read_src(span.lo * itemsize, &mut scratch[..len])?;
+
+            let mut pos = at;
+            self.for_each_run(span.out_first, span.out_count, |element, count| {
+                let from = ((element - span.lo) * itemsize) as usize;
+                let n = (count * itemsize) as usize;
+                out[pos..pos + n].copy_from_slice(&scratch[from..from + n]);
+                pos += n;
+                Ok(())
+            })
+        })
     }
 }
 
@@ -1537,24 +1633,100 @@ mod tests {
         assert!(matches!(served.kind, LayoutKind::Contiguous { .. }));
     }
 
-    #[test]
-    fn consecutive_elements_are_read_together() {
-        // Two rows of a 2-d slice: one read per row, not per element.
-        let layout = layout(
-            &[4, 6],
-            DType::Uint8,
-            &[Index::range(1, 3), Index::range(2, 5)],
-        )
-        .expect("layout");
+    /// The `(offset, len)` of each source read behind reading all of a layout.
+    fn reads_of(layout: &SelectionLayout) -> Vec<(u64, usize)> {
         let mut reads = Vec::new();
-        let mut dst = vec![0u8; 6];
+        let mut dst = vec![0u8; layout.total_bytes as usize];
         layout
             .read_with(0, &mut dst, |at, buf| {
                 reads.push((at, buf.len()));
                 Ok(())
             })
             .expect("read");
-        assert_eq!(reads, vec![(8, 3), (14, 3)]);
+        reads
+    }
+
+    #[test]
+    fn nearby_elements_are_read_together() {
+        // Two rows of a 2-d slice, three bytes apart: one read covers both.
+        let rows = layout(
+            &[4, 6],
+            DType::Uint8,
+            &[Index::range(1, 3), Index::range(2, 5)],
+        )
+        .expect("layout");
+        assert_eq!(reads_of(&rows), vec![(8, 9)]);
+
+        // Every other element of a large array: one read per span, not per
+        // element.
+        let strided = layout(
+            &[1 << 22],
+            DType::Uint32,
+            &[Index::Slice {
+                start: None,
+                stop: None,
+                step: Some(2),
+            }],
+        )
+        .expect("layout");
+        let reads = reads_of(&strided);
+        assert_eq!(reads.len(), 16, "16 MiB of source in 1 MiB spans");
+        assert!(reads.iter().all(|(_, len)| *len as u64 <= SPAN_MAX_BYTES));
+
+        // Elements far apart are not worth the bytes between them.
+        let sparse =
+            layout(&[1 << 20], DType::Uint8, &[Index::Fancy(vec![0, 100_000])]).expect("layout");
+        assert_eq!(reads_of(&sparse), vec![(0, 1), (100_000, 1)]);
+    }
+
+    #[test]
+    fn span_reads_match_numpy_on_a_large_array() {
+        // Wide enough that spans are cut by both limits, in both directions.
+        let shape = [300u64, 5000];
+        let at = |r: u64, c: u64| (r * shape[1] + c) as u32;
+        let every = |step: i64| Index::Slice {
+            start: None,
+            stop: None,
+            step: Some(step),
+        };
+        let rows = [299u64, 0, 1, 150, 151, 7];
+        type Case = (Vec<Index>, Vec<u32>);
+        let cases: Vec<Case> = vec![
+            (
+                vec![every(2), every(3)],
+                (0..300)
+                    .step_by(2)
+                    .flat_map(|r| (0..5000).step_by(3).map(move |c| at(r, c)))
+                    .collect(),
+            ),
+            (
+                vec![Index::full(), every(-7)],
+                (0..300)
+                    .flat_map(|r| (0..5000).rev().step_by(7).map(move |c| at(r, c)))
+                    .collect(),
+            ),
+            (
+                vec![
+                    Index::Fancy(rows.iter().map(|&r| r as i64).collect()),
+                    every(2),
+                ],
+                rows.iter()
+                    .flat_map(|&r| (0..5000).step_by(2).map(move |c| at(r, c)))
+                    .collect(),
+            ),
+        ];
+        for (indices, expected) in cases {
+            let layout = layout(&shape, DType::Uint32, &indices).expect("layout");
+            let expected: Vec<u8> = expected.iter().flat_map(|v| v.to_le_bytes()).collect();
+            for chunk in [layout.total_bytes, 1 << 20, 65_537] {
+                let mut joined = Vec::new();
+                for offset in (0..layout.total_bytes).step_by(chunk as usize) {
+                    let len = chunk.min(layout.total_bytes - offset);
+                    joined.extend(read_indices(&layout, offset, len));
+                }
+                assert!(joined == expected, "{indices:?} in chunks of {chunk}");
+            }
+        }
     }
 
     #[test]
