@@ -1,0 +1,12 @@
+# Baseline server on aex2-eval1. Other settings get their own file and ports
+# so they can run beside this one.
+[server]
+control_addr = "0.0.0.0:50191"
+data_addr = "0.0.0.0:50192"
+enable_null_backend = true
+
+[server.limits]
+max_streams_per_session = 32
+
+[server.paths]
+roots = ["/mnt/aexram", "/home/mdxuser/disk"]

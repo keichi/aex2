@@ -1,0 +1,15 @@
+# The aex.toml server with one thread per connection, on its own ports so both
+# can run side by side.
+[server]
+control_addr = "0.0.0.0:50291"
+data_addr = "0.0.0.0:50292"
+enable_null_backend = true
+
+[server.limits]
+max_streams_per_session = 32
+
+[server.paths]
+roots = ["/mnt/aexram", "/home/mdxuser/disk"]
+
+[server.transfer]
+read_buffers = 1

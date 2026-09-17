@@ -38,7 +38,7 @@ M6 での既定値の決定は、「共有プールを作る」ではなく
 | `pool --readers P` | 接続数 + P | 提案。接続ごとにバッファ 3 枚 |
 
 プロトコル処理 (FETCH の解釈、チケット検証、クライアントの受信) は含まない。
-値は中央値 (MiB/s)。環境は [VM 間の測定](benchmark-vm.md#測定環境) と同じ。
+値は中央値 (MiB/s)。環境は [mdx2 の測定](benchmark-mdx2.md#測定環境) と同じ。
 
 ```console
 $ poolbench sink                                               # eval-2

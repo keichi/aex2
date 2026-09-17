@@ -38,7 +38,7 @@ protobuf のデコードと `bytearray` への再コピーが入るためであ�
 
 ## VM (mdx2)
 
-[benchmark-vm.md](benchmark-vm.md) と同じ VM 2 台で、VM 内ループバックと VM 間を測った。
+[benchmark-mdx2.md](benchmark-mdx2.md) と同じ VM 2 台で、VM 内ループバックと VM 間を測った。
 測定日 2026-09-17。
 
 ### 条件
@@ -68,7 +68,7 @@ protobuf のデコードと `bytearray` への再コピーが入るためであ�
   Sapphire Rapids の vCPU では M4 より遅いためと見ているが、プロファイルは取っていない
 - **v2 の VM 間は 1.87 GiB/s**で、ワイヤの上限 (iPerf3 1 ストリーム 3,221 MiB/s) の 58 %。
   律速は前回の測定どおりサーバの送りスレッド 1 本と、チャンクごとの往復である
-  ([benchmark-vm.md](benchmark-vm.md))。どちらも M4 (並列接続・credit) の対象
+  ([benchmark-mdx2.md](benchmark-mdx2.md))。どちらも M4 (並列接続・credit) の対象
 - 10 MiB は 1 回が 4〜14 ms と短く、初回のばらつき (接続の立ち上がり) が平均に入っている
 
 ### Python 層のコスト

@@ -34,7 +34,7 @@ M4 で、1 クライアントが複数のデータ接続を張り、チャンク
 
 - **Mac**: Apple M4 (10 コア)、メモリ 32 GiB、macOS。ループバック。
   4 GiB の `.npy` はページキャッシュ上
-- **VM**: [VM 間の測定](benchmark-vm.md#測定環境) と同じ 2 台 (mdx2、16 vCPU、MTU 1442)。
+- **VM**: [mdx2 の測定](benchmark-mdx2.md#測定環境) と同じ 2 台 (mdx2、16 vCPU、MTU 1442)。
   サーバ `aex2-eval-1`、クライアント `aex2-eval-2`。`.npy` は tmpfs 上の 4 GiB。
   sysctl は既定値 (`net.core.wmem_max = 212992`)
 
@@ -49,6 +49,9 @@ M4 で、1 クライアントが複数のデータ接続を張り、チャンク
 
 中央値、n = 5。この VM は同条件でも測定ごとの振れが大きい (4 本で `read_buffers = 1`
 が `read_buffers = 3` を下回っているのはその範囲である)。
+
+サーバ設定は `benchmarks/mdx2/aex.toml` (50191) と `benchmarks/mdx2/aex-read-buffers-1.toml` (50291)。
+手順は [eval-mdx2.md](eval-mdx2.md)。
 
 ```console
 # クライアント側
@@ -74,7 +77,7 @@ $ target/release/aexbench http://192.168.100.207:50291 mem.npy \
 8 本で止まる。** 合成バックエンド (読みがない) と `read_buffers = 1` の `.npy` がほぼ同じ
 値になるので、16 本の `read_buffers = 1` は tmpfs からの読みにも律速されていない。
 
-[VM 間の測定](benchmark-vm.md#ダブルバッファリングが効かない) では、1 本でも
+[VM 間の測定](benchmark-mdx2.md#ダブルバッファリングが効かない) では、1 本でも
 ダブルバッファリングは速度で引き分け、CPU は 29 % 増えるという結果だった。接続数が
 増えるとスレッドが 2 倍になる分だけ vCPU を奪い合い、それが速度の差として出る。
 
@@ -90,7 +93,7 @@ $ target/release/aexbench http://192.168.100.207:50291 mem.npy \
 | 1 MiB | 8 | 10,272 | 15,086 | 15,288 |
 
 credit 1 は M3 までの動作 (`FETCH` を 1 つ書いて `DATA` を待ち切る) と同じである。
-[VM 間の測定](benchmark-vm.md#チャンクサイズが-3-倍を持っていく) で 256 KiB が
+[VM 間の測定](benchmark-mdx2.md#チャンクサイズが-3-倍を持っていく) で 256 KiB が
 16 MiB の 3 分の 1 しか出なかった原因の往復費用は、credit 16 でほぼ埋まる
 (同じサーバで 256 KiB・credit 16 が 2,294 MiB/s、16 MiB・credit 4 が 2,423 MiB/s)。
 
