@@ -219,6 +219,8 @@ aex2/
 
 v1 の `aex.proto` を土台に、**データ転送 RPC を「転送計画の発行」に置き換える**。ファイル操作系はほぼそのまま維持する。
 
+コントロールプレーンの TCP 接続は、サーバ・クライアントとも **`TCP_NODELAY` を必ず有効にする**。ここを流れるのは小さい要求と MSS に満たない応答の往復ばかりで、Nagle が最後の断片を握ると相手の遅延 ACK (40 ms) まで出ない。inline 返却される小さい選択 (§5.6.2) はこの 1 往復がそのまま応答時間になるため、影響が最も大きい。gRPC ライブラリに listener や connector を自前で渡す場合は、ライブラリ側の TCP 設定が適用されない点に注意する。データプレーンの `tcp.nodelay` (§6.7) はベンチマークで掃引するための設定項目だが、**コントロールプレーン側は設定項目にしない**。掃引がコントロールプレーンの応答時間まで動かしてしまうと、測っているものが分からなくなるためである。
+
 ### 5.1 サービス定義
 
 ```proto
@@ -818,7 +820,7 @@ ScatterBuffer { ptr, len }  ← 複数スレッドが非重複領域に書くた
 
 | 設定 | 値 | 理由 |
 |------|-----|------|
-| `TCP_NODELAY` | on | 小さい `FETCH` フレームが Nagle で遅延するのを防ぐ |
+| `TCP_NODELAY` | on (設定可能) | 小さい `FETCH` フレームが Nagle で遅延するのを防ぐ。コントロールプレーンは掃引対象外で常時 on (§5) |
 | `SO_SNDBUF` / `SO_RCVBUF` | 設定可能 (既定は OS 自動) | 高 BDP 環境では OS の自動調整上限 (`net.ipv4.tcp_rmem`) を超える必要がある。明示設定できる口を用意する |
 | `TCP_CONGESTION` | 設定可能 (Linux のみ) | WAN では BBR が有効な場合がある。研究上の比較対象として設定可能にする |
 | `SO_REUSEADDR` | on (サーバ) | 再起動時の TIME_WAIT 回避 |
@@ -1092,7 +1094,7 @@ inline_limit_bytes  = 65536     # これ以下の選択は TransferPlan に inli
 decode_cache_bytes  = 0         # 圧縮バックエンド用 LRU (第 7.4 節)。.npy のみの初版では未使用
 
 [server.tcp]
-nodelay    = true
+nodelay    = true               # データプレーンのみ。コントロールプレーンは常に有効 (§5)
 sndbuf     = 0                  # 0 = OS 既定
 congestion = ""                 # Linux のみ。例 "bbr"
 
