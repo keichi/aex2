@@ -1,0 +1,19 @@
+[package]
+name = "aex-py"
+description = "Python bindings for the AEX2 client (the aex._aex extension module)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "_aex"
+crate-type = ["cdylib"]
+
+[dependencies]
+aex-client.workspace = true
+half = { version = "2", default-features = false }
+numpy = { version = "0.29", features = ["half"] }
+# abi3: one wheel for every Python from 3.11 on.
+pyo3 = { version = "0.29", features = ["abi3-py311"] }

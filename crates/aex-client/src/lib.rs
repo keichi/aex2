@@ -13,8 +13,9 @@ pub mod error;
 pub mod pool;
 pub mod transfer;
 
-pub use aex_core::{DType, Index, QualitySpec};
+pub use aex_core::{DType, ErrorClass, Index, QualitySpec};
 pub use client::{Client, DatasetInfo, FileHandle, Item, SessionInfo, PROTOCOL_VERSION};
 pub use config::ClientConfig;
 pub use error::{ClientError, Result};
+pub use tonic::Code;
 pub use transfer::{ArrayData, Element, Plan, TransferResult, TypedArray};

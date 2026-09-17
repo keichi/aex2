@@ -6,6 +6,7 @@ members = [
     "crates/aex-wire",
     "crates/aex-server",
     "crates/aex-client",
+    "crates/aex-py",
     "benchmarks/rust",
     "tests/rust",
 ]

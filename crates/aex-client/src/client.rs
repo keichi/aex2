@@ -44,6 +44,12 @@ impl FileHandle {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// A handle that went out through [`FileHandle::as_u64`], such as one kept
+    /// by the Python layer.
+    pub fn from_u64(handle: u64) -> Self {
+        FileHandle(handle)
+    }
 }
 
 /// What lives at a path in a file.
