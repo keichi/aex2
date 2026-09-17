@@ -9,18 +9,23 @@
 //! slower in order to make a large one faster is the wrong trade for a system
 //! whose main complaint about v1 is latency.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aex_core::{ArrayDataset, ArrayFile, Codec, Item, NpyFile, NullFile, SelectionLayout};
+use aex_core::{
+    ArrayDataset, ArrayFile, Axis, Codec, Function, Item, NpyFile, NullFile, ReduceArgs,
+    SelectionLayout,
+};
 use aex_proto::aex_control_server::AexControl;
 use aex_proto::convert::{indices_from_proto, quality_from_proto, quality_to_proto};
+use aex_proto::function_argument::Value;
 use aex_proto::transfer_plan_or_error;
 use aex_proto::{
     ApplyFunctionReply, ApplyFunctionRequest, CloseFileReply, CloseFileRequest, ConnectReply,
-    ConnectRequest, DataEndpoint, Dataset, DisconnectReply, DisconnectRequest, GetItemRequest,
-    Group, ItemList, ListChildrenRequest, OpenFileReply, OpenFileRequest, PlanError,
-    PrepareSelectionRequest, PrepareSelectionsRequest, TransferPlan, TransferPlanList,
+    ConnectRequest, DataEndpoint, Dataset, DisconnectReply, DisconnectRequest, FunctionArgument,
+    GetItemRequest, Group, ItemList, ListChildrenRequest, OpenFileReply, OpenFileRequest,
+    PlanError, PrepareSelectionRequest, PrepareSelectionsRequest, TransferPlan, TransferPlanList,
     TransferPlanOrError,
 };
 use tonic::{Request, Response, Status};
@@ -354,21 +359,68 @@ impl AexControl for ControlService {
 
     async fn apply_function(
         &self,
-        _request: Request<ApplyFunctionRequest>,
+        request: Request<ApplyFunctionRequest>,
     ) -> std::result::Result<Response<ApplyFunctionReply>, Status> {
-        Err(not_implemented_yet(
-            "ApplyFunction",
-            "server-side reductions",
-        ))
+        let request = request.into_inner();
+        let session = self.sessions.get(&request.session_id)?;
+        let file = session.files().get(request.handle)?;
+        let Item::Dataset(dataset) = file.get_item(&request.name).map_err(ServerError::from)?
+        else {
+            return Err(ServerError::BadRequest(format!(
+                "{:?} is a group; only a dataset can be reduced",
+                request.name
+            ))
+            .into());
+        };
+        let function = Function::from_name(&request.function_name).ok_or_else(|| {
+            ServerError::BadRequest(format!(
+                "{:?} is not a function this server computes",
+                request.function_name
+            ))
+        })?;
+        let args = reduce_args(&request.kwargs)?;
+        let indices = indices_from_proto(&request.indices, self.config.limits.max_fancy_indices)
+            .map_err(ServerError::from)?;
+        let layout = dataset
+            .layout(&indices, &aex_core::QualitySpec::exact())
+            .map_err(ServerError::from)?;
+        let limit = self.config.transfer.inline_limit_bytes;
+
+        // Reading the whole selection takes a while; keep it off the threads
+        // that answer the other calls.
+        let reduced = tokio::task::spawn_blocking(move || {
+            aex_core::reduce(&*dataset, &layout, function, &args, limit)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("the reduction did not finish: {e}")))?
+        .map_err(ServerError::from)?;
+
+        Ok(Response::new(ApplyFunctionReply {
+            dtype: reduced.dtype.as_i32(),
+            shape: shape_to_proto(&reduced.shape)?,
+            data: reduced.data,
+            plan: None,
+        }))
     }
 }
 
-/// Says what the RPC is waiting on, so that a client hitting one during
-/// development is not left wondering whether it misdialled.
-fn not_implemented_yet(rpc: &str, what: &str) -> Status {
-    Status::unimplemented(format!(
-        "{rpc} is part of {what}, which this server does not serve yet"
-    ))
+/// numpy's keyword arguments to a reduction, as far as this server takes them.
+fn reduce_args(kwargs: &HashMap<String, FunctionArgument>) -> Result<ReduceArgs> {
+    let mut args = ReduceArgs::default();
+    for (name, value) in kwargs {
+        let bad = || ServerError::BadRequest(format!("{name}={value:?} is not supported"));
+        let value = value.value.as_ref().ok_or_else(bad)?;
+        match (name.as_str(), value) {
+            ("axis", Value::NoneValue(_)) => args.axis = Axis::All,
+            ("axis", Value::IntValue(a)) => args.axis = Axis::One(*a),
+            ("axis", Value::TupleInt(t)) => args.axis = Axis::Many(t.values.clone()),
+            ("keepdims", Value::BoolValue(k)) => args.keepdims = *k,
+            ("ddof", Value::IntValue(d)) => args.ddof = *d,
+            ("ddof", Value::FloatValue(d)) if d.fract() == 0.0 => args.ddof = *d as i64,
+            _ => return Err(bad()),
+        }
+    }
+    Ok(args)
 }
 
 /// Assemble the reply, whichever way the selection is being answered.
@@ -590,6 +642,35 @@ mod tests {
             "npy"
         );
         assert!(format_from_extension(std::path::Path::new("/data/noext")).is_err());
+    }
+
+    #[test]
+    fn reduction_arguments_come_off_the_wire() {
+        let arg = |value| FunctionArgument { value: Some(value) };
+        let kwargs = HashMap::from([
+            (
+                "axis".to_string(),
+                arg(Value::TupleInt(aex_proto::IntTuple {
+                    values: vec![0, -1],
+                })),
+            ),
+            ("keepdims".to_string(), arg(Value::BoolValue(true))),
+            ("ddof".to_string(), arg(Value::FloatValue(1.0))),
+        ]);
+        let args = reduce_args(&kwargs).unwrap();
+        assert_eq!(args.axis, Axis::Many(vec![0, -1]));
+        assert!(args.keepdims);
+        assert_eq!(args.ddof, 1);
+
+        for (name, value) in [
+            ("out", Value::NoneValue(true)),
+            ("ddof", Value::FloatValue(0.5)),
+            ("keepdims", Value::IntValue(1)),
+        ] {
+            let kwargs = HashMap::from([(name.to_string(), arg(value))]);
+            let err = reduce_args(&kwargs).unwrap_err();
+            assert_eq!(err.class(), aex_core::ErrorClass::Request, "{name}");
+        }
     }
 
     #[test]

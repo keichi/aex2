@@ -7,6 +7,8 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+# float16 elements, for reductions.
+half = "2"
 # Keep default-features off: npyz's complex / half features are only needed by
 # its data-reading API, not by header parsing.
 npyz.workspace = true
@@ -21,6 +23,5 @@ hdf5 = ["dep:flate2", "dep:hdf5", "dep:hdf5-sys"]
 
 [dev-dependencies]
 # Element types the HDF5 tests write.
-half = "2"
 num-complex = "0.4"
 tempfile.workspace = true

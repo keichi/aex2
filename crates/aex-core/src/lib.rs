@@ -13,6 +13,7 @@ pub mod backends;
 pub mod dtype;
 pub mod error;
 pub mod quality;
+pub mod reduce;
 pub mod selection;
 
 pub use backend::{ArrayDataset, ArrayFile, Item};
@@ -25,4 +26,5 @@ pub use backends::null::{NullDataset, NullFile};
 pub use dtype::{DType, ALL_DTYPES};
 pub use error::{AexError, ErrorClass, Result};
 pub use quality::{Codec, Encoding, QualitySpec};
+pub use reduce::{reduce, Axis, Function, ReduceArgs, Reduced};
 pub use selection::{AxisSel, Index, LayoutKind, SelectionLayout};

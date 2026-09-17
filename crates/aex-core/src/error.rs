@@ -90,6 +90,11 @@ pub enum AexError {
     #[error("unsupported selection: {0}")]
     UnsupportedSelection(String),
 
+    /// A reduction numpy would refuse too, or one whose result is too large
+    /// to send back.
+    #[error("{0}")]
+    BadFunction(String),
+
     /// No item at this path in the file.
     #[error("no such item: {0}")]
     NotFound(String),
@@ -123,6 +128,7 @@ impl AexError {
             | AexError::UnsupportedHdf5(_)
             | AexError::BadSelection(_)
             | AexError::UnsupportedSelection(_)
+            | AexError::BadFunction(_)
             | AexError::NotFound(_)
             | AexError::NotAGroup(_)
             | AexError::OutOfRange { .. } => ErrorClass::Request,
