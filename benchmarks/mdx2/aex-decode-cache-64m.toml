@@ -1,0 +1,14 @@
+# Like aex.toml, with room for only 16 decoded chunks of 4 MiB: one per stream
+# at most, so reading a compressed file decodes every chunk on every run.
+[server]
+control_addr = "0.0.0.0:50391"
+data_addr = "0.0.0.0:50392"
+
+[server.limits]
+max_streams_per_session = 32
+
+[server.transfer]
+decode_cache_bytes = 67108864
+
+[server.paths]
+roots = ["/mnt/aexram", "/home/mdxuser/disk"]

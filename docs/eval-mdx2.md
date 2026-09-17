@@ -142,13 +142,14 @@ $ ssh aex2-eval1 "bash -lc 'cd aex2 && cargo clippy --all-targets --all-features
 |---|---|---|
 | `aex.toml` | 50191 / 50192 | 基準 (`read_buffers` は既定の 3) |
 | `aex-read-buffers-1.toml` | 50291 / 50292 | `read_buffers = 1` |
+| `aex-decode-cache-64m.toml` | 50391 / 50392 | `decode_cache_bytes` を 64 MiB に。圧縮 HDF5 を毎回伸長させる |
 
 ```console
-$ for c in aex aex-read-buffers-1; do
+$ for c in aex aex-read-buffers-1 aex-decode-cache-64m; do
     ssh aex2-eval1 "cd aex2; mkdir -p ~/logs; setsid nohup target/release/aex-server \
       --config benchmarks/mdx2/$c.toml > ~/logs/$c.log 2>&1 < /dev/null &"
   done
-$ sleep 1; ssh aex2-eval1 'ss -ltn | grep -E ":50[0-9]9[12]"'   # 4 行出れば立ち上がっている
+$ sleep 1; ssh aex2-eval1 'ss -ltn | grep -E ":50[0-9]9[12]"'   # 2 行 × サーバ数出れば立ち上がっている
 $ ssh aex2-eval1 'pkill -x aex-server'                    # 止める
 ```
 
