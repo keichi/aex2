@@ -53,7 +53,7 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 - `tcp.congestion` は Linux でのみ適用する (他の OS では起動時に警告を出す)
 
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
-([M4: 並列ストリーム](docs/benchmark-m4.md)、[v1 との比較 (Mac・VM)](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
+([M4: 並列ストリーム](docs/benchmark-m4.md)、[共有読みプールの予備測定](docs/benchmark-read-pool.md)、[v1 との比較 (Mac・VM)](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
 [sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、VM 2 台を実ネットワークで
