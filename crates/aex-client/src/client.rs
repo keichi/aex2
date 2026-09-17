@@ -236,6 +236,7 @@ impl Client {
             session_id: as_16_bytes(&session.id, "session id")?,
             session_token: as_16_bytes(&session.token, "session token")?,
             nodelay: config.tcp_nodelay,
+            rcvbuf: config.rcvbuf,
             connect_timeout: config.connect_timeout,
         })?;
 

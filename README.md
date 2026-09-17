@@ -48,8 +48,7 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
   フェッチする。並列ストリーム・ワークスティーリング・credit パイプラインは未実装。
   なお localhost では単一接続で既にマシンの限界に達しており、接続を増やしても
   合計は増えない
-- `tcp.sndbuf` / `tcp.congestion` は設定を受け付けるがまだ適用しない
-  (起動時に警告を出す)
+- `tcp.congestion` は Linux でのみ適用する (他の OS では起動時に警告を出す)
 
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
 ([v1 との比較 (Mac・VM)](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、

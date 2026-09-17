@@ -12,7 +12,7 @@
 //! always correct, whichever connection it goes out on.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -21,6 +21,7 @@ use aex_wire::{
     read_frame_header, write_frame, ErrorPayload, FrameHeader, FrameType, Hello, Ready, Ticket,
     READY_LEN,
 };
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::error::{ClientError, Result};
 
@@ -40,6 +41,7 @@ pub struct ConnSettings {
     /// Never logged: it is what a connection proves itself with.
     pub session_token: [u8; 16],
     pub nodelay: bool,
+    pub rcvbuf: Option<usize>,
     pub connect_timeout: Duration,
 }
 
@@ -63,15 +65,13 @@ impl DataConn {
         let mut last = None;
         let stream = addrs
             .iter()
-            .find_map(
-                |addr| match TcpStream::connect_timeout(addr, settings.connect_timeout) {
-                    Ok(stream) => Some(stream),
-                    Err(e) => {
-                        last = Some(e);
-                        None
-                    }
-                },
-            )
+            .find_map(|addr| match dial(addr, settings) {
+                Ok(stream) => Some(stream),
+                Err(e) => {
+                    last = Some(e);
+                    None
+                }
+            })
             .ok_or_else(|| {
                 let reason = last.map(|e| e.to_string()).unwrap_or_else(|| {
                     format!("{}:{} resolved to no address", settings.host, settings.port)
@@ -210,6 +210,23 @@ impl DataConn {
             message: error.message,
         })
     }
+}
+
+/// Connect one socket, sizing its receive buffer first.
+///
+/// Before the connect, because the window scale is agreed in the SYN and a
+/// buffer enlarged afterwards cannot be advertised in full.
+fn dial(addr: &SocketAddr, settings: &ConnSettings) -> std::io::Result<TcpStream> {
+    let socket = Socket::new(
+        Domain::for_address(*addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if let Some(bytes) = settings.rcvbuf {
+        socket.set_recv_buffer_size(bytes)?;
+    }
+    socket.connect_timeout(&(*addr).into(), settings.connect_timeout)?;
+    Ok(socket.into())
 }
 
 /// The session's data connections.

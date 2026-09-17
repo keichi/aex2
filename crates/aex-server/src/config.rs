@@ -3,10 +3,8 @@
 //! Every knob has a default, so a server runs with nothing but `--root`. The
 //! TOML file mirrors the struct: `[server]`, `[server.limits]`, and so on.
 //!
-//! A few settings are read and validated before anything acts on them —
-//! `tcp.sndbuf` and `tcp.congestion` are, as of this release. Keeping the file
-//! format complete from the start means a deployment's config does not have to
-//! change under it, and the data plane warns about what it is not applying.
+//! `tcp.congestion` only takes effect on Linux; elsewhere the data plane warns
+//! that it is ignoring it.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

@@ -2,10 +2,6 @@
 //!
 //! Everything here can also be set from the environment, so that a benchmark
 //! sweep does not need a recompile between points.
-//!
-//! Only settings the client can act on are here. Credit, the receive buffer
-//! size and the congestion control algorithm arrive with the parallel transfer
-//! path they belong to, rather than sitting unused and looking as if they work.
 
 use std::time::Duration;
 
@@ -33,6 +29,9 @@ pub struct ClientConfig {
     /// Whether to disable Nagle on the data connections. A fetch is 48 bytes
     /// that a whole chunk is waiting on, so holding it back costs a round trip.
     pub tcp_nodelay: bool,
+    /// `SO_RCVBUF` for the data connections. `None` leaves the OS to tune it,
+    /// which caps the window below what a high bandwidth-delay link needs.
+    pub rcvbuf: Option<usize>,
 }
 
 impl Default for ClientConfig {
@@ -45,6 +44,7 @@ impl Default for ClientConfig {
             chunk_bytes: 0,
             max_retries: 3,
             tcp_nodelay: true,
+            rcvbuf: None,
         }
     }
 }
@@ -81,6 +81,9 @@ impl ClientConfig {
         }
         if let Some(nodelay) = lookup("AEX_TCP_NODELAY").and_then(|v| parse_bool(&v)) {
             self.tcp_nodelay = nodelay;
+        }
+        if let Some(bytes) = lookup("AEX_RCVBUF").and_then(|v| v.parse().ok()) {
+            self.rcvbuf = Some(bytes);
         }
         self
     }
@@ -120,6 +123,7 @@ mod tests {
         assert_eq!(config.chunk_bytes, 0);
         assert_eq!(config.max_retries, 3);
         assert!(config.tcp_nodelay);
+        assert_eq!(config.rcvbuf, None);
     }
 
     #[test]
@@ -129,9 +133,11 @@ mod tests {
             "AEX_CONNECT_TIMEOUT_MS" => Some("250".to_string()),
             "AEX_CHUNK_BYTES" => Some("262144".to_string()),
             "AEX_TCP_NODELAY" => Some("off".to_string()),
+            "AEX_RCVBUF" => Some("8388608".to_string()),
             _ => None,
         });
         assert_eq!(config.streams, 16);
+        assert_eq!(config.rcvbuf, Some(8 << 20));
         assert_eq!(config.connect_timeout, Duration::from_millis(250));
         assert_eq!(config.chunk_bytes, 256 * 1024);
         assert!(!config.tcp_nodelay);

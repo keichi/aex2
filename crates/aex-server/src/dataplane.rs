@@ -32,6 +32,7 @@ use aex_wire::{
     write_frame, ErrorPayload, FrameHeader, FrameType, Hello, Ready, Ticket, HEADER_LEN, HELLO_LEN,
     PROTOCOL_VERSION, TICKET_LEN,
 };
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::config::ServerConfig;
 use crate::error::{Result, ServerError};
@@ -85,15 +86,7 @@ impl DataPlane {
         sessions: Arc<SessionRegistry>,
         transfers: Arc<TransferRegistry>,
     ) -> Result<Self> {
-        if config.tcp.sndbuf != 0 || !config.tcp.congestion.is_empty() {
-            // Saying so beats leaving an operator to conclude from a benchmark
-            // that the setting made no difference.
-            tracing::warn!(
-                "tcp.sndbuf and tcp.congestion are not applied yet; only tcp.nodelay is"
-            );
-        }
-
-        let listener = TcpListener::bind(config.data_addr)?;
+        let listener = listen(&config)?;
         // The accept loop polls rather than blocking, so that it can be told to
         // stop without something else having to connect to wake it.
         listener.set_nonblocking(true)?;
@@ -224,6 +217,42 @@ fn serve_connection(mut stream: TcpStream, peer: SocketAddr, context: Arc<Contex
         Ok(()) => tracing::debug!(%peer, "data connection closed"),
         Err(e) => tracing::info!(%peer, "data connection ended: {e}"),
     }
+}
+
+/// Open the listening socket with the configured TCP options.
+///
+/// They are set on the listener because accepted sockets inherit them, and so
+/// that a congestion control algorithm the kernel lacks fails at startup rather
+/// than on every connection.
+fn listen(config: &ServerConfig) -> Result<TcpListener> {
+    let addr = config.data_addr;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    // A restarted server would otherwise wait out TIME_WAIT on its own port.
+    socket.set_reuse_address(true)?;
+    if config.tcp.sndbuf != 0 {
+        socket.set_send_buffer_size(config.tcp.sndbuf)?;
+    }
+    if !config.tcp.congestion.is_empty() {
+        set_congestion(&socket, &config.tcp.congestion)?;
+    }
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+#[cfg(target_os = "linux")]
+fn set_congestion(socket: &Socket, name: &str) -> Result<()> {
+    socket
+        .set_tcp_congestion(name.as_bytes())
+        .map_err(|e| ServerError::Config(format!("tcp.congestion {name:?} cannot be applied: {e}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_congestion(_socket: &Socket, name: &str) -> Result<()> {
+    // Saying so beats leaving an operator to conclude from a benchmark that the
+    // setting made no difference.
+    tracing::warn!("tcp.congestion {name:?} is ignored: it is only applied on Linux");
+    Ok(())
 }
 
 fn configure(stream: &TcpStream, config: &ServerConfig) -> io::Result<()> {
@@ -546,4 +575,42 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Hex for logs. Session ids are opaque, so they are shown as bytes.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(adjust: impl FnOnce(&mut ServerConfig)) -> ServerConfig {
+        let mut config = ServerConfig {
+            data_addr: "127.0.0.1:0".parse().unwrap(),
+            ..ServerConfig::default()
+        };
+        adjust(&mut config);
+        config
+    }
+
+    #[test]
+    fn the_send_buffer_is_applied_to_the_listener() {
+        let listener = listen(&config(|c| c.tcp.sndbuf = 4 << 20)).expect("listen");
+        let applied = socket2::SockRef::from(&listener)
+            .send_buffer_size()
+            .unwrap();
+        // The kernel may round it up (Linux doubles it), never down.
+        assert!(applied >= 4 << 20, "{applied}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unknown_congestion_algorithm_fails_at_startup() {
+        let err = listen(&config(|c| c.tcp.congestion = "no-such-cc".into())).unwrap_err();
+        assert!(matches!(err, ServerError::Config(_)), "{err}");
+    }
+
+    #[test]
+    fn a_restarted_server_can_take_its_port_straight_back() {
+        let listener = listen(&config(|_| {})).expect("listen");
+        let reuse = socket2::SockRef::from(&listener).reuse_address().unwrap();
+        assert!(reuse);
+    }
 }
