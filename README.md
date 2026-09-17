@@ -57,7 +57,8 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
 [sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、mdx2 の VM 2 台を実ネットワークで
-繋いだ測定は [docs/benchmark-mdx2.md](docs/benchmark-mdx2.md) にある。mdx2 での測り方の決まりごとは
+繋いだ測定は [docs/benchmark-mdx2.md](docs/benchmark-mdx2.md)、そこに遅延を足した測定は
+[docs/benchmark-delay.md](docs/benchmark-delay.md) にある。mdx2 での測り方の決まりごとは
 [docs/eval-mdx2.md](docs/eval-mdx2.md) にまとめた。
 
 macOS (M4) ではメモリ上のデータで単一接続 12,048 MiB/s (iPerf3 の 62 %)、Linux
