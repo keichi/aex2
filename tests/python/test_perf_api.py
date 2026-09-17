@@ -1,4 +1,4 @@
-"""The performance APIs: read_into, gather, stats."""
+"""The performance APIs: read_into, gather, get_async, stats."""
 
 import numpy as np
 import pytest
@@ -92,6 +92,33 @@ def test_gather_spans_several_batches(array_proxy):
 def test_gather_raises_the_first_failure(array_proxy):
     with pytest.raises(aex.AexValueError, match="500"):
         array_proxy.gather([np.s_[0], np.s_[500], np.s_[600]])
+
+
+# ============================================================
+# get_async
+# ============================================================
+
+
+def test_get_async_gives_what_indexing_would(array_proxy):
+    keys = [np.s_[i : i + 30] for i in range(0, 100, 10)]
+    futures = [array_proxy.get_async(key) for key in keys]
+    for key, future in zip(keys, futures, strict=True):
+        np.testing.assert_array_equal(future.result(timeout=30), expected_ds1()[key])
+
+
+def test_get_async_reports_failure_through_the_future(array_proxy):
+    future = array_proxy.get_async(np.s_[500])
+    with pytest.raises(aex.AexValueError):
+        future.result(timeout=30)
+
+
+def test_close_waits_for_pending_transfers(server, ds_paths):
+    client = aex.Client(server)
+    arr = client.open(ds_paths["ds1"])["array"]
+    futures = [arr.get_async(np.s_[:]) for _ in range(8)]
+    client.close()
+    for future in futures:
+        np.testing.assert_array_equal(future.result(timeout=0), expected_ds1())
 
 
 # ============================================================

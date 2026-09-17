@@ -3,13 +3,17 @@
 import operator
 import warnings
 from collections.abc import Callable, Iterator, Sequence
-from typing import Any, Literal, cast
+from concurrent.futures import Future
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import numpy.typing as npt
 
 from . import _aex
 from .errors import AexFallbackError, AexFallbackWarning
+
+if TYPE_CHECKING:
+    from .client import Client
 
 __all__ = ["ArrayProxy", "set_fallback_policy", "set_fallback_threshold"]
 
@@ -49,13 +53,14 @@ class ArrayProxy:
 
     def __init__(
         self,
-        native: _aex.Client,
+        client: "Client",
         handle: int,
         name: str,
         dtype: str,
         shape: tuple[int, ...],
     ) -> None:
-        self._native = native
+        self._client = client
+        self._native = client._native
         self.handle = handle
         self.name = name
         self.dtype = np.dtype(dtype)
@@ -102,6 +107,14 @@ class ArrayProxy:
         wire_key = _to_wire(key, self.shape)
         plan = self._native.prepare(self.handle, self.name, wire_key)
         self._native.fill(plan, self.handle, self.name, wire_key, out)
+
+    def get_async(self, key: Any) -> "Future[npt.NDArray[Any]]":
+        """Start transferring a selection and return at once.
+
+        The transfer runs on the client's worker threads; ``result()`` gives
+        what ``self[key]`` would have.
+        """
+        return self._client._submit(self.__getitem__, key)
 
     def gather(self, keys: Sequence[Any]) -> list[npt.NDArray[Any]]:
         """Transfer several selections, resolving them in one round trip.
