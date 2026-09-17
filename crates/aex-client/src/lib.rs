@@ -1,6 +1,6 @@
 //! The AEX2 Rust client.
 //!
-//! Usable on its own, and the layer the Python bindings will sit on in M3.
+//! Usable on its own, and the layer the Python bindings sit on.
 //! Keeping it separate from the bindings also lets a benchmark measure the
 //! transfer without Python in the picture.
 //!
@@ -17,4 +17,4 @@ pub use aex_core::{DType, Index, QualitySpec};
 pub use client::{Client, DatasetInfo, FileHandle, Item, SessionInfo, PROTOCOL_VERSION};
 pub use config::ClientConfig;
 pub use error::{ClientError, Result};
-pub use transfer::{ArrayData, Element, TransferResult, TypedArray};
+pub use transfer::{ArrayData, Element, Plan, TransferResult, TypedArray};

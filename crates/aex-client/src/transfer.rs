@@ -15,20 +15,36 @@ use aex_wire::{Ticket, TICKET_LEN};
 use crate::error::{ClientError, Result};
 
 /// A resolved selection, ready to fetch.
-#[derive(Debug, Clone)]
-pub(crate) struct Plan {
+///
+/// The dtype and shape are the server's answer, so a caller sizes its buffer
+/// from them rather than working the selection out a second time.
+#[derive(Clone)]
+pub struct Plan {
     /// 0 when the data came back inline and there is nothing to fetch.
-    pub request_id: u32,
-    pub ticket: Ticket,
+    pub(crate) request_id: u32,
+    pub(crate) ticket: Ticket,
     pub dtype: DType,
     pub shape: Vec<u64>,
     pub total_bytes: u64,
-    pub inline_data: Vec<u8>,
+    pub(crate) inline_data: Vec<u8>,
+}
+
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The ticket is a capability and the inline data can be large.
+        f.debug_struct("Plan")
+            .field("request_id", &self.request_id)
+            .field("dtype", &self.dtype)
+            .field("shape", &self.shape)
+            .field("total_bytes", &self.total_bytes)
+            .field("inline", &self.is_inline())
+            .finish()
+    }
 }
 
 impl Plan {
     /// Read a plan off the wire.
-    pub fn from_proto(plan: aex_proto::TransferPlan) -> Result<Self> {
+    pub(crate) fn from_proto(plan: aex_proto::TransferPlan) -> Result<Self> {
         let dtype =
             DType::from_i32(plan.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
         let shape = plan
@@ -95,7 +111,7 @@ impl Plan {
     /// Each chunk is `(offset, len)` in the logical byte stream, which is also
     /// its position in the output buffer, so a chunk can be received on any
     /// connection and still land in the right place.
-    pub fn chunks(&self, chunk_bytes: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+    pub(crate) fn chunks(&self, chunk_bytes: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
         let chunk_bytes = chunk_bytes.max(1);
         (0..self.total_bytes)
             .step_by(chunk_bytes as usize)

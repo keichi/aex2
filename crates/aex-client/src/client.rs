@@ -324,14 +324,7 @@ impl Client {
         dst: &mut [u8],
     ) -> Result<TransferResult> {
         let plan = self.prepare(handle, name, indices)?;
-        if plan.total_bytes != dst.len() as u64 {
-            return Err(ClientError::BadRequest(format!(
-                "the selection is {} bytes and the buffer is {}",
-                plan.total_bytes,
-                dst.len()
-            )));
-        }
-        self.fill(plan, handle, name, indices, dst)
+        self.fill(&plan, handle, name, indices, dst)
     }
 
     /// Read a selection, allocating for it.
@@ -347,7 +340,7 @@ impl Client {
         let plan = self.prepare(handle, name, indices)?;
         let (dtype, shape) = (plan.dtype, plan.shape.clone());
         let mut bytes = vec![0u8; plan.total_bytes as usize];
-        let transfer = self.fill(plan, handle, name, indices, &mut bytes)?;
+        let transfer = self.fill(&plan, handle, name, indices, &mut bytes)?;
         Ok(ArrayData {
             dtype,
             shape,
@@ -383,7 +376,7 @@ impl Client {
         // form and the in-memory form are the same bytes.
         let dst =
             unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, total_bytes) };
-        let transfer = self.fill(plan, handle, name, indices, dst)?;
+        let transfer = self.fill(&plan, handle, name, indices, dst)?;
         Ok(TypedArray {
             shape,
             data,
@@ -391,8 +384,11 @@ impl Client {
         })
     }
 
-    /// Ask the server to resolve a selection.
-    fn prepare(&self, handle: FileHandle, name: &str, indices: &[Index]) -> Result<Plan> {
+    /// Ask the server to resolve a selection, in one round trip.
+    ///
+    /// The plan says what the result will be, so the caller can allocate for
+    /// it before [`Client::fill`].
+    pub fn prepare(&self, handle: FileHandle, name: &str, indices: &[Index]) -> Result<Plan> {
         // Checked here so that a selection too large to travel does not cost a
         // round trip to be told so.
         check_fancy_limit(indices, self.session.max_fancy_indices)
@@ -417,17 +413,25 @@ impl Client {
 
     /// Fill `dst` from a plan, preparing again once if the plan has gone.
     ///
-    /// A plan can be evicted while the client is still working through its
-    /// chunks. The client holds the selection, so it can just ask for another
-    /// one; twice in a row would mean something other than eviction.
-    fn fill(
+    /// `dst` has to be exactly `plan.total_bytes` long. The selection is taken
+    /// again because a plan can be evicted while the client is still working
+    /// through its chunks, and then the client just asks for another one;
+    /// twice in a row would mean something other than eviction.
+    pub fn fill(
         &self,
-        plan: Plan,
+        plan: &Plan,
         handle: FileHandle,
         name: &str,
         indices: &[Index],
         dst: &mut [u8],
     ) -> Result<TransferResult> {
+        if plan.total_bytes != dst.len() as u64 {
+            return Err(ClientError::BadRequest(format!(
+                "the selection is {} bytes and the buffer is {}",
+                plan.total_bytes,
+                dst.len()
+            )));
+        }
         let started = Instant::now();
 
         if plan.is_inline() {
@@ -442,7 +446,7 @@ impl Client {
             });
         }
 
-        let mut plan = plan;
+        let mut plan = plan.clone();
         let mut retries = 0;
         loop {
             match self.run_transfer(&plan, dst) {

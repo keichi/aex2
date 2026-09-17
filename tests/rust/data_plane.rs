@@ -465,6 +465,47 @@ fn reading_into_a_buffer_writes_exactly_that_buffer() {
 }
 
 #[test]
+fn a_plan_says_what_to_allocate_before_the_fill() {
+    let server = TestServer::start();
+    let expected = server.write_counting_npy("ocean.npy", &[500, 200]);
+    let client = server.connect();
+    let handle = client.open("ocean.npy").expect("open");
+
+    // One inline, one over the data plane.
+    for indices in [vec![Index::Single(3)], vec![Index::range(10, 400)]] {
+        let plan = client.prepare(handle, "array", &indices).expect("prepare");
+        assert_eq!(plan.dtype, aex_client::DType::Float32);
+        let mut bytes = vec![0u8; plan.total_bytes as usize];
+        client
+            .fill(&plan, handle, "array", &indices, &mut bytes)
+            .expect("fill");
+
+        let first = if plan.shape == [200] { 600 } else { 2000 };
+        assert_eq!(plan.shape.iter().product::<u64>() * 4, plan.total_bytes);
+        let values: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert!(
+            values == expected[first..first + values.len()],
+            "{indices:?}"
+        );
+
+        // A plan can be filled again, and only into a buffer of its length.
+        client
+            .fill(&plan, handle, "array", &indices, &mut bytes)
+            .expect("fill again");
+        let err = client
+            .fill(&plan, handle, "array", &indices, &mut bytes[1..])
+            .unwrap_err();
+        assert!(
+            matches!(err, aex_client::ClientError::BadRequest(_)),
+            "{err}"
+        );
+    }
+}
+
+#[test]
 fn reading_as_the_wrong_type_is_refused() {
     let server = TestServer::start();
     server.write_counting_npy("ocean.npy", &[500, 200]);
