@@ -7,6 +7,7 @@ exercise the same control plane and data plane a user would.
 import os
 import re
 import subprocess
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -59,6 +60,8 @@ def server(data_dir: Path) -> Iterator[str]:
     if address is None:
         proc.kill()
         pytest.fail("aex-server exited before it was listening")
+    # Keep reading, or the server blocks on a full pipe once it has logged enough.
+    threading.Thread(target=proc.stdout.read, daemon=True).start()
     try:
         yield address
     finally:
