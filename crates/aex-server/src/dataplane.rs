@@ -231,6 +231,14 @@ fn listen(config: &ServerConfig) -> Result<TcpListener> {
     socket.set_reuse_address(true)?;
     if config.tcp.sndbuf != 0 {
         socket.set_send_buffer_size(config.tcp.sndbuf)?;
+        // Linux silently caps it at net.core.wmem_max.
+        let applied = socket.send_buffer_size()?;
+        if applied < config.tcp.sndbuf {
+            tracing::warn!(
+                "tcp.sndbuf {} was capped at {applied} by the OS (net.core.wmem_max on Linux)",
+                config.tcp.sndbuf
+            );
+        }
     }
     if !config.tcp.congestion.is_empty() {
         set_congestion(&socket, &config.tcp.congestion)?;
@@ -592,12 +600,13 @@ mod tests {
 
     #[test]
     fn the_send_buffer_is_applied_to_the_listener() {
-        let listener = listen(&config(|c| c.tcp.sndbuf = 4 << 20)).expect("listen");
+        // Below Linux's default net.core.wmem_max, which would cap it.
+        let listener = listen(&config(|c| c.tcp.sndbuf = 100_000)).expect("listen");
         let applied = socket2::SockRef::from(&listener)
             .send_buffer_size()
             .unwrap();
-        // The kernel may round it up (Linux doubles it), never down.
-        assert!(applied >= 4 << 20, "{applied}");
+        // The kernel may round it up (Linux doubles it).
+        assert!(applied >= 100_000, "{applied}");
     }
 
     #[cfg(target_os = "linux")]
