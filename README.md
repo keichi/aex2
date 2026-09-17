@@ -11,9 +11,11 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 
 ## 状態
 
-**M3 (Python バインディング) まで実装済み。** Python と Rust の両方から `.npy` の
+**M4 (並列化と I/O 最適化) まで実装済み。** Python と Rust の両方から `.npy` の
 任意の選択を取得できる。実データは protobuf を一切通らず、カーネルから呼び出し側の
-バッファ (Python では `np.empty` した配列) へ直接読み込まれる。
+バッファ (Python では `np.empty` した配列) へ直接読み込まれる。1 クライアントが複数の
+データ接続を使い、VM 間の実ネットワークでは 16 接続で 1 接続の 8 倍 (163 Gbit/s) 出る
+([M4 の測定](docs/benchmark-m4.md))。
 
 - `aex-core` — `DType`、`ErrorClass` / `AexError`、選択の解決 (`Index` の正規化と
   `SelectionLayout`)、`ArrayFile` / `ArrayDataset` トレイト、`.npy` バックエンド
@@ -51,7 +53,7 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 - `tcp.congestion` は Linux でのみ適用する (他の OS では起動時に警告を出す)
 
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
-([v1 との比較 (Mac・VM)](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
+([M4: 並列ストリーム](docs/benchmark-m4.md)、[v1 との比較 (Mac・VM)](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
 [sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、VM 2 台を実ネットワークで

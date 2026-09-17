@@ -1601,7 +1601,7 @@ for impl in ["aex_v1", "aex_v2"]:
 | 適応品質 (キャスト / 間引き / 誤差上限) | 研究の核だが転送基盤が先 | `QualitySpec`、`TransferPlan` の dtype/shape (要求と実際の分離)、フレームヘッダの `encoding` | M6 以降 |
 | TLS | 「信頼できる環境」前提。暗号化すると受信側のゼロコピーが成立しなくなる | HELLO の `flags` にネゴシエーションビットを予約 | 公開運用を検討する時点 |
 | 書き込み (`DoPut` 相当) | read-only で研究目的は達成できる | フレーム種別の未使用値 (0x04、0x07 以降)。`FETCH` と対になる `PUSH` を追加可能 | 要望が出た時点 |
-| 密な選択に対する一括 pread + 集約 | 断片ごとの `pread` で syscall が律速するかが未測定。over-read バッファと上限・分割ロジックを測定前に抱えたくない (§6.5.2) | `read_range` の内部実装のみで閉じる。フレームプロトコルもトレイトも変更不要 | M4 の測定で syscall 律速と分かった時点 |
+| ~~密な選択に対する一括 pread + 集約~~ | M4 の測定で律速と判明し実装済み (隙間 4 KiB 以下の断片を最大 1 MiB の窓で一括読み)。[docs/benchmark-m4.md](docs/benchmark-m4.md) | — | — |
 | 大きい fancy 選択の効率的な送信 | `repeated int64` は 100 万要素で 8 MB になり gRPC 上限を超える。初版は `max_fancy_indices` で拒否する (§5.4) | `Index.kind` の oneof に新しい表現を追加できる (mask のビットマップ、差分 + varint、サーバ側述語評価) | 実利用で上限に当たった時点 |
 | 複数サーバ分散転送 | 広域分散の本丸だが基盤が先 | `ConnectReply.endpoints` (複数返却可能) | 適応品質の後 |
 | RDMA / io_uring | TCP で CPU 律速が残る場合の次の一手 | データプレーンはフレーム定義と実装が分離済み | ベンチで TCP が律速と判明した時点 |
