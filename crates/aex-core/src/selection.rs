@@ -11,10 +11,10 @@
 //! and every offset a frame carries is a position in it, so a chunk can be
 //! received on any connection, in any order, and still land in the right place.
 //!
-//! This release resolves only [`LayoutKind::Contiguous`] — selections that are
-//! one run of bytes in the source. Strided and fragmented layouts, and the
-//! O(1) seek into a fragment sequence they need, come with the parallel
-//! transfer path.
+//! A selection that is one run of bytes in the source is served with a single
+//! read. Anything else is gathered element by element in output order, which is
+//! correct for every selection numpy accepts; reading strided selections in
+//! spans rather than elements comes with the parallel transfer path.
 
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
@@ -473,10 +473,10 @@ fn resolve_slice(
 /// parallel transfer would gain nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutKind {
-    /// One run of bytes in the source. The fastest path, and the only one this
-    /// release resolves; `Strided` and `Fragmented` join it with the parallel
-    /// transfer path.
+    /// One run of bytes in the source. The fastest path.
     Contiguous { src_offset: u64, len: u64 },
+    /// Anything else, read in output order.
+    Gathered(Gathered),
 }
 
 /// A selection resolved into a logical byte stream.
@@ -511,7 +511,6 @@ impl SelectionLayout {
         }
 
         let resolved = resolve(shape, indices)?;
-        check_advanced(&resolved)?;
         let num_elements = resolved.num_elements();
         let total_bytes = num_elements.checked_mul(dtype.itemsize()).ok_or_else(|| {
             AexError::BadSelection(format!(
@@ -519,24 +518,47 @@ impl SelectionLayout {
             ))
         })?;
 
-        let Some((offset_elements, len_elements)) = contiguous_run(shape, &resolved.axes) else {
-            return Err(AexError::UnsupportedSelection(
-                "this selection is not one contiguous run of the source; strided and \
-                 fragmented layouts are not implemented yet"
-                    .to_string(),
-            ));
+        let run = if walks_independently(&resolved) {
+            contiguous_run(shape, &resolved.axes)
+        } else {
+            None
         };
-        debug_assert_eq!(len_elements, num_elements);
+        let kind = match run {
+            Some((offset_elements, len_elements)) => {
+                debug_assert_eq!(len_elements, num_elements);
+                LayoutKind::Contiguous {
+                    src_offset: offset_elements * dtype.itemsize(),
+                    len: total_bytes,
+                }
+            }
+            None => LayoutKind::Gathered(Gathered::new(shape, &resolved)?),
+        };
 
         Ok(SelectionLayout {
             out_shape: resolved.out_shape,
             dtype,
             total_bytes,
-            kind: LayoutKind::Contiguous {
-                src_offset: offset_elements * dtype.itemsize(),
-                len: total_bytes,
-            },
+            kind,
         })
+    }
+
+    /// Read `[offset, offset + dst.len())` of the logical byte stream.
+    ///
+    /// `read_src` reads the source array's own bytes at a byte offset; this
+    /// decides which of them go where, so a backend only has to know storage.
+    pub fn read_with(
+        &self,
+        offset: u64,
+        dst: &mut [u8],
+        mut read_src: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.check_range(offset, dst.len() as u64)?;
+        match &self.kind {
+            LayoutKind::Contiguous { src_offset, .. } => read_src(src_offset + offset, dst),
+            LayoutKind::Gathered(gathered) => {
+                gathered.read(self.dtype.itemsize(), offset, dst, read_src)
+            }
+        }
     }
 
     /// Reject a range that falls outside the logical byte stream.
@@ -553,38 +575,234 @@ impl SelectionLayout {
     }
 }
 
-/// Refuse an advanced group this release cannot lay out.
+/// Whether walking the axes independently visits what numpy selects.
 ///
-/// The axes of a group are walked in step, and [`contiguous_run`] walks them
-/// independently. The two agree only when at most one of them takes more than
-/// one index, and when the group's dimension has not been moved to the front —
-/// otherwise the result is a different set of elements, or the same elements in
-/// a different order, and serving it would be worse than refusing it.
-fn check_advanced(resolved: &ResolvedSelection) -> Result<()> {
+/// The axes of an advanced group are walked in step, and [`contiguous_run`]
+/// walks them independently. The two agree only when at most one of them takes
+/// more than one index, and when the group's dimension has not been moved to
+/// the front.
+fn walks_independently(resolved: &ResolvedSelection) -> bool {
     let Some(advanced) = &resolved.advanced else {
-        return Ok(());
+        return true;
     };
-
-    if !advanced.adjacent {
-        return Err(AexError::UnsupportedSelection(
-            "an index array separated from another index by a slice reorders the result, \
-             which is not implemented yet"
-                .to_string(),
-        ));
-    }
-    let walked: usize = advanced
+    let walked = advanced
         .axes
         .iter()
         .filter(|&&axis| resolved.axes[axis].len() > 1)
         .count();
-    if walked > 1 {
-        return Err(AexError::UnsupportedSelection(
-            "advanced indexing over more than one axis picks elements pairwise rather than \
-             as a grid, which is not implemented yet"
-                .to_string(),
-        ));
+    advanced.adjacent && walked <= 1
+}
+
+/// A selection that is not one run, as a walk over its output dimensions.
+///
+/// The source element behind an output position is `base` plus one term per
+/// dimension, so any position can be reached without walking up to it. Output
+/// dimensions of length 1 add a constant and are folded into `base`, which is
+/// also where `NewAxis` and plain integers go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gathered {
+    /// Source element of the first output element.
+    base: u64,
+    /// Output dimensions longer than 1, in output order.
+    dims: Vec<Dim>,
+}
+
+/// What one output dimension adds to the source element as its index moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Dim {
+    /// `k * step` source elements. `step` may be negative.
+    Stride { len: u64, step: i64 },
+    /// `offsets[k]` source elements: one index array, or several walked in
+    /// step, already multiplied out.
+    List(Vec<u64>),
+}
+
+impl Dim {
+    fn len(&self) -> u64 {
+        match self {
+            Dim::Stride { len, .. } => *len,
+            Dim::List(offsets) => offsets.len() as u64,
+        }
     }
-    Ok(())
+
+    /// The term for index `k`. Wrapping, because a negative stride only lands
+    /// on a valid element once the other terms are added.
+    fn term(&self, k: u64) -> u64 {
+        match self {
+            Dim::Stride { step, .. } => k.wrapping_mul(*step as u64),
+            Dim::List(offsets) => offsets[k as usize],
+        }
+    }
+}
+
+impl Gathered {
+    fn new(shape: &[u64], resolved: &ResolvedSelection) -> Result<Self> {
+        let too_large = || {
+            AexError::BadSelection(format!(
+                "an array of shape {shape:?} has more elements than an offset can address"
+            ))
+        };
+        // Source elements per step along each axis, in C order.
+        let mut strides = vec![1u64; shape.len()];
+        for axis in (0..shape.len().saturating_sub(1)).rev() {
+            strides[axis] = strides[axis + 1]
+                .checked_mul(shape[axis + 1])
+                .ok_or_else(too_large)?;
+        }
+
+        let group = resolved.advanced.as_ref();
+        let mut base = 0u64;
+        let mut dims = Vec::new();
+        let mut group_at = None;
+        for (axis, sel) in resolved.axes.iter().enumerate() {
+            let stride = strides[axis];
+            if group.is_some_and(|g| g.axes.contains(&axis)) {
+                group_at.get_or_insert(dims.len());
+                continue;
+            }
+            match sel {
+                AxisSel::Point(index) => base += index * stride,
+                AxisSel::Range { start, len, step } => {
+                    base += start * stride;
+                    if *len > 1 {
+                        let step = i64::try_from(stride)
+                            .ok()
+                            .and_then(|stride| stride.checked_mul(*step))
+                            .ok_or_else(too_large)?;
+                        dims.push(Dim::Stride { len: *len, step });
+                    }
+                }
+                AxisSel::Fancy(_) => unreachable!("an index array is always in the group"),
+            }
+        }
+
+        if let Some(group) = group {
+            // Position k takes the k-th index of every array, and the one index
+            // of a scalar or a length-1 array.
+            let mut offsets = vec![0u64; group.len as usize];
+            for &axis in &group.axes {
+                let stride = strides[axis];
+                match &resolved.axes[axis] {
+                    AxisSel::Point(index) => base += index * stride,
+                    AxisSel::Fancy(list) if list.len() == 1 => base += list[0] * stride,
+                    AxisSel::Fancy(list) => {
+                        for (offset, index) in offsets.iter_mut().zip(list) {
+                            *offset += index * stride;
+                        }
+                    }
+                    AxisSel::Range { .. } => unreachable!("a slice is never in the group"),
+                }
+            }
+            if group.len > 1 {
+                let at = if group.adjacent {
+                    group_at.unwrap_or(0)
+                } else {
+                    0
+                };
+                dims.insert(at, Dim::List(offsets));
+            }
+        }
+
+        Ok(Gathered { base, dims })
+    }
+
+    /// Call `f(source element, count)` for each run of consecutive source
+    /// elements behind output elements `[first, first + count)`, in order.
+    ///
+    // ponytail: a strided row yields one run per element, so one read each;
+    // reading the row's span once and picking from it is the upgrade.
+    fn for_each_run(
+        &self,
+        first: u64,
+        count: u64,
+        mut f: impl FnMut(u64, u64) -> Result<()>,
+    ) -> Result<()> {
+        let ndim = self.dims.len();
+
+        let mut index = vec![0u64; ndim];
+        let mut rest = first;
+        for (i, dim) in self.dims.iter().enumerate().rev() {
+            index[i] = rest % dim.len();
+            rest /= dim.len();
+        }
+
+        // prefix[i + 1] is the source element with the dimensions past i at 0.
+        let mut prefix = vec![self.base; ndim + 1];
+        let refresh = |prefix: &mut [u64], index: &[u64], from: usize| {
+            for i in from..ndim {
+                prefix[i + 1] = prefix[i].wrapping_add(self.dims[i].term(index[i]));
+            }
+        };
+        refresh(&mut prefix, &index, 0);
+
+        let mut run: Option<(u64, u64)> = None;
+        for _ in 0..count {
+            let element = prefix[ndim];
+            run = match run {
+                Some((start, len)) if start + len == element => Some((start, len + 1)),
+                Some((start, len)) => {
+                    f(start, len)?;
+                    Some((element, 1))
+                }
+                None => Some((element, 1)),
+            };
+
+            // Advance like an odometer, recomputing only what changed.
+            let mut i = ndim;
+            while i > 0 {
+                i -= 1;
+                index[i] += 1;
+                if index[i] < self.dims[i].len() {
+                    break;
+                }
+                index[i] = 0;
+            }
+            refresh(&mut prefix, &index, i);
+        }
+        match run {
+            Some((start, len)) => f(start, len),
+            None => Ok(()),
+        }
+    }
+
+    /// Fill `dst` with `[offset, offset + dst.len())` of the logical stream.
+    fn read(
+        &self,
+        itemsize: u64,
+        offset: u64,
+        dst: &mut [u8],
+        mut read_src: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        let end = offset + dst.len() as u64;
+        let first = offset / itemsize;
+        let count = end.div_ceil(itemsize) - first;
+
+        // A chunk need not start or end on an element boundary. Then whole
+        // elements are read aside and the requested bytes cut out of them.
+        let skip = (offset - first * itemsize) as usize;
+        let aligned = skip == 0 && end % itemsize == 0;
+        let mut aside = Vec::new();
+        let out: &mut [u8] = if aligned {
+            &mut *dst
+        } else {
+            aside.resize((count * itemsize) as usize, 0);
+            &mut aside
+        };
+
+        let mut pos = 0usize;
+        self.for_each_run(first, count, |element, len| {
+            let bytes = (len * itemsize) as usize;
+            read_src(element * itemsize, &mut out[pos..pos + bytes])?;
+            pos += bytes;
+            Ok(())
+        })?;
+
+        if !aligned {
+            let len = dst.len();
+            dst.copy_from_slice(&aside[skip..skip + len]);
+        }
+        Ok(())
+    }
 }
 
 /// The one run of source elements a selection covers, if it is one.
@@ -923,15 +1141,6 @@ mod tests {
     }
 
     #[test]
-    fn a_layout_this_release_cannot_serve_says_so() {
-        let err = layout(&[4, 3], DType::Uint8, &[Index::full(), Index::range(0, 2)])
-            .expect_err("strided is not implemented");
-        assert!(matches!(err, AexError::UnsupportedSelection(_)), "{err}");
-        // The client has to be able to tell this from a mistake of its own.
-        assert_eq!(err.class(), crate::ErrorClass::Request);
-    }
-
-    #[test]
     fn an_encoding_the_layout_cannot_apply_is_refused() {
         // The control plane resolves the fallback before it gets here, so a
         // quality this code cannot honour means the two disagree.
@@ -1146,36 +1355,168 @@ mod tests {
         resolve(&[4, 5], &[Index::Fancy(vec![0]), Index::Fancy(vec![1, 3])]).expect("broadcasts");
     }
 
+    /// Read `[offset, offset + len)` of a layout over a source whose elements
+    /// are their own flat index, as little-endian u32.
+    fn read_indices(layout: &SelectionLayout, offset: u64, len: u64) -> Vec<u8> {
+        let mut dst = vec![0u8; len as usize];
+        layout
+            .read_with(offset, &mut dst, |at, buf| {
+                for (i, byte) in buf.iter_mut().enumerate() {
+                    let pos = at + i as u64;
+                    *byte = ((pos / 4) as u32).to_le_bytes()[(pos % 4) as usize];
+                }
+                Ok(())
+            })
+            .expect("read");
+        dst
+    }
+
     #[test]
-    fn an_advanced_group_this_release_cannot_lay_out_is_refused() {
-        // Two axes walked in step pick elements pairwise; the layout walks axes
-        // independently, so serving this would return a different set.
-        let err = layout(
-            &[4, 5],
-            DType::Int8,
-            &[Index::Fancy(vec![0, 2]), Index::Fancy(vec![1, 3])],
-        )
-        .unwrap_err();
-        assert!(matches!(err, AexError::UnsupportedSelection(_)), "{err}");
+    fn a_gathered_selection_matches_numpy() {
+        // Every expectation here is what numpy returns for np.arange(n) of the
+        // same shape.
+        // Source shape, selection, result shape, result.
+        type Case = (&'static [u64], Vec<Index>, Vec<u64>, Vec<u32>);
+        let cases: Vec<Case> = vec![
+            (
+                &[4, 6],
+                vec![Index::range(1, 3), Index::range(2, 5)],
+                vec![2, 3],
+                vec![8, 9, 10, 14, 15, 16],
+            ),
+            (
+                &[4, 6],
+                vec![Index::Slice {
+                    start: None,
+                    stop: None,
+                    step: Some(2),
+                }],
+                vec![2, 6],
+                vec![0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17],
+            ),
+            (
+                &[4, 6],
+                vec![
+                    Index::full(),
+                    Index::Slice {
+                        start: None,
+                        stop: None,
+                        step: Some(-2),
+                    },
+                ],
+                vec![4, 3],
+                vec![5, 3, 1, 11, 9, 7, 17, 15, 13, 23, 21, 19],
+            ),
+            (
+                &[4, 6],
+                vec![Index::Fancy(vec![3, 0, 3])],
+                vec![3, 6],
+                vec![
+                    18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 18, 19, 20, 21, 22, 23,
+                ],
+            ),
+            (
+                &[4, 6],
+                vec![Index::full(), Index::Single(4)],
+                vec![4],
+                vec![4, 10, 16, 22],
+            ),
+            (
+                &[4, 6],
+                vec![Index::Fancy(vec![0, 2]), Index::Fancy(vec![1, 5])],
+                vec![2],
+                vec![1, 17],
+            ),
+            (
+                &[4, 6],
+                vec![Index::Fancy(vec![3]), Index::Fancy(vec![0, 1, 2])],
+                vec![3],
+                vec![18, 19, 20],
+            ),
+            (
+                &[4, 6],
+                vec![Index::NewAxis, Index::Fancy(vec![2, 1]), Index::NewAxis],
+                vec![1, 2, 1, 6],
+                vec![12, 13, 14, 15, 16, 17, 6, 7, 8, 9, 10, 11],
+            ),
+            (
+                &[3, 4, 5],
+                vec![
+                    Index::Fancy(vec![0, 2]),
+                    Index::full(),
+                    Index::Fancy(vec![4, 1]),
+                ],
+                vec![2, 4],
+                vec![4, 9, 14, 19, 41, 46, 51, 56],
+            ),
+            (
+                &[3, 4, 5],
+                vec![
+                    Index::Single(1),
+                    Index::range(1, 3),
+                    Index::Fancy(vec![0, 3]),
+                ],
+                vec![2, 2],
+                vec![25, 30, 28, 33],
+            ),
+            (
+                &[3, 4, 5],
+                vec![Index::Ellipsis, Index::Fancy(vec![1, 0])],
+                vec![3, 4, 2],
+                vec![
+                    1, 0, 6, 5, 11, 10, 16, 15, 21, 20, 26, 25, 31, 30, 36, 35, 41, 40, 46, 45, 51,
+                    50, 56, 55,
+                ],
+            ),
+            (
+                &[3, 4, 5],
+                vec![
+                    Index::Slice {
+                        start: None,
+                        stop: None,
+                        step: Some(-1),
+                    },
+                    Index::Fancy(vec![1, 2]),
+                    Index::Fancy(vec![0]),
+                ],
+                vec![3, 2],
+                vec![45, 50, 25, 30, 5, 10],
+            ),
+        ];
 
-        // A group split by a slice has its dimension moved to the front, which
-        // reorders the bytes.
-        let err = layout(
-            &[4, 5, 6],
-            DType::Int8,
-            &[Index::Single(0), Index::full(), Index::Fancy(vec![1, 2])],
-        )
-        .unwrap_err();
-        assert!(matches!(err, AexError::UnsupportedSelection(_)), "{err}");
+        for (shape, indices, shape_out, expected) in cases {
+            let layout = layout(shape, DType::Uint32, &indices)
+                .unwrap_or_else(|e| panic!("{indices:?}: {e}"));
+            assert_eq!(layout.out_shape, shape_out, "{indices:?}");
+            let expected: Vec<u8> = expected.iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert_eq!(layout.total_bytes, expected.len() as u64, "{indices:?}");
+            assert_eq!(
+                read_indices(&layout, 0, layout.total_bytes),
+                expected,
+                "{indices:?}"
+            );
 
-        // One axis of the group taking more than one index is fine: walking in
-        // step and walking independently agree, and the bytes are one run.
+            // Any cut of the stream, element boundary or not, reads the same.
+            for chunk in [1, 3, 4, 7] {
+                let mut joined = Vec::new();
+                for offset in (0..layout.total_bytes).step_by(chunk) {
+                    let len = (chunk as u64).min(layout.total_bytes - offset);
+                    joined.extend(read_indices(&layout, offset, len));
+                }
+                assert_eq!(joined, expected, "{indices:?} in chunks of {chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_selection_that_is_one_run_is_still_read_as_one() {
+        // One array and one integer side by side walk the same either way.
         let served = layout(
             &[4, 5],
             DType::Int8,
             &[Index::Single(1), Index::Fancy(vec![0, 1])],
         )
-        .expect("one array and one integer, side by side");
+        .expect("layout");
         assert_eq!(served.out_shape, vec![2]);
         assert_eq!(
             served.kind,
@@ -1185,7 +1526,7 @@ mod tests {
             }
         );
 
-        // And so is a group that only ever names one element.
+        // So does a group that only ever names one element.
         let served = layout(
             &[4, 5],
             DType::Int8,
@@ -1193,6 +1534,27 @@ mod tests {
         )
         .expect("both arrays hold one index");
         assert_eq!(served.out_shape, vec![1], "numpy gives (1,), not (1, 1)");
+        assert!(matches!(served.kind, LayoutKind::Contiguous { .. }));
+    }
+
+    #[test]
+    fn consecutive_elements_are_read_together() {
+        // Two rows of a 2-d slice: one read per row, not per element.
+        let layout = layout(
+            &[4, 6],
+            DType::Uint8,
+            &[Index::range(1, 3), Index::range(2, 5)],
+        )
+        .expect("layout");
+        let mut reads = Vec::new();
+        let mut dst = vec![0u8; 6];
+        layout
+            .read_with(0, &mut dst, |at, buf| {
+                reads.push((at, buf.len()));
+                Ok(())
+            })
+            .expect("read");
+        assert_eq!(reads, vec![(8, 3), (14, 3)]);
     }
 
     #[test]

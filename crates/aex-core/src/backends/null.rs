@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::backend::{normalize_path, ArrayDataset, ArrayFile, Item};
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
-use crate::selection::{LayoutKind, SelectionLayout};
+use crate::selection::SelectionLayout;
 
 /// Name of the one dataset, matching what the other backends call theirs.
 pub const DATASET_NAME: &str = "array";
@@ -154,13 +154,10 @@ impl ArrayDataset for NullDataset {
     }
 
     fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()> {
-        layout.check_range(offset, dst.len() as u64)?;
-        match layout.kind {
-            LayoutKind::Contiguous { src_offset, .. } => {
-                self.fill(src_offset + offset, dst);
-                Ok(())
-            }
-        }
+        layout.read_with(offset, dst, |at, buf| {
+            self.fill(at, buf);
+            Ok(())
+        })
     }
 }
 

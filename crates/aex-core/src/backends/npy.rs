@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::backend::{normalize_path, ArrayDataset, ArrayFile, Item};
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
-use crate::selection::{LayoutKind, SelectionLayout};
+use crate::selection::SelectionLayout;
 
 /// Name of the one dataset in a `.npy`, as v1 exposed it.
 pub const DATASET_NAME: &str = "array";
@@ -196,12 +196,7 @@ impl ArrayDataset for NpyDataset {
     /// A `.npy` is the array flattened in C order, so a contiguous selection is
     /// a range of the file and needs one `pread`.
     fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()> {
-        layout.check_range(offset, dst.len() as u64)?;
-        match layout.kind {
-            LayoutKind::Contiguous { src_offset, .. } => {
-                self.read_bytes_at(src_offset + offset, dst)
-            }
-        }
+        layout.read_with(offset, dst, |at, buf| self.read_bytes_at(at, buf))
     }
 }
 

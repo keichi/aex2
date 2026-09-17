@@ -359,30 +359,74 @@ fn a_selection_comes_back_as_numpy_would_have_taken_it() {
 }
 
 #[test]
-fn a_selection_this_release_cannot_serve_says_so() {
+fn a_selection_that_is_not_one_run_is_gathered() {
     let server = TestServer::start();
-    server.write_counting_npy("grid.npy", &[64, 2000]);
+    let (rows, cols) = (64u64, 2000u64);
+    server.write_counting_npy("grid.npy", &[rows as usize, cols as usize]);
     let client = server.connect();
     let handle = client.open("grid.npy").expect("open");
+    let at = |r: u64, c: u64| (r * cols + c) as f32;
 
-    // Strided and fragmented layouts arrive with the parallel transfer path.
-    // Until then they are refused, rather than served wrongly.
-    for indices in [
-        vec![Index::full(), Index::range(0, 100)],
-        vec![Index::Slice {
-            start: None,
-            stop: None,
-            step: Some(2),
-        }],
-        vec![Index::Fancy(vec![1, 5, 9])],
-    ] {
-        let err = client
-            .read_selection(handle, "array", &indices)
-            .expect_err("not implemented yet");
-        assert_eq!(err.class(), Some(ErrorClass::Request), "{indices:?}: {err}");
+    // Each is checked against the source element by element. Some are small
+    // enough to come back inline and some go over the data plane; both read
+    // through the same layout.
+    let every_other_row: Vec<f32> = (0..rows)
+        .step_by(2)
+        .flat_map(|r| (0..cols).map(move |c| at(r, c)))
+        .collect();
+    let reversed_thirds: Vec<f32> = (0..rows)
+        .flat_map(|r| (0..cols).rev().step_by(3).map(move |c| at(r, c)))
+        .collect();
+    let rows_159: Vec<f32> = [1, 5, 9]
+        .into_iter()
+        .flat_map(|r| (0..cols).map(move |c| at(r, c)))
+        .collect();
+    let cases: Vec<(Vec<Index>, Vec<u64>, Vec<f32>)> = vec![
+        (
+            vec![Index::full(), Index::range(0, 100)],
+            vec![rows, 100],
+            (0..rows)
+                .flat_map(|r| (0..100).map(move |c| at(r, c)))
+                .collect(),
+        ),
+        (
+            vec![Index::Slice {
+                start: None,
+                stop: None,
+                step: Some(2),
+            }],
+            vec![rows / 2, cols],
+            every_other_row,
+        ),
+        (
+            vec![
+                Index::full(),
+                Index::Slice {
+                    start: None,
+                    stop: None,
+                    step: Some(-3),
+                },
+            ],
+            vec![rows, cols.div_ceil(3)],
+            reversed_thirds,
+        ),
+        (vec![Index::Fancy(vec![1, 5, 9])], vec![3, cols], rows_159),
+        (
+            vec![Index::Fancy(vec![0, 63]), Index::Fancy(vec![1999, 7])],
+            vec![2],
+            vec![at(0, 1999), at(63, 7)],
+        ),
+    ];
+
+    for (indices, shape, expected) in cases {
+        let array = client
+            .read_selection_as::<f32>(handle, "array", &indices)
+            .unwrap_or_else(|e| panic!("{indices:?}: {e}"));
+        assert_eq!(array.shape, shape, "{indices:?}");
+        assert!(array.data == expected, "{indices:?}");
     }
 
-    // A selection numpy would refuse too.
+    // A selection numpy would refuse is still refused.
     let err = client
         .read_selection(handle, "array", &[Index::Single(64)])
         .unwrap_err();
