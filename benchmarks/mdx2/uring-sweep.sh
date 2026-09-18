@@ -29,7 +29,7 @@ sleep 1
 trap 'ssh "$CLIENT" "pkill -x poolbench || true"' EXIT
 
 for _ in $(seq "$ROUNDS"); do
-    for s in 1 4 16; do
+    for s in 1 4 8 16; do
         run $MEM "$s" serial
         run $MEM "$s" pair --buffers 3
         for d in 1 2 4 8; do
@@ -38,7 +38,7 @@ for _ in $(seq "$ROUNDS"); do
         run $MEM "$s" uring-copy --depth 4
         run $MEM "$s" uring-zc --depth 4
     done
-    for s in 1 4; do
+    for s in 1 4 8; do
         run $DISK "$s" serial --cold
         run $DISK "$s" pair --buffers 3 --cold
         run $DISK "$s" uring --depth 4 --cold

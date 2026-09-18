@@ -536,12 +536,17 @@ mod uring {
             slot.buf[slot.sent..].as_ptr(),
             (slot.frame() - slot.sent) as u32,
         );
+        // MSG_WAITALL: let the kernel finish the piece rather than come back
+        // with a partial send and leave the socket idle until it is resubmitted.
         let entry = if how == How::Zc {
             opcode::SendZc::new(fd, ptr, len)
+                .flags(libc::MSG_WAITALL)
                 .zc_flags(SEND_ZC_REPORT_USAGE)
                 .build()
         } else {
-            opcode::Send::new(fd, ptr, len).build()
+            opcode::Send::new(fd, ptr, len)
+                .flags(libc::MSG_WAITALL)
+                .build()
         };
         entry.user_data(SEND_TAG | i as u64)
     }
