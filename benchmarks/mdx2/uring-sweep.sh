@@ -43,7 +43,8 @@ disk_round() {
     for s in 1 4 8 16; do
         run $DISK "$s" serial --cold
         run $DISK "$s" pair --buffers 3 --cold
-        for d in 2 4 8 16; do
+        for d in 4 8 16; do
+            run $DISK "$s" fadvise --depth "$d" --cold
             run $DISK "$s" uring --depth "$d" --cold
         done
         run $DISK "$s" uring-zc --depth 8 --cold

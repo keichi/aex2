@@ -7,6 +7,7 @@
 //! - `serial`: one thread per connection reads and writes in turn
 //! - `pair`: each connection has a reader thread and a writer thread
 //! - `pool`: P reader threads shared by every connection, one writer each
+//! - `fadvise`: `serial`, with the next `--depth` pieces hinted to the kernel
 //! - `uring`: one thread per connection, reads on its own io_uring, blocking send
 //! - `uring-copy` / `uring-zc`: reads and sends both on the ring
 //!
@@ -35,6 +36,7 @@ enum Mode {
     Serial,
     Pair,
     Pool,
+    Fadvise,
     Uring,
     UringCopy,
     UringZc,
@@ -144,6 +146,7 @@ fn main() -> std::io::Result<()> {
                     Mode::Serial => serial(&file, &ranges, conns, piece),
                     Mode::Pair => pair(&file, &ranges, conns, piece, buffers),
                     Mode::Pool => pool(&file, &ranges, conns, piece, buffers, readers),
+                    Mode::Fadvise => fadvise(&file, &ranges, conns, piece, depth),
                     _ => uring::run(&file, &ranges, conns, piece, depth, mode, verify, &stats),
                 }?;
                 runs.push(Run {
@@ -156,6 +159,7 @@ fn main() -> std::io::Result<()> {
                 Mode::Serial => "serial".to_string(),
                 Mode::Pair => format!("pair buffers={buffers}"),
                 Mode::Pool => format!("pool readers={readers} buffers={buffers}"),
+                Mode::Fadvise => format!("fadvise depth={depth}"),
                 Mode::Uring => format!("uring depth={depth}"),
                 Mode::UringCopy => format!("uring-copy depth={depth}"),
                 Mode::UringZc => format!("uring-zc depth={depth}"),
@@ -229,6 +233,29 @@ fn evict(_file: &File) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
+/// Ask the kernel to start reading `[at, at + len)` now.
+#[cfg(target_os = "linux")]
+fn will_need(file: &File, at: u64, len: usize) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let rc = unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            at as i64,
+            len as i64,
+            libc::POSIX_FADV_WILLNEED,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn will_need(_file: &File, _at: u64, _len: usize) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 /// Send one piece with its header, then wait for nothing: the sink only reads.
 fn send_piece(conn: &mut TcpStream, piece: &[u8]) -> std::io::Result<()> {
     let header = [0u8; HEADER_LEN];
@@ -285,6 +312,43 @@ fn serial(
         let mut at = range.start;
         while at < range.end {
             let len = piece.min((range.end - at) as usize);
+            read_piece(file, at, &mut buf[..len])?;
+            send_piece(&mut conn, &buf[..len])?;
+            at += len as u64;
+        }
+        finish(conn)
+    })
+}
+
+/// `serial`, with the read of the next `depth` pieces already under way.
+///
+/// The cheapest way to have more than one read in flight per connection: the
+/// kernel starts them, and nothing is handed between threads.
+fn fadvise(
+    file: &File,
+    ranges: &[Range],
+    conns: Vec<TcpStream>,
+    piece: usize,
+    depth: usize,
+) -> std::io::Result<()> {
+    per_conn(ranges, conns, |_, range, mut conn| {
+        let mut buf = vec![0u8; piece];
+        let window = (depth * piece) as u64;
+        let advise = |at: u64| {
+            if at < range.end {
+                will_need(file, at, piece.min((range.end - at) as usize))
+            } else {
+                Ok(())
+            }
+        };
+        for i in 0..depth as u64 {
+            advise(range.start + i * piece as u64)?;
+        }
+        let mut at = range.start;
+        while at < range.end {
+            let len = piece.min((range.end - at) as usize);
+            // Keep the hint `depth` pieces ahead of where the reading is.
+            advise(at + window)?;
             read_piece(file, at, &mut buf[..len])?;
             send_piece(&mut conn, &buf[..len])?;
             at += len as u64;
