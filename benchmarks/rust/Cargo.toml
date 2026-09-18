@@ -11,3 +11,6 @@ publish = false
 aex-client.workspace = true
 clap.workspace = true
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.15"

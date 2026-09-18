@@ -7,15 +7,20 @@
 //! - `serial`: one thread per connection reads and writes in turn
 //! - `pair`: each connection has a reader thread and a writer thread
 //! - `pool`: P reader threads shared by every connection, one writer each
+//! - `uring`: one thread per connection, reads on its own io_uring, blocking send
+//! - `uring-copy` / `uring-zc`: reads and sends both on the ring
 //!
 //! `pair` doubles the threads with the connections; `pool` keeps the readers
-//! at a count chosen for the machine or the storage.
+//! at a count chosen for the machine or the storage. The `uring` modes keep one
+//! thread per connection and overlap the reads with the send from that same
+//! thread, so nothing is handed between threads.
 
 use std::fs::File;
 use std::io::{IoSlice, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -30,6 +35,9 @@ enum Mode {
     Serial,
     Pair,
     Pool,
+    Uring,
+    UringCopy,
+    UringZc,
 }
 
 #[derive(Parser)]
@@ -63,6 +71,12 @@ enum Command {
         /// Buffers per connection, for `pair` and `pool`.
         #[arg(long, default_value_t = 3)]
         buffers: usize,
+        /// Pieces read ahead per connection, for the `uring` modes.
+        #[arg(long, default_value_t = 4)]
+        depth: usize,
+        /// Check every piece against a pread of the same range. Costs time.
+        #[arg(long)]
+        verify: bool,
         #[arg(long, default_value_t = 524288)]
         piece: usize,
         /// Where the data starts; 128 is where a `.npy` header usually ends.
@@ -94,6 +108,8 @@ fn main() -> std::io::Result<()> {
             mode,
             readers,
             buffers,
+            depth,
+            verify,
             piece,
             offset,
             reps,
@@ -108,6 +124,7 @@ fn main() -> std::io::Result<()> {
                 })
                 .collect();
 
+            let stats = uring::Stats::default();
             let mut runs = Vec::new();
             for _ in 0..reps {
                 if cold {
@@ -127,6 +144,7 @@ fn main() -> std::io::Result<()> {
                     Mode::Serial => serial(&file, &ranges, conns, piece),
                     Mode::Pair => pair(&file, &ranges, conns, piece, buffers),
                     Mode::Pool => pool(&file, &ranges, conns, piece, buffers, readers),
+                    _ => uring::run(&file, &ranges, conns, piece, depth, mode, verify, &stats),
                 }?;
                 runs.push(Run {
                     bytes: share * streams as u64,
@@ -138,6 +156,9 @@ fn main() -> std::io::Result<()> {
                 Mode::Serial => "serial".to_string(),
                 Mode::Pair => format!("pair buffers={buffers}"),
                 Mode::Pool => format!("pool readers={readers} buffers={buffers}"),
+                Mode::Uring => format!("uring depth={depth}"),
+                Mode::UringCopy => format!("uring-copy depth={depth}"),
+                Mode::UringZc => format!("uring-zc depth={depth}"),
             };
             report(
                 &format!(
@@ -146,17 +167,48 @@ fn main() -> std::io::Result<()> {
                 ),
                 &runs,
             );
+            stats.report();
             Ok(())
         }
     }
 }
 
+/// Discard what arrives, and report what receiving it cost once the last
+/// connection of a run closes: the sender is only worth speeding up while the
+/// receiver still has headroom.
 fn sink(listen: &str) -> std::io::Result<()> {
+    let active = Arc::new(AtomicUsize::new(0));
+    let bytes = Arc::new(AtomicU64::new(0));
+    let start: Arc<Mutex<(Instant, f64)>> = Arc::new(Mutex::new((Instant::now(), 0.0)));
+
     for conn in TcpListener::bind(listen)?.incoming() {
         let mut conn = conn?;
+        let (active, bytes, start) = (active.clone(), bytes.clone(), start.clone());
         std::thread::spawn(move || {
+            if active.fetch_add(1, Ordering::SeqCst) == 0 {
+                bytes.store(0, Ordering::SeqCst);
+                *start.lock().unwrap() = (Instant::now(), cpu_seconds());
+            }
             let mut buf = vec![0u8; 1 << 20];
-            while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
+            while let Ok(n) = conn.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                bytes.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            // Let the sender's `finish` return: it waits for a read to end.
+            let _ = conn.shutdown(Shutdown::Both);
+            if active.fetch_sub(1, Ordering::SeqCst) == 1 {
+                let (at, cpu) = *start.lock().unwrap();
+                report(
+                    "sink",
+                    &[Run {
+                        bytes: bytes.load(Ordering::SeqCst),
+                        elapsed: at.elapsed(),
+                        cpu: cpu_seconds() - cpu,
+                    }],
+                );
+            }
         });
     }
     Ok(())
@@ -357,4 +409,336 @@ fn pool(
         drop(owned);
         result
     })
+}
+
+/// Reads (and optionally sends) on an io_uring owned by the connection's own
+/// thread: the locality of `serial` with the overlap of `pair`, and no handoff.
+#[cfg(target_os = "linux")]
+mod uring {
+    use super::{finish, per_conn, send_piece, Mode, Range, HEADER_LEN};
+    use std::collections::VecDeque;
+    use std::fs::File;
+    use std::io;
+    use std::net::TcpStream;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use io_uring::{cqueue, opcode, squeue, types, IoUring};
+
+    /// Ask the kernel to say, in the notification, whether a zero-copy send had
+    /// to copy after all. Not in the crate's exported bindings.
+    const SEND_ZC_REPORT_USAGE: u16 = 8;
+    const NOTIF_ZC_COPIED: u32 = 1 << 31;
+
+    /// Completion kind, in the top bits of `user_data`; the rest is the slot.
+    const SEND_TAG: u64 = 1 << 32;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum How {
+        /// Reads on the ring, send with a blocking `writev`.
+        Blocking,
+        Copy,
+        Zc,
+    }
+
+    #[derive(Default)]
+    pub struct Stats {
+        sends: AtomicU64,
+        copied: AtomicU64,
+        enobufs: AtomicU64,
+    }
+
+    impl Stats {
+        pub fn report(&self) {
+            let sends = self.sends.load(Ordering::Relaxed);
+            if sends == 0 {
+                return;
+            }
+            let copied = self.copied.load(Ordering::Relaxed);
+            println!(
+                "  sends {sends}  copied {copied} ({:.0} %)  enobufs {}",
+                100.0 * copied as f64 / sends as f64,
+                self.enobufs.load(Ordering::Relaxed),
+            );
+        }
+    }
+
+    /// One piece in flight: its buffer holds the header and the payload next to
+    /// each other so a ring send is one SQE.
+    struct Slot {
+        buf: Vec<u8>,
+        at: u64,
+        len: usize,
+        got: usize,
+        sent: usize,
+        ready: bool,
+        done: bool,
+        /// Zero-copy notifications still owed for this buffer.
+        notifs: u32,
+    }
+
+    impl Slot {
+        fn frame(&self) -> usize {
+            HEADER_LEN + self.len
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        file: &File,
+        ranges: &[Range],
+        conns: Vec<TcpStream>,
+        piece: usize,
+        depth: usize,
+        mode: Mode,
+        verify: bool,
+        stats: &Stats,
+    ) -> io::Result<()> {
+        let how = match mode {
+            Mode::Uring => How::Blocking,
+            Mode::UringCopy => How::Copy,
+            Mode::UringZc => How::Zc,
+            _ => unreachable!("only the uring modes come here"),
+        };
+        per_conn(ranges, conns, |_, range, conn| {
+            connection(file, range, conn, piece, depth, how, verify, stats)
+        })
+    }
+
+    /// Push one SQE, making room by submitting if the queue is full.
+    ///
+    /// # Safety
+    ///
+    /// The buffer the entry points at must stay put until its completion (and,
+    /// for a zero-copy send, its notification) has been reaped.
+    unsafe fn push(ring: &mut IoUring, entry: &squeue::Entry) -> io::Result<()> {
+        while ring.submission().push(entry).is_err() {
+            ring.submit()?;
+        }
+        Ok(())
+    }
+
+    fn read_sqe(fd: types::Fd, slot: &mut Slot, i: usize) -> squeue::Entry {
+        let at = slot.got;
+        opcode::Read::new(
+            fd,
+            slot.buf[HEADER_LEN + at..].as_mut_ptr(),
+            (slot.len - at) as u32,
+        )
+        .offset(slot.at + at as u64)
+        .build()
+        .user_data(i as u64)
+    }
+
+    fn send_sqe(fd: types::Fd, slot: &Slot, i: usize, how: How) -> squeue::Entry {
+        let (ptr, len) = (
+            slot.buf[slot.sent..].as_ptr(),
+            (slot.frame() - slot.sent) as u32,
+        );
+        let entry = if how == How::Zc {
+            opcode::SendZc::new(fd, ptr, len)
+                .zc_flags(SEND_ZC_REPORT_USAGE)
+                .build()
+        } else {
+            opcode::Send::new(fd, ptr, len).build()
+        };
+        entry.user_data(SEND_TAG | i as u64)
+    }
+
+    fn check(file: &File, slot: &Slot) -> io::Result<()> {
+        let mut want = vec![0u8; slot.len];
+        file.read_exact_at(&mut want, slot.at)?;
+        if want != slot.buf[HEADER_LEN..slot.frame()] {
+            return Err(io::Error::other("piece read through the ring differs"));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connection(
+        file: &File,
+        range: Range,
+        mut conn: TcpStream,
+        piece: usize,
+        depth: usize,
+        how: How,
+        verify: bool,
+        stats: &Stats,
+    ) -> io::Result<()> {
+        // Enough room for every read plus the send and a retry.
+        let mut ring = IoUring::new(((depth + 4) as u32).next_power_of_two())?;
+        let file_fd = types::Fd(file.as_raw_fd());
+        let sock_fd = types::Fd(conn.as_raw_fd());
+        // A blocking socket makes io_uring punt the send to a kernel worker
+        // thread, which is the handoff this is trying to avoid.
+        if how != How::Blocking {
+            conn.set_nonblocking(true)?;
+        }
+
+        let mut slots: Vec<Slot> = (0..depth)
+            .map(|_| Slot {
+                buf: vec![0u8; HEADER_LEN + piece],
+                at: 0,
+                len: 0,
+                got: 0,
+                sent: 0,
+                ready: false,
+                done: false,
+                notifs: 0,
+            })
+            .collect();
+        let mut free: Vec<usize> = (0..depth).rev().collect();
+        // Submission order, which is also the order the pieces must be sent in.
+        let mut order: VecDeque<usize> = VecDeque::new();
+        let mut next = range.start;
+        let mut sending = false;
+        let mut notifs = 0u32;
+
+        loop {
+            let mut progress = false;
+
+            while next < range.end {
+                let Some(i) = free.pop() else { break };
+                let len = piece.min((range.end - next) as usize);
+                let slot = &mut slots[i];
+                (slot.at, slot.len, slot.got, slot.sent) = (next, len, 0, 0);
+                (slot.ready, slot.done) = (false, false);
+                let sqe = read_sqe(file_fd, slot, i);
+                // SAFETY: the slot is not touched again until its completion.
+                unsafe { push(&mut ring, &sqe)? };
+                order.push_back(i);
+                next += len as u64;
+                progress = true;
+            }
+
+            if !sending {
+                if let Some(&head) = order.front() {
+                    if slots[head].ready {
+                        if verify {
+                            check(file, &slots[head])?;
+                        }
+                        if how == How::Blocking {
+                            let slot = &slots[head];
+                            send_piece(&mut conn, &slot.buf[HEADER_LEN..slot.frame()])?;
+                            order.pop_front();
+                            free.push(head);
+                        } else {
+                            let sqe = send_sqe(sock_fd, &slots[head], head, how);
+                            // SAFETY: the buffer is held until the send, and any
+                            // notification, has completed.
+                            unsafe { push(&mut ring, &sqe)? };
+                            sending = true;
+                        }
+                        progress = true;
+                    }
+                }
+            }
+
+            if order.is_empty() && next >= range.end && notifs == 0 {
+                break;
+            }
+
+            ring.submit_and_wait(usize::from(!progress))?;
+            for cqe in ring.completion().collect::<Vec<cqueue::Entry>>() {
+                let i = (cqe.user_data() & 0xffff_ffff) as usize;
+                if cqe.user_data() & SEND_TAG == 0 {
+                    let n = cqe.result();
+                    if n < 0 {
+                        return Err(io::Error::from_raw_os_error(-n));
+                    }
+                    if n == 0 {
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                    let slot = &mut slots[i];
+                    slot.got += n as usize;
+                    if slot.got == slot.len {
+                        slot.ready = true;
+                    } else {
+                        let sqe = read_sqe(file_fd, slot, i);
+                        // SAFETY: as above; the slot stays put.
+                        unsafe { push(&mut ring, &sqe)? };
+                    }
+                    continue;
+                }
+
+                if cqueue::notif(cqe.flags()) {
+                    if cqe.result() as u32 & NOTIF_ZC_COPIED != 0 {
+                        stats.copied.fetch_add(1, Ordering::Relaxed);
+                    }
+                    notifs -= 1;
+                    slots[i].notifs -= 1;
+                    if slots[i].done && slots[i].notifs == 0 {
+                        free.push(i);
+                    }
+                    continue;
+                }
+
+                let n = cqe.result();
+                if n == -libc::ENOBUFS {
+                    // Out of pinned memory for zero copy; this piece goes the
+                    // ordinary way. No notification follows a failed send.
+                    stats.enobufs.fetch_add(1, Ordering::Relaxed);
+                    let sqe = send_sqe(sock_fd, &slots[i], i, How::Copy);
+                    // SAFETY: as above; the slot stays put.
+                    unsafe { push(&mut ring, &sqe)? };
+                    continue;
+                }
+                if n < 0 {
+                    return Err(io::Error::from_raw_os_error(-n));
+                }
+                if cqueue::more(cqe.flags()) {
+                    slots[i].notifs += 1;
+                    notifs += 1;
+                }
+                let slot = &mut slots[i];
+                slot.sent += n as usize;
+                if slot.sent < slot.frame() {
+                    let sqe = send_sqe(sock_fd, slot, i, how);
+                    // SAFETY: as above; the slot stays put.
+                    unsafe { push(&mut ring, &sqe)? };
+                    continue;
+                }
+                stats.sends.fetch_add(1, Ordering::Relaxed);
+                sending = false;
+                debug_assert_eq!(order.front(), Some(&i), "sends complete in order");
+                order.pop_front();
+                slot.done = true;
+                if slot.notifs == 0 {
+                    free.push(i);
+                }
+            }
+        }
+
+        conn.set_nonblocking(false)?;
+        finish(conn)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod uring {
+    use super::{Mode, Range};
+    use std::fs::File;
+    use std::net::TcpStream;
+
+    #[derive(Default)]
+    pub struct Stats(());
+
+    impl Stats {
+        pub fn report(&self) {}
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        _file: &File,
+        _ranges: &[Range],
+        _conns: Vec<TcpStream>,
+        _piece: usize,
+        _depth: usize,
+        _mode: Mode,
+        _verify: bool,
+        _stats: &Stats,
+    ) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
