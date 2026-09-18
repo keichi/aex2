@@ -15,6 +15,9 @@ mdx2 上の VM 2 台で測るときの決まりごと。測定結果そのもの
 | データ | `/mnt/aexram` (tmpfs 12 GiB)、`~/disk` (virtio) | なし |
 
 - SSH の別名は `~/.ssh/config` にあり、`mdx2-gw` 経由、ユーザ `mdxuser`
+- **VM どうしも ssh できる**。`aex2-eval2` の `~/.ssh/id_ed25519` が両方の
+  `authorized_keys` に入っている。数時間かかる掃引を VM 側の tmux で回すためで、
+  Mac が寝ても止まらない (手順は「長い掃引を VM 上で回す」)
 - VM 間は RTT 約 0.7 ms、MTU 1442 (MSS 1390)。帯域は共有で、**同条件でも日によって振れる**
 - ハードウェアの詳細は [benchmark-mdx2.md](benchmark-mdx2.md#測定環境) の「測定環境」
 
@@ -211,6 +214,26 @@ $ ssh aex2-eval1 'pkill -x aex-server'                    # 止める
 6. **直後の iPerf3** (手順 3 と同じ)
 7. **後片付け**: サーバと iperf3 を止め、手順 1 のコマンドで何も残っていないことと
    sysctl が既定値であることを確かめる
+
+## 長い掃引を VM 上で回す
+
+`param-sweep.sh` のように数時間かかるものは、Mac ではなく `aex2-eval2` の tmux で回す。
+Mac がスリープすると ssh が落ち、netem と sysctl が設定されたまま残るため。
+
+スクリプトは `ssh` で両方の VM を触るので、VM 側で走らせるときは `SERVER` と `CLIENT`
+を**別名ではなく IP** にする (VM の `~/.ssh/config` には別名がない)。
+
+```console
+$ ssh aex2-eval2 "tmux new-session -d -s sweep 'cd aex2 &&
+    SERVER=192.168.100.207 CLIENT=192.168.101.235 \
+    bash benchmarks/mdx2/param-sweep.sh 5 2>&1 | tee ~/param-sweep.txt'"
+$ ssh aex2-eval2 'tmux ls; tail -3 ~/param-sweep.txt'       # 進み具合
+$ ssh aex2-eval2 'tmux kill-session -t sweep'               # 止める
+```
+
+**tmux を kill すると `trap` が走らず netem と sysctl が残る**。止めたら
+`tc qdisc show dev enp3s0` と `sysctl net.ipv4.tcp_rmem net.core.rmem_max` を
+両方の VM で確かめ、残っていれば手で戻す。
 
 ## 結果の記録
 

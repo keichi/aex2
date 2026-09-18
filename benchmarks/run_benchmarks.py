@@ -13,9 +13,14 @@ pointing at a v1 checkout. Run v1 in v1's own environment, since it needs grpcio
     (cd ../aex && uv run python -m aex.server) &
     uv run --project ../aex python benchmarks/run_benchmarks.py --v1 ../aex \\
         --data-dir "$PWD/benchmarks/data"
+
+v2's tuning knobs are environment variables (AEX_STREAMS, AEX_CREDIT,
+AEX_CHUNK_BYTES, ...), so a sweep needs no flags here; whichever are set are
+printed with the results, since a number without its settings is not a record.
 """
 
 import argparse
+import os
 import statistics
 import sys
 import time
@@ -104,6 +109,8 @@ def main() -> int:
     print(f"Server: {args.host}")
     print(f"Files to test: {len(paths)}")
     print(f"Runs per file: {args.runs}")
+    settings = {k: v for k, v in sorted(os.environ.items()) if k.startswith("AEX_")}
+    print(f"Client settings: {settings or 'defaults'}")
 
     all_results: list[Result] = []
     client = Client(args.host)
