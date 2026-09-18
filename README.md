@@ -72,7 +72,8 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
 ([M6: パラメータ掃引と既定値](docs/benchmark-m6.md)、[M4: 並列ストリーム](docs/benchmark-m4.md)、[共有読みプールの予備測定](docs/benchmark-read-pool.md)、[v1 との比較 (Mac・VM)](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
-[sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
+[sendfile を採らない理由](docs/sendfile.md)、
+[io_uring を採らない理由](docs/benchmark-uring.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、mdx2 の VM 2 台を実ネットワークで
 繋いだ測定は [docs/benchmark-mdx2.md](docs/benchmark-mdx2.md)、そこに遅延を足した測定は
 [docs/benchmark-delay.md](docs/benchmark-delay.md)、gather が省く往復の測定は
