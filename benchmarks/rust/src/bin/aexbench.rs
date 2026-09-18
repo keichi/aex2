@@ -51,6 +51,9 @@ struct Cli {
     /// Fetches outstanding per connection.
     #[arg(long, default_value_t = aex_client::config::DEFAULT_CREDIT)]
     credit: u32,
+    /// `SO_RCVBUF` for each data connection. 0 leaves the kernel to tune it.
+    #[arg(long, default_value_t = 0)]
+    rcvbuf: usize,
     /// Take every step-th element. Above 1 the selection is not one run, and
     /// every element is read on its own.
     #[arg(long, default_value_t = 1)]
@@ -74,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             chunk_bytes: cli.chunk,
             streams: cli.streams,
             credit: cli.credit,
+            rcvbuf: (cli.rcvbuf > 0).then_some(cli.rcvbuf),
             ..ClientConfig::default()
         },
     )?;
@@ -137,8 +141,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let label = cli.label.unwrap_or_else(|| cli.file.clone());
     report(
         &format!(
-            "aex {label} chunk={} streams={} credit={} step={}",
-            cli.chunk, cli.streams, cli.credit, cli.step
+            "aex {label} chunk={} streams={} credit={} rcvbuf={} step={}",
+            cli.chunk, cli.streams, cli.credit, cli.rcvbuf, cli.step
         ),
         &runs,
     );

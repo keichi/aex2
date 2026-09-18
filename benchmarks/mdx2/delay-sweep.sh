@@ -16,22 +16,6 @@ set -euo pipefail
 REPS=${1:-3}
 RTTS=(0 1 5 10 25 50 100)
 . "$(dirname "$0")/netem.sh"
-DEFAULT_RMEM="4096 131072 6291456" DEFAULT_WMEM="4096 16384 4194304"
-# Holds a single stream's BDP at about 20 Gbit/s and 100 ms.
-TUNED_MAX=$((256 << 20))
-
-set_buffers() {
-    local rmem=$DEFAULT_RMEM wmem=$DEFAULT_WMEM
-    [ "$1" = tuned ] && rmem="4096 131072 $TUNED_MAX" wmem="4096 16384 $TUNED_MAX"
-    for h in $SERVER $CLIENT; do
-        ssh "$h" "sudo sysctl -q -w net.ipv4.tcp_rmem='$rmem' net.ipv4.tcp_wmem='$wmem'"
-    done
-}
-
-# Cached ssthresh from the previous run would skip slow start.
-flush_metrics() {
-    for h in $SERVER $CLIENT; do ssh "$h" 'sudo ip tcp_metrics flush all' 2>/dev/null || true; done
-}
 
 restore() {
     clear_rtt

@@ -24,3 +24,28 @@ clear_rtt() {
         ssh "$h" 'sudo tc qdisc del dev enp3s0 root 2>/dev/null' || true
     done
 }
+
+DEFAULT_RMEM="4096 131072 6291456" DEFAULT_WMEM="4096 16384 4194304"
+# Holds a single stream's BDP at about 20 Gbit/s and 100 ms.
+TUNED_MAX=$((256 << 20))
+
+# Kernel socket buffer ceilings: `default` or `tuned`. The default ones cap a
+# single stream below the BDP from about 5 ms of round trip upwards, so a sweep
+# that means to measure anything else has to raise them first.
+# `net.core.*mem_max` only caps a buffer size asked for by setsockopt, which
+# autotuning never does, so it moves with the ceilings rather than separately.
+DEFAULT_CORE_MAX=212992
+
+set_buffers() {
+    local rmem=$DEFAULT_RMEM wmem=$DEFAULT_WMEM core=$DEFAULT_CORE_MAX
+    [ "$1" = tuned ] && rmem="4096 131072 $TUNED_MAX" wmem="4096 16384 $TUNED_MAX" core=$TUNED_MAX
+    for h in $SERVER $CLIENT; do
+        ssh "$h" "sudo sysctl -q -w net.ipv4.tcp_rmem='$rmem' net.ipv4.tcp_wmem='$wmem' \
+            net.core.rmem_max=$core net.core.wmem_max=$core"
+    done
+}
+
+# Cached ssthresh from the previous run would skip slow start.
+flush_metrics() {
+    for h in $SERVER $CLIENT; do ssh "$h" 'sudo ip tcp_metrics flush all' 2>/dev/null || true; done
+}
