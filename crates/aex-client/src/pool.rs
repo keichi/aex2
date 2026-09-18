@@ -410,7 +410,7 @@ struct State {
     queue: VecDeque<Chunk>,
     /// Chunks not yet complete, whether queued or in flight.
     remaining: usize,
-    /// Threads still working.
+    /// Threads still working, this one included.
     live: usize,
     retries: u32,
     /// Ends the transfer: no more fetches go out, and what is in flight drains.
@@ -522,14 +522,14 @@ impl Transfer<'_> {
         flight: &mut VecDeque<InFlight<'s>>,
     ) -> Result<bool> {
         let credit = self.spec.credit.max(1) as usize;
-        let fresh: Vec<Chunk> = {
+        let mut fresh: VecDeque<Chunk> = {
             let mut state = self.lock();
             loop {
-                let mut fresh = Vec::new();
+                let mut fresh = VecDeque::new();
                 if state.error.is_none() {
                     while flight.len() + fresh.len() < credit {
                         match state.queue.pop_front() {
-                            Some(chunk) => fresh.push(chunk),
+                            Some(chunk) => fresh.push_back(chunk),
                             None => break,
                         }
                     }
@@ -540,21 +540,42 @@ impl Transfer<'_> {
                 if state.error.is_some() || state.remaining == 0 {
                     return Ok(false);
                 }
+                if state.live == 1 {
+                    // Last one here, with nothing queued and nothing of its
+                    // own in flight: no chunk can come back, so waiting would
+                    // hang the transfer instead of failing it.
+                    return Err(ClientError::Protocol(format!(
+                        "{} chunks of the transfer are unaccounted for",
+                        state.remaining
+                    )));
+                }
                 // Everything left is in flight elsewhere; wait in case some of
                 // it comes back.
                 state = self.wake.wait(state).unwrap_or_else(|p| p.into_inner());
             }
         };
 
-        for chunk in fresh {
+        while let Some(chunk) = fresh.pop_front() {
             let part = &self.parts[chunk.part];
-            let slice = part.scatter.claim(chunk.offset, chunk.len)?;
-            flight.push_back(InFlight {
-                chunk,
-                slice,
-                received: 0,
-            });
-            conn.send_fetch(part.request_id, part.ticket, chunk.offset, chunk.len)?;
+            let asked = match part.scatter.claim(chunk.offset, chunk.len) {
+                Ok(slice) => {
+                    flight.push_back(InFlight {
+                        chunk,
+                        slice,
+                        received: 0,
+                    });
+                    conn.send_fetch(part.request_id, part.ticket, chunk.offset, chunk.len)
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = asked {
+                // The connection broke partway through topping it up. What is
+                // in flight goes back with it, but these were taken off the
+                // queue and never asked for, so nothing else would fetch them
+                // and the transfer would wait for them forever.
+                self.give_back(fresh);
+                return Err(e);
+            }
         }
 
         let header = conn.read_header()?;
@@ -609,6 +630,21 @@ impl Transfer<'_> {
             drop(state);
             self.wake.notify_all();
         }
+    }
+
+    /// Put chunks that were taken off the queue but never asked for back on it.
+    ///
+    /// Not counted as retries: nothing was sent, so they have not been tried.
+    fn give_back(&self, chunks: VecDeque<Chunk>) {
+        if chunks.is_empty() {
+            return;
+        }
+        let mut state = self.lock();
+        for chunk in chunks.into_iter().rev() {
+            state.queue.push_front(chunk);
+        }
+        drop(state);
+        self.wake.notify_all();
     }
 
     /// Put a chunk back at the front of the queue, counting it against its
