@@ -1,0 +1,16 @@
+# The aex.toml server with the reader thread but the shallowest pool, on its
+# own ports so it can run beside the others. Two buffers cost the same thread
+# as three, so this separates the thread's cost from the pool's depth.
+[server]
+control_addr = "0.0.0.0:50491"
+data_addr = "0.0.0.0:50492"
+enable_null_backend = true
+
+[server.limits]
+max_streams_per_session = 32
+
+[server.paths]
+roots = ["/mnt/aexram", "/home/mdxuser/disk"]
+
+[server.transfer]
+read_buffers = 2
