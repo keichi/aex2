@@ -57,19 +57,12 @@ impl Hdf5File {
         // Opened first so a missing or unreadable file is reported as such,
         // not as a libhdf5 failure.
         let raw = Arc::new(File::open(path)?);
-        // Without libhdf5's file lock: it is a reader, the data is read through
-        // `raw` rather than through libhdf5, and the lock only gets in the way
-        // — a writer holds the file, or the filesystem cannot lock at all,
-        // which is ordinary on the shared ones this serves from.
-        let file = hdf5::File::with_options()
-            .with_fapl(|fapl| fapl.file_locking(false))
-            .open(path)
-            .map_err(|e| {
-                AexError::UnsupportedHdf5(format!(
-                    "{} is not an HDF5 file (netCDF-4 is served, netCDF-3 is not): {e}",
-                    path.display()
-                ))
-            })?;
+        let file = hdf5::File::open(path).map_err(|e| {
+            AexError::UnsupportedHdf5(format!(
+                "{} is not an HDF5 file (netCDF-4 is served, netCDF-3 is not): {e}",
+                path.display()
+            ))
+        })?;
         Ok(Hdf5File {
             file,
             raw,
@@ -718,17 +711,23 @@ mod tests {
     use crate::quality::QualitySpec;
     use crate::selection::{Index, LayoutKind};
 
-    /// Write a fixture, with the file locking the reader uses: libhdf5 refuses
-    /// to open a file whose locking setting disagrees with a handle it already
-    /// has open.
-    fn create(path: impl AsRef<Path>) -> hdf5::File {
-        hdf5::File::with_options()
-            .with_fapl(|fapl| fapl.file_locking(false))
-            .create(path)
-            .unwrap()
-    }
-
+    /// Open a fixture, retrying a refused file lock.
+    ///
+    /// libhdf5 takes a file lock when it opens a file. On macOS, with these
+    /// tests running in parallel, the lock is now and then still refused a
+    /// fraction of a millisecond after the writer closed its file — no other
+    /// process or descriptor holds it by then, and the next attempt succeeds.
+    /// Nothing outside the tests waits on it, so the retry lives here.
     fn open(path: impl AsRef<Path>) -> Result<Hdf5File> {
+        let path = path.as_ref();
+        for _ in 0..20 {
+            match Hdf5File::open(path, Arc::new(DecodeCache::new(1 << 20))) {
+                Err(AexError::UnsupportedHdf5(e)) if e.contains("unable to lock file") => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                other => return other,
+            }
+        }
         Hdf5File::open(path, Arc::new(DecodeCache::new(1 << 20)))
     }
 
@@ -773,7 +772,7 @@ mod tests {
     fn every_dtype_reads_back_as_written() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         let n: usize = 24;
         let mut expected = Vec::new();
         macro_rules! case {
@@ -821,7 +820,7 @@ mod tests {
     fn selections_and_odd_offsets_match_the_source() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         let values: Vec<i32> = (0..10 * 7).collect();
         write(&h5, "a", &values, &[10, 7]);
         drop(h5);
@@ -856,7 +855,7 @@ mod tests {
     fn scalars_empty_arrays_and_unwritten_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         h5.new_dataset::<f64>()
             .create("scalar")
             .unwrap()
@@ -899,7 +898,7 @@ mod tests {
     fn groups_are_walked_and_listed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         let inner = h5
             .create_group("outer")
             .unwrap()
@@ -913,9 +912,6 @@ mod tests {
             .unwrap();
         h5.link_soft("/outer/inner/a", "alias").unwrap();
         h5.link_soft("/nowhere", "dangling").unwrap();
-        // Every handle, or the file stays open for writing and the reader
-        // cannot open it with its own locking setting.
-        drop(inner);
         drop(h5);
 
         let file = open(&path).unwrap();
@@ -959,9 +955,9 @@ mod tests {
         if let Some(dir) = std::env::var_os(DIR_VAR) {
             let dir = Path::new(&dir);
             let secret = dir.join("secret.h5");
-            let h5 = create(&secret);
+            let h5 = hdf5::File::create(&secret).unwrap();
             write(&h5, "data", &[42u8], &[1]);
-            let h5 = create(dir.join("t.h5"));
+            let h5 = hdf5::File::create(dir.join("t.h5")).unwrap();
             h5.link_external(secret.to_str().unwrap(), "/data", "leak")
                 .unwrap();
             return;
@@ -990,7 +986,7 @@ mod tests {
     fn unservable_datasets_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         // hdf5-metno only writes native types, so big-endian goes through the C API.
         let be_id = hdf5::sync::sync(|| *hdf5_sys::h5t::H5T_STD_I32BE);
         let space = hdf5::Dataspace::try_new(&[3][..]).unwrap();
@@ -1046,7 +1042,7 @@ mod tests {
     fn many_threads_read_at_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         let values: Vec<u64> = (0..1 << 16).collect();
         let bytes = write(&h5, "a", &values, &[values.len()]);
         drop(h5);
@@ -1090,7 +1086,7 @@ mod tests {
     fn chunked_datasets_read_back_under_every_filter() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         // Shapes whose chunks leave edges, cover a trailing axis exactly, or both.
         let shapes: [(&[usize], &[usize]); 5] = [
             (&[10, 7], &[3, 4]),
@@ -1162,7 +1158,7 @@ mod tests {
     fn unwritten_chunks_read_as_the_fill_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         for (name, deflate) in [("plain", false), ("deflated", true)] {
             let mut builder = h5
                 .new_dataset::<i16>()
@@ -1193,7 +1189,7 @@ mod tests {
     fn a_corrupt_chunk_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         let values: Vec<u64> = (0..64).collect();
         let d = h5
             .new_dataset::<u64>()
@@ -1226,7 +1222,7 @@ mod tests {
     fn many_threads_share_a_small_cache() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         let values: Vec<f64> = (0..1 << 15).map(|i| (i as f64).sin()).collect();
         h5.new_dataset::<f64>()
             .shape([values.len()])
@@ -1264,7 +1260,7 @@ mod tests {
     fn a_dataset_is_opened_once_per_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.h5");
-        let h5 = create(&path);
+        let h5 = hdf5::File::create(&path).unwrap();
         write(&h5, "a", &[1u8], &[1]);
         drop(h5);
         let file = open(&path).unwrap();

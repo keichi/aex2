@@ -14,12 +14,7 @@ const COLS: usize = 1000;
 /// `/group/packed`, the same values compressed in chunks.
 fn write_grid(server: &TestServer, name: &str) -> Vec<f32> {
     let values: Vec<f32> = (0..ROWS * COLS).map(|i| i as f32).collect();
-    // Without libhdf5's file lock, as the server opens it: it refuses a file
-    // whose locking setting disagrees with a handle already open.
-    let file = hdf5::File::with_options()
-        .with_fapl(|fapl| fapl.file_locking(false))
-        .create(server.root().join(name))
-        .expect("create");
+    let file = hdf5::File::create(server.root().join(name)).expect("create");
     let group = file.create_group("group").expect("group");
     group
         .new_dataset::<f32>()
