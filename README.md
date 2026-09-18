@@ -65,7 +65,8 @@ M4 以降で解消する予定の、**実装上の**制限 (プロトコルの�
 [sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、mdx2 の VM 2 台を実ネットワークで
 繋いだ測定は [docs/benchmark-mdx2.md](docs/benchmark-mdx2.md)、そこに遅延を足した測定は
-[docs/benchmark-delay.md](docs/benchmark-delay.md)、HDF5 バックエンドの測定は
+[docs/benchmark-delay.md](docs/benchmark-delay.md)、gather が省く往復の測定は
+[docs/benchmark-gather.md](docs/benchmark-gather.md)、HDF5 バックエンドの測定は
 [docs/benchmark-hdf5.md](docs/benchmark-hdf5.md) にある。mdx2 での測り方の決まりごとは
 [docs/eval-mdx2.md](docs/eval-mdx2.md) にまとめた。
 
