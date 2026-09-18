@@ -1,5 +1,5 @@
-# Baseline server on aex2-eval1. Other settings get their own file and ports
-# so they can run beside this one.
+# Baseline server on aex2-eval1: every transfer setting left at its default.
+# Other settings get their own file and ports so they can run beside this one.
 [server]
 control_addr = "0.0.0.0:50191"
 data_addr = "0.0.0.0:50192"

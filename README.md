@@ -11,11 +11,14 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 
 ## 状態
 
-**M5 (性能用 API とサーバサイド計算) まで実装済み。** Python と Rust の両方から
+**M6 (評価) まで実装済み。** Python と Rust の両方から
 `.npy` と HDF5 (netCDF-4 を含む) の任意の選択を取得できる。実データは protobuf を
 一切通らず、カーネルから呼び出し側のバッファ (Python では `np.empty` した配列) へ
 直接読み込まれる。1 クライアントが複数のデータ接続を使い、VM 間の実ネットワークでは
 16 接続で 1 接続の 8 倍 (163 Gbit/s) 出る ([M4 の測定](docs/benchmark-m4.md))。
+
+**既定値は実測で決めてある** ([M6 の測定](docs/benchmark-m6.md))。VM 間の 1 GiB を
+Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (23.3 倍) 出る。
 
 小さい選択は 1 往復で返り (`inline_limit_bytes` 以下)、`gather` は N 個の選択を
 1 往復にまとめる。往復 100 ms で 64 個なら 6,460 ms が 102 ms になる
@@ -59,14 +62,15 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
   ビット単位では一致しない
 - **適応品質は未実装**。`at()` は常に EXACT で返し、`AexQualityWarning` を出す
 - **多次元の整数インデックス配列は非対応**。1 次元にして送り、結果を reshape すること
-- **credit は固定値** (既定 4、`AEX_CREDIT`)。RTT と帯域から自動で決める処理は
-  M6 の測定後に入れる。**遅延のある回線では credit が転送の頭打ちを決める**
-  ([遅延を足した測定](docs/benchmark-delay.md))
+- **credit は固定値** (既定 16、`AEX_CREDIT`)。RTT と帯域から自動で決める処理は
+  入れていない。**遅延のある回線では `streams × credit × chunk_bytes` が転送の
+  頭打ちを決める** ([遅延を足した測定](docs/benchmark-delay.md)、
+  [M6 の測定](docs/benchmark-m6.md))
 - **`get_async` は転送を中断できない**。`Future` を捨てても転送は最後まで走る
 - `tcp.congestion` は Linux でのみ適用する (他の OS では起動時に警告を出す)
 
 ローカル (同一ホスト) での転送性能の測定結果は `docs/` にある
-([M4: 並列ストリーム](docs/benchmark-m4.md)、[共有読みプールの予備測定](docs/benchmark-read-pool.md)、[v1 との比較 (Mac・VM)](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
+([M6: パラメータ掃引と既定値](docs/benchmark-m6.md)、[M4: 並列ストリーム](docs/benchmark-m4.md)、[共有読みプールの予備測定](docs/benchmark-read-pool.md)、[v1 との比較 (Mac・VM)](docs/benchmark-m3-v1-v2.md)、[M2 時点](docs/benchmark-m2-local.md)、[ダブルバッファリング](docs/benchmark-double-buffering.md)、
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
 [sendfile を採らない理由](docs/sendfile.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、mdx2 の VM 2 台を実ネットワークで
@@ -77,7 +81,9 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 [docs/eval-mdx2.md](docs/eval-mdx2.md) にまとめた。
 
 macOS (M4) ではメモリ上のデータで単一接続 12,048 MiB/s (iPerf3 の 62 %)、Linux
-(Ryzen 9 5900X) では 6,694 MiB/s (iPerf3 単一ストリームは 5,863 MiB/s)。どちらでもダブルバッファリングが 50 % 以上効く。
+(Ryzen 9 5900X) では 6,694 MiB/s (iPerf3 単一ストリームは 5,863 MiB/s)。どちらも
+単一接続で、そこではダブルバッファリングが 50 % 以上効く (接続を増やすと逆転する。
+[M6 の測定](docs/benchmark-m6.md))。
 **Linux では読みスレッドと送りスレッドを同じ L3 に載せるかどうかで 36 % 変わる**
 (未対応)。
 
@@ -213,6 +219,37 @@ with aex.Client("127.0.0.1:50051") as client:
 ssh トンネルなどでサーバが広告するデータプレーンのポートに直接届かない場合は、
 `AEX_DATA_ENDPOINT=host:port` で接続先を指定する。
 
+## チューニング
+
+既定値はそのままで使えるように決めてある ([M6 の測定](docs/benchmark-m6.md))。
+それでも足りないときに動かす順序は次のとおり。
+
+| | 既定 | 環境変数 |
+|---|---|---|
+| データ接続数 | 8 | `AEX_STREAMS` |
+| credit (接続あたりの先行 `FETCH` 数) | 16 | `AEX_CREDIT` |
+| チャンクサイズ | サーバ推奨値 (4 MiB) | `AEX_CHUNK_BYTES` |
+
+1. **まず接続数を上げる。** どの往復時間でも効き、遅延のない回線では**唯一**効く。
+   パイプラインに隠す往復がないので、そこでは credit もチャンクも効かない。
+   上限はサーバの `limits.max_streams_per_session` (既定 32)
+2. **接続数を増やせないぶんを credit で埋める。** 遅延のある回線でのスループットは
+   接続あたりの in-flight バイト数 `streams × credit × chunk_bytes` だけで決まり、
+   どのノブで作っても同じ値になる。帯域遅延積の 2〜4 倍を目安にする
+   (20 Gbit/s × 50 ms に対し、in-flight 128 MiB で 1,753 MiB/s、256 MiB で 2,806)
+3. **チャンクサイズは触らない。** credit と等価な上、大きくすると最初のフレームまでの
+   待ちと再送の単位が増える
+4. **`SO_RCVBUF` (`AEX_RCVBUF`) は設定しない。** 明示するとカーネルの自動調整が止まり、
+   指定した値が窓の上限になる。往復 50 ms で 4 MiB を指定すると 1,028 MiB/s が
+   327 MiB/s に落ちる。窓を広げたいなら `net.ipv4.tcp_rmem` の上限を上げる
+
+サーバ側の `transfer.read_buffers` は既定の `1`、つまり接続自身のスレッドで読む。
+`2` 以上にすると接続ごとに読みスレッドが 1 本増えて読みと送りが重なるが、
+重ねて得られる上限は `1 + min(read, send) / max(read, send)` なので、**読みと送りが
+同程度の速さのときにしか効かない**。16 コアの VM では 16 接続で 9,162 対 18,859 MiB/s と
+既定のほうが 2 倍速い。上げる価値があるかは環境ごとに測ること
+([M6 の測定](docs/benchmark-m6.md))。
+
 ## 前提と制約
 
 - 対象 OS は Linux (最適化対象) と macOS。`pread` を使うため Unix 系に限る
@@ -224,8 +261,8 @@ ssh トンネルなどでサーバが広告するデータプレーンのポー�
 - データプレーンは平文。認証はセッショントークンと転送ごとの ticket のみで、
   「少数クライアント・信頼できる環境」を前提とする。厳密なマルチテナント制御や
   暗号化は行わない (TLS は HELLO の `flags` に枠のみ確保)
-- 接続ごとに専用 OS スレッドを使う。スレッド数は
-  `クライアント数 × 接続数` に比例する
+- 接続ごとに専用 OS スレッドを使う。スレッド数は `クライアント数 × 接続数` に
+  比例する (`read_buffers` を 2 以上にするとその倍になる)
 
 ## リポジトリ構成
 

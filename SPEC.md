@@ -706,9 +706,11 @@ BDP    = 推定帯域 × 実測 RTT
 
 RTT はハンドシェイク往復と PING/PONG から、帯域は直近の転送実績から推定する。初回転送時は既定値を使う。
 
-**チャンクサイズ**: 既定 4 MiB。調査メモの「256 KB 〜 4 MB が最適」は HTTP/2 フレーム制御下での知見であり、生 TCP では上限がより高い。ベンチマークで 256 KiB / 1 / 4 / 16 MiB を掃引して決定する (第 12 章)。
+**チャンクサイズ**: 既定 4 MiB。M6 の掃引で 256 KiB / 1 / 4 / 16 MiB を測った結果、遅延のある回線では credit と等価に働く (どちらで in-flight バイト数を作っても同じ値になる) ため、4 MiB のまま credit で調整する ([docs/benchmark-m6.md](docs/benchmark-m6.md))。
 
-**接続数**: 既定 4。localhost では 1〜2 で飽和し、10 GbE では 2〜4、高 BDP 環境では 8〜16 が必要と見込む。これもベンチマークで掃引する。
+**接続数**: 既定 8。M6 の掃引では、遅延のない回線で効くノブはこれだけだった。16 まで伸びるが、1 台のクライアントが `max_streams_per_session` (既定 32) の半分を取らないよう 8 とする。
+
+**credit**: 既定 16。遅延のある回線でのスループットは `streams × credit × chunk_bytes` だけで決まる。16 は既定のチャンクサイズで 512 MiB を in-flight に置き、20 Gbit/s × 200 ms を覆う。
 
 ### 6.5 送信パス (サーバ)
 
@@ -1139,7 +1141,8 @@ transfer_ttl_sec         = 60
 
 [server.transfer]
 default_chunk_bytes = 4194304   # 4 MiB
-read_buffers        = 3         # 接続あたりの読みバッファ枚数 (ダブルバッファリング)
+read_buffers        = 1         # 接続あたりの読みバッファ枚数。1 = 接続自身のスレッドで読む。
+                                # 2 以上で読みスレッドが 1 本増え、読みと送りが重なる
 max_fetch_bytes     = 16777216  # 1 回の FETCH で受け付ける上限
 inline_limit_bytes  = 65536     # これ以下の選択は TransferPlan に inline 返却 (§5.6.2)。
                                 # ApplyFunction の inline 上限も兼ねる
@@ -1259,9 +1262,9 @@ fill(plan, dst):
 
 ```rust
 pub struct ClientConfig {
-    pub streams:        u32,     // 既定 4
+    pub streams:        u32,     // 既定 8
     pub chunk_bytes:    u64,     // 既定 0 = サーバ推奨値に従う
-    pub credit:         u32,     // 既定 0 = BDP から自動計算
+    pub credit:         u32,     // 既定 16 (M6 の掃引で決定。自動計算は入れていない)
     pub connect_timeout: Duration,
     pub codec:          Codec,   // 既定 RAW
     pub tcp_nodelay:    bool,
@@ -1637,6 +1640,11 @@ for impl in ["aex_v1", "aex_v2"]:
 - README、API ドキュメント、測定結果のまとめ
 
 **完了条件**: v1 と v2 の比較データが揃い、既定値が実測に基づいて設定されている
+
+**完了** ([docs/benchmark-m6.md](docs/benchmark-m6.md))。`streams` 4 → 8、`credit` 4 → 16、
+`read_buffers` 3 → 1。VM 間の 1 GiB は v1 の 456 MiB/s に対し 10,647 MiB/s (23.3 倍)。
+掃引で分かったのは、遅延のある回線では 3 つのノブが `streams × credit × chunk_bytes`
+として等価に効き、遅延のない回線では接続数だけが効くということである。
 
 ---
 
