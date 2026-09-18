@@ -7,12 +7,20 @@ use std::time::Duration;
 
 /// Data connections the client asks for when it has no reason to ask for more.
 ///
-/// One connection cannot fill a high bandwidth-delay link, and past a handful
-/// the gain flattens while the server-side cost does not.
-pub const DEFAULT_STREAMS: u32 = 4;
+/// Connections are the one knob that helps at every round trip: on a link with
+/// no delay they are the only thing that helps at all, since there is nothing
+/// to pipeline. Eight rather than more because a single client should not take
+/// half of a server's connection budget to be well served.
+pub const DEFAULT_STREAMS: u32 = 8;
 
-/// Fetches outstanding per connection until measurements say otherwise.
-pub const DEFAULT_CREDIT: u32 = 4;
+/// Fetches outstanding per connection.
+///
+/// Throughput on a delayed link is set by the bytes in flight, which is this
+/// times the chunk size times the connections. Sixteen puts 512 MiB in flight
+/// at the default chunk size, enough for 20 Gbit/s at 200 ms, and costs nothing
+/// on a fast link: data goes straight into the caller's buffer, so a deeper
+/// pipeline holds no more memory, only more sockets with something in them.
+pub const DEFAULT_CREDIT: u32 = 16;
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {

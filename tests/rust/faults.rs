@@ -109,7 +109,13 @@ fn a_transient_error_retries_just_that_chunk() {
     let server = TestServer::start();
     let expected = server.write_counting_npy("grid.npy", &SHAPE);
     let proxy = Proxy::start(server.data_addr, Fault::FailFirstFetch);
-    let client = server.connect_with(through(&proxy, |_| {}));
+    // Pinned so that the counts below stay about the retry. A deeper pipeline
+    // lets the first connections take all the work, and a fixture this small
+    // then leaves the last ones with no fetch to fail.
+    let client = server.connect_with(through(&proxy, |c| {
+        c.streams = 4;
+        c.credit = 1;
+    }));
     let handle = client.open("grid.npy").expect("open");
 
     let array = client
@@ -128,7 +134,7 @@ fn a_file_truncated_under_a_transfer_fails_it_without_retrying() {
     let path = server.write_npy("grid.npy", &SHAPE);
     let expected = server.write_counting_npy("intact.npy", &SHAPE);
     let proxy = Proxy::start(server.data_addr, Fault::None);
-    let client = server.connect_with(through(&proxy, |_| {}));
+    let client = server.connect_with(through(&proxy, |c| c.streams = 4));
     let handle = client.open("grid.npy").expect("open");
     let plan = client.prepare(handle, "array", &[]).expect("prepare");
 

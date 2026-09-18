@@ -19,9 +19,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Streams granted when the client expresses no preference.
 ///
 /// Matches the client default: a client asking for "whatever you think" is
-/// almost always one that has not been tuned, and four streams is the point
-/// where a single connection stops being the limit on a fast link.
-pub const DEFAULT_STREAMS: u32 = 4;
+/// almost always one that has not been tuned.
+pub const DEFAULT_STREAMS: u32 = 8;
 
 /// Codecs this server can produce. Bit 0 is RAW.
 pub const SUPPORTED_CODECS: u32 = 1;
