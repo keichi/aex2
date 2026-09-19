@@ -8,6 +8,7 @@
 //! - `pair`: each connection has a reader thread and a writer thread
 //! - `pool`: P reader threads shared by every connection, one writer each
 //! - `fadvise`: `serial`, with the next `--depth` pieces hinted to the kernel
+//! - `pair-fadvise`: `pair`, with the reader hinting as well
 //! - `uring`: one thread per connection, reads on its own io_uring, blocking send
 //! - `uring-copy` / `uring-zc`: reads and sends both on the ring
 //!
@@ -37,6 +38,7 @@ enum Mode {
     Pair,
     Pool,
     Fadvise,
+    PairFadvise,
     Uring,
     UringCopy,
     UringZc,
@@ -220,9 +222,10 @@ fn main() -> std::io::Result<()> {
                 let started = Instant::now();
                 match mode {
                     Mode::Serial => serial(&file, &ranges, conns, shape),
-                    Mode::Pair => pair(&file, &ranges, conns, shape, buffers),
+                    Mode::Pair => pair(&file, &ranges, conns, shape, buffers, 0),
                     Mode::Pool => pool(&file, &ranges, conns, shape, buffers, readers),
                     Mode::Fadvise => fadvise(&file, &ranges, conns, shape, depth),
+                    Mode::PairFadvise => pair(&file, &ranges, conns, shape, buffers, depth),
                     _ => uring::run(&file, &ranges, conns, shape, depth, mode, verify, &stats),
                 }?;
                 runs.push(Run {
@@ -234,6 +237,7 @@ fn main() -> std::io::Result<()> {
             let label = match mode {
                 Mode::Serial => "serial".to_string(),
                 Mode::Pair => format!("pair buffers={buffers}"),
+                Mode::PairFadvise => format!("pair-fadvise buffers={buffers} depth={depth}"),
                 Mode::Pool => format!("pool readers={readers} buffers={buffers}"),
                 Mode::Fadvise => format!("fadvise depth={depth}"),
                 Mode::Uring => format!("uring depth={depth}"),
@@ -396,6 +400,27 @@ fn serial(
     })
 }
 
+/// Start the kernel reading the `depth` pieces from `at` on.
+fn prime(file: &File, shape: Shape, range: Range, at: u64, depth: usize) -> std::io::Result<()> {
+    for i in 0..depth as u64 {
+        let ahead = at + i * shape.span();
+        if ahead >= range.end {
+            break;
+        }
+        shape.will_need(file, ahead)?;
+    }
+    Ok(())
+}
+
+/// Keep the hint `depth` pieces ahead of the piece being read.
+fn hint(file: &File, shape: Shape, range: Range, at: u64, depth: usize) -> std::io::Result<()> {
+    let ahead = at + depth as u64 * shape.span();
+    if depth > 0 && ahead < range.end {
+        shape.will_need(file, ahead)?;
+    }
+    Ok(())
+}
+
 /// `serial`, with the read of the next `depth` pieces already under way.
 ///
 /// The cheapest way to have more than one read in flight per connection: the
@@ -409,21 +434,10 @@ fn fadvise(
 ) -> std::io::Result<()> {
     per_conn(ranges, conns, |_, range, mut conn| {
         let mut buf = vec![0u8; shape.piece];
-        let window = depth as u64 * shape.span();
-        let advise = |at: u64| {
-            if at < range.end {
-                shape.will_need(file, at)
-            } else {
-                Ok(())
-            }
-        };
-        for i in 0..depth as u64 {
-            advise(range.start + i * shape.span())?;
-        }
+        prime(file, shape, range, range.start, depth)?;
         let mut at = range.start;
         while at < range.end {
-            // Keep the hint `depth` pieces ahead of where the reading is.
-            advise(at + window)?;
+            hint(file, shape, range, at, depth)?;
             shape.read(file, at, &mut buf)?;
             send_piece(&mut conn, &buf)?;
             at += shape.span();
@@ -438,6 +452,7 @@ fn pair(
     conns: Vec<TcpStream>,
     shape: Shape,
     buffers: usize,
+    depth: usize,
 ) -> std::io::Result<()> {
     per_conn(ranges, conns, |_, range, mut conn| {
         let (free_tx, free_rx) = channel::<Vec<u8>>();
@@ -447,9 +462,11 @@ fn pair(
         }
         std::thread::scope(|scope| {
             let reader = scope.spawn(move || -> std::io::Result<()> {
+                prime(file, shape, range, range.start, depth)?;
                 let mut at = range.start;
                 while at < range.end {
                     let mut buf = free_rx.recv().expect("writer alive");
+                    hint(file, shape, range, at, depth)?;
                     shape.read(file, at, &mut buf)?;
                     full_tx.send((buf, shape.piece)).expect("writer alive");
                     at += shape.span();
