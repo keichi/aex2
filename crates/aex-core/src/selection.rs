@@ -561,6 +561,23 @@ impl SelectionLayout {
         }
     }
 
+    /// Where `[offset, offset + len)` of the logical stream lies in the source,
+    /// when the selection is one run.
+    ///
+    /// `None` for a gathered selection, where one logical range is many source
+    /// ranges and the caller has to walk them, and `None` for a range with
+    /// nothing in it. The range is clipped to the stream, because the callers
+    /// of this are asking in order to read ahead.
+    pub fn source_run(&self, offset: u64, len: u64) -> Option<(u64, u64)> {
+        match &self.kind {
+            LayoutKind::Contiguous { src_offset, .. } => {
+                let len = len.min(self.total_bytes.checked_sub(offset)?);
+                (len > 0).then_some((src_offset + offset, len))
+            }
+            LayoutKind::Gathered(_) => None,
+        }
+    }
+
     /// Reject a range that falls outside the logical byte stream.
     pub fn check_range(&self, offset: u64, len: u64) -> Result<()> {
         let end = offset.checked_add(len);
@@ -1217,6 +1234,30 @@ mod tests {
                 len: 8
             }
         );
+    }
+
+    #[test]
+    fn a_contiguous_layout_says_where_a_range_comes_from() {
+        // Row 10 of a (100, 200) int32 array: one run, 200 * 4 bytes in.
+        let layout = layout(&[100, 200], DType::Int32, &[Index::Single(10)]).expect("layout");
+        let base = 10 * 200 * 4;
+        assert_eq!(layout.source_run(0, 40), Some((base, 40)));
+        assert_eq!(layout.source_run(40, 40), Some((base + 40, 40)));
+        // Read-ahead asks past the end, and gets what is there.
+        assert_eq!(layout.source_run(600, 1000), Some((base + 600, 200)));
+        assert_eq!(layout.source_run(800, 8), None);
+    }
+
+    #[test]
+    fn a_gathered_layout_says_a_range_is_not_one_run() {
+        let layout = layout(
+            &[100, 200],
+            DType::Int32,
+            &[Index::full(), Index::range(0, 100)],
+        )
+        .expect("layout");
+        assert!(matches!(layout.kind, LayoutKind::Gathered(_)));
+        assert_eq!(layout.source_run(0, 40), None);
     }
 
     #[test]

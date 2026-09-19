@@ -87,6 +87,13 @@ pub trait ArrayDataset: Send + Sync {
     /// mutability.
     fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()>;
 
+    /// Ask the storage to start fetching `[offset, offset + len)` of the
+    /// logical stream, so the read that follows does not wait for the disk.
+    ///
+    /// Advisory: the default does nothing, and a backend that cannot map the
+    /// range to storage without doing the work twice should leave it that way.
+    fn will_need(&self, _layout: &SelectionLayout, _offset: u64, _len: u64) {}
+
     /// Size of one decoded storage chunk, for a backend that decodes whole
     /// chunks into a shared cache. The server warns when the cache cannot hold
     /// one per stream, since the streams would then evict each other.

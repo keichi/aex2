@@ -17,6 +17,10 @@ flate2 = { workspace = true, optional = true }
 hdf5 = { workspace = true, optional = true }
 hdf5-sys = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# posix_fadvise, to start a read before it is wanted.
+libc = "0.2"
+
 [features]
 # Needs libhdf5 >= 1.14 at build time.
 hdf5 = ["dep:flate2", "dep:hdf5", "dep:hdf5-sys"]

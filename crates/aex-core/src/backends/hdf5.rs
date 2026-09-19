@@ -286,6 +286,16 @@ impl ArrayDataset for Hdf5Dataset {
         }
     }
 
+    fn will_need(&self, layout: &SelectionLayout, offset: u64, len: u64) {
+        // Only an uncompressed contiguous dataset maps a logical range to one
+        // file range; a chunked one is served through the decode cache.
+        if let Storage::Contiguous(base) = &self.storage {
+            if let Some((at, len)) = layout.source_run(offset, len) {
+                super::will_need(&self.raw, base + at, len);
+            }
+        }
+    }
+
     fn decoded_chunk_bytes(&self) -> Option<u64> {
         match &self.storage {
             Storage::Chunked(chunked) if !chunked.filters.is_empty() => Some(chunked.chunk_bytes),

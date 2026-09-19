@@ -33,6 +33,7 @@ dependencies = [
  "half",
  "hdf5-metno",
  "hdf5-metno-sys",
+ "libc",
  "npyz",
  "num-complex",
  "tempfile",

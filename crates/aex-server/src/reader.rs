@@ -73,7 +73,17 @@ struct Inline {
     buffer: Option<Vec<u8>>,
     /// What is left of the range being served.
     pending: Option<ReadRequest>,
+    /// How far into the logical stream the storage has been asked to read.
+    hinted: u64,
 }
+
+/// How far ahead of the piece being read the storage is asked to fetch.
+///
+/// A cold read is as deep as what is in flight, and one thread can only have
+/// one read in flight by itself. Measured on a virtio disk: the throughput
+/// stops climbing past about this much, and the hint costs a syscall per piece
+/// whatever its size.
+const READ_AHEAD_BYTES: u64 = 4 << 20;
 
 /// The reader thread of one connection, and the channels it shares with it.
 struct Threaded {
@@ -101,6 +111,7 @@ impl ReadPipeline {
             Mode::Inline(RefCell::new(Inline {
                 buffer: Some(vec![0u8; piece_bytes]),
                 pending: None,
+                hinted: 0,
             }))
         } else {
             Mode::Threaded(Threaded::start(buffers, piece_bytes)?)
@@ -118,7 +129,9 @@ impl ReadPipeline {
         let request = ReadRequest { entry, offset, len };
         match &self.mode {
             Mode::Inline(inline) => {
-                inline.borrow_mut().pending = Some(request);
+                let mut inline = inline.borrow_mut();
+                inline.hinted = request.offset;
+                inline.pending = Some(request);
                 Ok(())
             }
             Mode::Threaded(threaded) => threaded
@@ -172,6 +185,18 @@ impl Inline {
         let mut bytes = self.buffer.take().unwrap_or_else(|| vec![0u8; piece_bytes]);
         let piece = request.len.min(bytes.len() as u64) as usize;
         let at = request.offset;
+
+        // Ask for what comes after this piece before blocking on this one, so
+        // that a cold read is already under way by the time it is wanted.
+        let window = at.saturating_add(READ_AHEAD_BYTES).min(at + request.len);
+        if window > self.hinted {
+            let from = self.hinted.max(at);
+            request
+                .entry
+                .dataset()
+                .will_need(request.entry.layout(), from, window - from);
+            self.hinted = window;
+        }
         if let Err(e) =
             request
                 .entry
@@ -301,6 +326,8 @@ mod tests {
         shape: Vec<u64>,
         reads: AtomicU64,
         fail_at: Option<u64>,
+        /// The end of the furthest range read-ahead was asked for.
+        hinted: AtomicU64,
     }
 
     impl ArrayDataset for Counting {
@@ -325,6 +352,10 @@ mod tests {
             }
             Ok(())
         }
+
+        fn will_need(&self, _layout: &SelectionLayout, offset: u64, len: u64) {
+            self.hinted.fetch_max(offset + len, Ordering::Relaxed);
+        }
     }
 
     fn entry_of(len: u64, fail_at: Option<u64>) -> (Arc<TransferEntry>, Arc<Counting>) {
@@ -332,6 +363,7 @@ mod tests {
             shape: vec![len],
             reads: AtomicU64::new(0),
             fail_at,
+            hinted: AtomicU64::new(0),
         });
         let layout =
             SelectionLayout::resolve(&[len], DType::Uint8, &[], &QualitySpec::exact()).unwrap();
@@ -357,6 +389,45 @@ mod tests {
                 Piece::Failed(e) => return (data, Some(e)),
             }
         }
+    }
+
+    #[test]
+    fn reading_inline_asks_for_the_pieces_after_the_one_it_is_reading() {
+        let len = 4 * READ_AHEAD_BYTES;
+        let (entry, dataset) = entry_of(len, None);
+        let pipeline = ReadPipeline::start(1, 4096).expect("start");
+        pipeline.request(entry, 0, len).expect("request");
+
+        let Piece::Data { bytes, .. } = pipeline.next_piece().expect("a piece") else {
+            panic!("the first piece is data");
+        };
+        assert_eq!(
+            dataset.hinted.load(Ordering::Relaxed),
+            READ_AHEAD_BYTES,
+            "the first piece read should have asked for a window past itself"
+        );
+        assert_eq!(dataset.reads.load(Ordering::Relaxed), 1, "one piece read");
+        pipeline.recycle(bytes);
+
+        // The window slides rather than being asked for again from the start.
+        while let Piece::Data { bytes, .. } = pipeline.next_piece().expect("a piece") {
+            pipeline.recycle(bytes);
+        }
+        assert_eq!(dataset.hinted.load(Ordering::Relaxed), len);
+    }
+
+    /// Read-ahead is for the connection's own thread; the reader thread has its
+    /// own buffers ahead of the writer and would only ask twice.
+    #[test]
+    fn the_reader_thread_does_not_ask_for_read_ahead() {
+        let (entry, dataset) = entry_of(8192, None);
+        let pipeline = ReadPipeline::start(3, 4096).expect("start");
+        pipeline.request(entry, 0, 8192).expect("request");
+        let (pieces, failure) = drain(&pipeline);
+
+        assert!(failure.is_none());
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(dataset.hinted.load(Ordering::Relaxed), 0);
     }
 
     #[test]

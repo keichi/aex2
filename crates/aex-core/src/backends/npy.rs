@@ -198,6 +198,12 @@ impl ArrayDataset for NpyDataset {
     fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()> {
         layout.read_with(offset, dst, |at, buf| self.read_bytes_at(at, buf))
     }
+
+    fn will_need(&self, layout: &SelectionLayout, offset: u64, len: u64) {
+        if let Some((at, len)) = layout.source_run(offset, len) {
+            super::will_need(&self.file, self.data_offset + at, len);
+        }
+    }
 }
 
 /// A `.npy` presented as a hierarchy: a root group holding one dataset.
