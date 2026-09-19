@@ -143,14 +143,11 @@ $ ssh aex2-eval1 "bash -lc 'cd aex2 && cargo clippy --all-targets --all-features
 
 | TOML | 制御 / データ | 違い |
 |---|---|---|
-| `aex.toml` | 50191 / 50192 | 基準 (すべて既定値。`read_buffers` は 1) |
-| `aex-read-buffers-1.toml` | 50291 / 50292 | `read_buffers = 1` を明示 (既定と同じ) |
-| `aex-read-buffers-2.toml` | 50491 / 50492 | `read_buffers = 2` (スレッドは 1 と違い有り、プールは最浅) |
-| `aex-read-buffers-3.toml` | 50591 / 50592 | `read_buffers = 3` (M6 より前の既定値) |
+| `aex.toml` | 50191 / 50192 | 基準 (すべて既定値) |
 | `aex-decode-cache-64m.toml` | 50391 / 50392 | `decode_cache_bytes` を 64 MiB に。圧縮 HDF5 を毎回伸長させる |
 
 ```console
-$ for c in aex aex-read-buffers-1 aex-read-buffers-2 aex-read-buffers-3 aex-decode-cache-64m; do
+$ for c in aex aex-decode-cache-64m; do
     ssh aex2-eval1 "cd aex2; mkdir -p ~/logs; setsid nohup target/release/aex-server \
       --config benchmarks/mdx2/$c.toml > ~/logs/$c.log 2>&1 < /dev/null &"
   done

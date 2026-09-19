@@ -77,22 +77,9 @@ pub struct Limits {
 #[serde(deny_unknown_fields, default)]
 pub struct Transfer {
     pub default_chunk_bytes: u64,
-    /// Read buffers per connection, circulating between its reader thread and
-    /// its writer. One makes the two take turns; two or more lets them overlap.
-    ///
-    /// The number picks two things at once, and only the first matters much:
-    /// whether the reading gets a thread of its own (one does not, two or more
-    /// do), and how deep the pool is. Two and three measure the same.
-    ///
-    /// Overlapping is worth at most `1 + min(read, send) / max(read, send)`,
-    /// so it pays only while the two sides are of similar speed, and the thread
-    /// costs a core whether it pays or not. One is the setting that is never
-    /// badly wrong; raise it where reading and sending are measured to be in
-    /// the same range.
-    pub read_buffers: u32,
-    /// Size of each of those buffers, and so how much of a fetch one `DATA`
-    /// frame carries. A fetch larger than this is answered in several frames,
-    /// which is what gives the reader and the writer something to overlap.
+    /// The buffer one connection reads into, and so how much of a fetch one
+    /// `DATA` frame carries. A fetch larger than this is answered in several
+    /// frames, which is what lets the storage read ahead of the sending.
     pub read_buffer_bytes: u64,
     pub max_fetch_bytes: u64,
     /// Selections at most this large come back inside the transfer plan, which
@@ -154,7 +141,6 @@ impl Default for Transfer {
     fn default() -> Self {
         Transfer {
             default_chunk_bytes: 4 * 1024 * 1024,
-            read_buffers: 1,
             read_buffer_bytes: 512 * 1024,
             max_fetch_bytes: 16 * 1024 * 1024,
             inline_limit_bytes: 64 * 1024,
@@ -214,9 +200,6 @@ impl ServerConfig {
         if self.transfer.default_chunk_bytes == 0 {
             return bad("transfer.default_chunk_bytes must be at least 1".to_string());
         }
-        if self.transfer.read_buffers == 0 {
-            return bad("transfer.read_buffers must be at least 1".to_string());
-        }
         if self.transfer.read_buffer_bytes == 0 {
             return bad("transfer.read_buffer_bytes must be at least 1".to_string());
         }
@@ -255,7 +238,6 @@ mod tests {
         assert_eq!(cfg.limits.max_sessions, 64);
         assert_eq!(cfg.transfer.default_chunk_bytes, 4 * 1024 * 1024);
         assert_eq!(cfg.transfer.inline_limit_bytes, 64 * 1024);
-        assert_eq!(cfg.transfer.read_buffers, 1);
         assert_eq!(cfg.transfer.read_buffer_bytes, 512 * 1024);
         assert_eq!(cfg.transfer.decode_cache_bytes, 1 << 30);
         assert!(cfg.tcp.nodelay);

@@ -5,38 +5,29 @@
 //! disk works. For data that does not fit in memory — which is what this whole
 //! system is for — that difference is most of the throughput.
 //!
-//! So each connection gets a reader thread. It takes what the connection was
-//! asked for, cuts it into pieces, fills a buffer with each, and hands them over
-//! as they come; the connection thread writes each piece out and hands the
-//! buffer straight back. A fixed set of buffers circulates between the two, so
-//! a transfer in progress allocates nothing and neither side can run away from
-//! the other.
+//! The overlap is bought from the kernel rather than from a second thread: the
+//! range is cut into pieces, and before blocking on one the storage is told to
+//! start fetching the window after it. The disk then works while the socket
+//! does, with one thread, one buffer and no handoff.
+//!
+//! A reader thread was tried instead and measured worse: two threads passing a
+//! buffer cost more than they save except on one connection, and even there the
+//! same two threads spent on two connections go faster.
 //!
 //! The pieces go out as separate `DATA` frames, which the protocol allows for
 //! exactly this reason: what a fetch asks for and what one frame carries were
 //! never required to be the same thing.
-//!
-//! Whether this pays depends on which side is slower. When the link is slower
-//! than the storage — which is the case this system is built for — overlapping
-//! them is most of the throughput. When the storage is the slower side by a
-//! wide margin, as it is over loopback, there is nothing much to overlap and
-//! the handoff is pure cost. `read_buffers = 1` says so: the reading then
-//! happens on the connection's own thread, with no second thread at all.
 
 use std::cell::RefCell;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use aex_core::AexError;
 
-use crate::error::{Result, ServerError};
 use crate::transfer::TransferEntry;
 
 /// A range of one transfer, for the reader to produce.
 ///
-/// Inline, the offset and the length are walked forward as pieces come out of
-/// it; on the reader thread they are only ever read.
+/// The offset and the length are walked forward as pieces come out of it.
 struct ReadRequest {
     entry: Arc<TransferEntry>,
     offset: u64,
@@ -59,14 +50,6 @@ pub enum Piece {
     Failed(AexError),
 }
 
-/// Where the reading happens.
-enum Mode {
-    /// On the connection's own thread. No handoff, and no overlap.
-    Inline(RefCell<Inline>),
-    /// On a thread of its own, overlapping with the writing.
-    Threaded(Threaded),
-}
-
 /// Reading on the caller's thread, one piece at a time.
 struct Inline {
     /// Taken by `next_piece` and put back by `recycle`.
@@ -85,38 +68,26 @@ struct Inline {
 /// whatever its size.
 const READ_AHEAD_BYTES: u64 = 4 << 20;
 
-/// The reader thread of one connection, and the channels it shares with it.
-struct Threaded {
-    /// `None` once shut down, so that the reader sees its work end.
-    work: Option<Sender<ReadRequest>>,
-    pieces: Receiver<Piece>,
-    /// Buffers the connection thread has finished writing.
-    free: Option<Sender<Vec<u8>>>,
-    thread: Option<JoinHandle<()>>,
-}
-
 /// How a connection reads what it is asked to send.
 pub struct ReadPipeline {
-    mode: Mode,
+    inline: RefCell<Inline>,
     piece_bytes: usize,
 }
 
 impl ReadPipeline {
-    /// Start a reader with `buffers` buffers of `piece_bytes` each.
+    /// Start a reader with one buffer of `piece_bytes`.
     ///
-    /// One buffer means no second thread: the reading happens inline, and the
-    /// two never overlap. Two or more starts the reader.
-    pub fn start(buffers: u32, piece_bytes: usize) -> Result<Self> {
-        let mode = if buffers <= 1 {
-            Mode::Inline(RefCell::new(Inline {
+    /// Allocated once and reused, so a transfer in progress never asks the
+    /// allocator for anything.
+    pub fn start(piece_bytes: usize) -> Self {
+        ReadPipeline {
+            inline: RefCell::new(Inline {
                 buffer: Some(vec![0u8; piece_bytes]),
                 pending: None,
                 hinted: 0,
-            }))
-        } else {
-            Mode::Threaded(Threaded::start(buffers, piece_bytes)?)
-        };
-        Ok(ReadPipeline { mode, piece_bytes })
+            }),
+            piece_bytes,
+        }
     }
 
     /// How much of a fetch one piece carries.
@@ -125,49 +96,21 @@ impl ReadPipeline {
     }
 
     /// Ask for a range. The pieces of it come back from [`Self::next_piece`].
-    pub fn request(&self, entry: Arc<TransferEntry>, offset: u64, len: u64) -> Result<()> {
-        let request = ReadRequest { entry, offset, len };
-        match &self.mode {
-            Mode::Inline(inline) => {
-                let mut inline = inline.borrow_mut();
-                inline.hinted = request.offset;
-                inline.pending = Some(request);
-                Ok(())
-            }
-            Mode::Threaded(threaded) => threaded
-                .work
-                .as_ref()
-                .and_then(|work| work.send(request).ok())
-                .ok_or_else(stopped),
-        }
+    pub fn request(&self, entry: Arc<TransferEntry>, offset: u64, len: u64) {
+        let mut inline = self.inline.borrow_mut();
+        inline.hinted = offset;
+        inline.pending = Some(ReadRequest { entry, offset, len });
     }
 
     /// The next piece of the range that was asked for.
-    pub fn next_piece(&self) -> Result<Piece> {
-        match &self.mode {
-            Mode::Inline(inline) => Ok(inline.borrow_mut().next(self.piece_bytes)),
-            Mode::Threaded(threaded) => threaded.pieces.recv().map_err(|_| stopped()),
-        }
+    pub fn next_piece(&self) -> Piece {
+        self.inline.borrow_mut().next(self.piece_bytes)
     }
 
     /// Give a buffer back once it has been written out.
     pub fn recycle(&self, bytes: Vec<u8>) {
-        match &self.mode {
-            Mode::Inline(inline) => inline.borrow_mut().buffer = Some(bytes),
-            // A closed pool means the reader has already stopped, and the
-            // buffer is of no use to anyone; dropping it is the whole of the
-            // cleanup.
-            Mode::Threaded(threaded) => {
-                if let Some(free) = &threaded.free {
-                    let _ = free.send(bytes);
-                }
-            }
-        }
+        self.inline.borrow_mut().buffer = Some(bytes);
     }
-}
-
-fn stopped() -> ServerError {
-    ServerError::Protocol("the reader thread has stopped".to_string())
 }
 
 impl Inline {
@@ -214,101 +157,6 @@ impl Inline {
             offset: at,
             bytes,
             len: piece,
-        }
-    }
-}
-
-impl Threaded {
-    fn start(buffers: u32, piece_bytes: usize) -> Result<Self> {
-        let (work_tx, work_rx) = channel::<ReadRequest>();
-        let (piece_tx, piece_rx) = channel::<Piece>();
-        let (free_tx, free_rx) = channel::<Vec<u8>>();
-
-        // Allocated once, up front: the point of the pool is that a transfer in
-        // progress never has to ask the allocator for anything.
-        for _ in 0..buffers {
-            free_tx
-                .send(vec![0u8; piece_bytes])
-                .map_err(|_| ServerError::Protocol("the read pool closed at once".to_string()))?;
-        }
-
-        let thread = std::thread::Builder::new()
-            .name("aex-data-read".to_string())
-            .spawn(move || read_loop(&work_rx, &piece_tx, &free_rx))?;
-
-        Ok(Threaded {
-            work: Some(work_tx),
-            pieces: piece_rx,
-            free: Some(free_tx),
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for Threaded {
-    fn drop(&mut self) {
-        // Both senders have to go before the reader can see that there is
-        // nothing more coming, whichever of the two it is waiting on.
-        self.work.take();
-        self.free.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn read_loop(work: &Receiver<ReadRequest>, pieces: &Sender<Piece>, free: &Receiver<Vec<u8>>) {
-    // The buffer of a failed read never went out, so it is kept here for the
-    // next one; dropping it would shrink the pool until the reader starves.
-    let mut spare: Option<Vec<u8>> = None;
-    while let Ok(request) = work.recv() {
-        let mut offset = request.offset;
-        let mut remaining = request.len;
-
-        let outcome = loop {
-            if remaining == 0 {
-                break Piece::Done;
-            }
-            // Blocks until the connection thread has written one out, which is
-            // what keeps the reader from running ahead without bound.
-            let mut bytes = match spare.take() {
-                Some(bytes) => bytes,
-                None => match free.recv() {
-                    Ok(bytes) => bytes,
-                    Err(_) => return,
-                },
-            };
-
-            // The buffer keeps its full length; only this much of it is read
-            // into. Shrinking it and growing it back would zero the difference
-            // before every fetch, for bytes about to be overwritten anyway.
-            let piece = remaining.min(bytes.len() as u64) as usize;
-            if let Err(e) = request.entry.dataset().read_range(
-                request.entry.layout(),
-                offset,
-                &mut bytes[..piece],
-            ) {
-                spare = Some(bytes);
-                break Piece::Failed(e);
-            }
-
-            let at = offset;
-            offset += piece as u64;
-            remaining -= piece as u64;
-            if pieces
-                .send(Piece::Data {
-                    offset: at,
-                    bytes,
-                    len: piece,
-                })
-                .is_err()
-            {
-                return;
-            }
-        };
-
-        if pieces.send(outcome).is_err() {
-            return;
         }
     }
 }
@@ -380,7 +228,7 @@ mod tests {
     fn drain(pipeline: &ReadPipeline) -> (Vec<(u64, Vec<u8>)>, Option<AexError>) {
         let mut data = Vec::new();
         loop {
-            match pipeline.next_piece().expect("the reader is alive") {
+            match pipeline.next_piece() {
                 Piece::Data { offset, bytes, len } => {
                     data.push((offset, bytes[..len].to_vec()));
                     pipeline.recycle(bytes);
@@ -395,10 +243,10 @@ mod tests {
     fn reading_inline_asks_for_the_pieces_after_the_one_it_is_reading() {
         let len = 4 * READ_AHEAD_BYTES;
         let (entry, dataset) = entry_of(len, None);
-        let pipeline = ReadPipeline::start(1, 4096).expect("start");
-        pipeline.request(entry, 0, len).expect("request");
+        let pipeline = ReadPipeline::start(4096);
+        pipeline.request(entry, 0, len);
 
-        let Piece::Data { bytes, .. } = pipeline.next_piece().expect("a piece") else {
+        let Piece::Data { bytes, .. } = pipeline.next_piece() else {
             panic!("the first piece is data");
         };
         assert_eq!(
@@ -410,31 +258,17 @@ mod tests {
         pipeline.recycle(bytes);
 
         // The window slides rather than being asked for again from the start.
-        while let Piece::Data { bytes, .. } = pipeline.next_piece().expect("a piece") {
+        while let Piece::Data { bytes, .. } = pipeline.next_piece() {
             pipeline.recycle(bytes);
         }
         assert_eq!(dataset.hinted.load(Ordering::Relaxed), len);
     }
 
-    /// Read-ahead is for the connection's own thread; the reader thread has its
-    /// own buffers ahead of the writer and would only ask twice.
-    #[test]
-    fn the_reader_thread_does_not_ask_for_read_ahead() {
-        let (entry, dataset) = entry_of(8192, None);
-        let pipeline = ReadPipeline::start(3, 4096).expect("start");
-        pipeline.request(entry, 0, 8192).expect("request");
-        let (pieces, failure) = drain(&pipeline);
-
-        assert!(failure.is_none());
-        assert_eq!(pieces.len(), 2);
-        assert_eq!(dataset.hinted.load(Ordering::Relaxed), 0);
-    }
-
     #[test]
     fn a_request_comes_back_in_pieces_that_cover_it_exactly() {
         let (entry, _) = entry_of(1000, None);
-        let pipeline = ReadPipeline::start(3, 256).expect("start");
-        pipeline.request(entry, 0, 1000).expect("request");
+        let pipeline = ReadPipeline::start(256);
+        pipeline.request(entry, 0, 1000);
 
         let (pieces, failure) = drain(&pipeline);
         assert!(failure.is_none());
@@ -455,20 +289,17 @@ mod tests {
     }
 
     #[test]
-    fn one_buffer_reads_inline_and_still_covers_the_range() {
-        // No second thread at all: the escape hatch for a deployment whose
-        // storage is so much slower than its link that overlapping the two
-        // buys less than handing the buffers between threads costs.
+    fn a_request_from_an_offset_starts_and_ends_where_it_was_asked_to() {
         let (entry, _) = entry_of(600, None);
-        let pipeline = ReadPipeline::start(1, 256).expect("start");
-        pipeline.request(entry, 100, 400).expect("request");
+        let pipeline = ReadPipeline::start(256);
+        pipeline.request(entry, 100, 400);
 
         let (pieces, failure) = drain(&pipeline);
         assert!(failure.is_none());
         assert_eq!(
             pieces.iter().map(|(_, b)| b.len()).sum::<usize>(),
             400,
-            "the pieces cover the range whatever the pool size"
+            "the pieces cover the range"
         );
         assert_eq!(pieces[0].0, 100, "and start where they were asked to");
     }
@@ -476,8 +307,8 @@ mod tests {
     #[test]
     fn a_read_that_fails_stops_the_request_and_says_so() {
         let (entry, dataset) = entry_of(1000, Some(512));
-        let pipeline = ReadPipeline::start(2, 256).expect("start");
-        pipeline.request(entry, 0, 1000).expect("request");
+        let pipeline = ReadPipeline::start(256);
+        pipeline.request(entry, 0, 1000);
 
         let (pieces, failure) = drain(&pipeline);
         assert!(failure.is_some(), "the failure has to reach the caller");
@@ -489,13 +320,13 @@ mod tests {
     #[test]
     fn failed_reads_do_not_use_up_the_buffers() {
         let (entry, _) = entry_of(1000, Some(0));
-        let pipeline = ReadPipeline::start(2, 256).expect("start");
+        let pipeline = ReadPipeline::start(256);
         // More failures than there are buffers; a leak would hang here.
         for _ in 0..5 {
-            pipeline.request(entry.clone(), 0, 100).expect("request");
+            pipeline.request(entry.clone(), 0, 100);
             assert!(drain(&pipeline).1.is_some());
         }
-        pipeline.request(entry, 256, 600).expect("request");
+        pipeline.request(entry, 256, 600);
         let (pieces, failure) = drain(&pipeline);
         assert!(failure.is_none());
         assert_eq!(pieces.len(), 3);
@@ -504,11 +335,9 @@ mod tests {
     #[test]
     fn the_reader_serves_one_request_after_another() {
         let (entry, _) = entry_of(1000, None);
-        let pipeline = ReadPipeline::start(2, 512).expect("start");
+        let pipeline = ReadPipeline::start(512);
         for offset in [0u64, 200, 400] {
-            pipeline
-                .request(entry.clone(), offset, 100)
-                .expect("request");
+            pipeline.request(entry.clone(), offset, 100);
             let (pieces, failure) = drain(&pipeline);
             assert!(failure.is_none());
             assert_eq!(pieces.len(), 1);
@@ -517,11 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_pipeline_stops_its_thread() {
-        let pipeline = ReadPipeline::start(2, 64).expect("start");
-        assert_eq!(pipeline.piece_bytes(), 64);
-        // Nothing to assert beyond the fact that this returns: Drop joins the
-        // reader, so a thread that did not notice would hang the test.
-        drop(pipeline);
+    fn the_piece_size_is_what_it_was_started_with() {
+        assert_eq!(ReadPipeline::start(64).piece_bytes(), 64);
     }
 }

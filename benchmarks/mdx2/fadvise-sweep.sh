@@ -2,10 +2,11 @@
 #
 # poolbench: is read-ahead worth it against the best the server can do today?
 #
-# `fadvise` is what `read_buffers = 1` would become: one thread, one buffer,
-# and the next pieces hinted to the kernel. It is compared with both of the
-# shapes the server has now (`serial` = read_buffers 1, `pair` = 3) and with
-# the two together, over memory-resident and cold data, contiguous and strided.
+# `fadvise` is one thread, one buffer, and the next pieces hinted to the kernel,
+# which is what the server does now. It is compared with what it did before
+# (`serial`, and `pair` for the reader thread that used to be an option) and
+# with the two together, over memory-resident and cold data, contiguous and
+# strided.
 #
 # The two buy different things — a second core, and read depth — so compare at
 # equal thread counts too: `pair-fadvise` at 4 connections is 8 threads, and so

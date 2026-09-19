@@ -16,7 +16,7 @@
 # shared link drifts over the day; take the median across passes.
 #
 # Usage: benchmarks/mdx2/param-sweep.sh [reps]
-#   Both servers must be up: aex.toml (50191) and aex-read-buffers-1.toml (50291).
+#   The server must be up: aex.toml (50191).
 
 set -euo pipefail
 
@@ -32,8 +32,7 @@ CREDITS=(1 2 4 8 16 64)
 RCVBUFS=(0 4194304 16777216 67108864 268435456)
 
 BYTES=$((4 << 30))
-PORT_DEFAULT=50191    # aex.toml, read_buffers = 3
-PORT_BUFFERS_1=50291  # aex-read-buffers-1.toml
+PORT_DEFAULT=50191    # aex.toml
 
 restore() {
     clear_rtt
@@ -68,12 +67,5 @@ for r in $(seq "$REPS"); do
         for b in "${RCVBUFS[@]}"; do
             run $PORT_DEFAULT "$p rcvbuf" --streams $BASE_STREAMS --chunk $BASE_CHUNK \
                 --credit $BASE_CREDIT --rcvbuf "$b"
-        done
-        # The server side knob, at the base point and at the stream count where
-        # M4 saw the two settings diverge.
-        for s in $BASE_STREAMS 16; do
-            run $PORT_BUFFERS_1 "$p read_buffers=1" --streams "$s" --chunk $BASE_CHUNK \
-                --credit $BASE_CREDIT
-        done
-    done
+        done    done
 done

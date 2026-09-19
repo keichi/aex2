@@ -315,13 +315,9 @@ fn check_hello(bytes: &[u8; HELLO_LEN], context: &Context) -> Result<Arc<Session
 /// Serve fetches until the peer hangs up, goes quiet or breaks the protocol.
 fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) -> Result<()> {
     let idle = Duration::from_secs(context.config.limits.data_conn_idle_timeout_sec);
-    // The reader that fills buffers while this thread writes the last one out.
-    // Its pool is allocated here and circulates for the life of the connection,
+    // The buffer is allocated here and reused for the life of the connection,
     // so a transfer in progress allocates nothing.
-    let pipeline = ReadPipeline::start(
-        context.config.transfer.read_buffers,
-        context.config.transfer.read_buffer_bytes as usize,
-    )?;
+    let pipeline = ReadPipeline::start(context.config.transfer.read_buffer_bytes as usize);
 
     loop {
         let mut bytes = [0u8; HEADER_LEN];
@@ -436,9 +432,9 @@ fn handle_fetch(
     // Hand the range to the reader and write out each piece as it arrives. The
     // pieces go as separate DATA frames; a fetch and a frame were never
     // required to be the same size, and this is what that is for.
-    pipeline.request(entry.clone(), header.offset, header.logical_len)?;
+    pipeline.request(entry.clone(), header.offset, header.logical_len);
     loop {
-        match pipeline.next_piece()? {
+        match pipeline.next_piece() {
             Piece::Data { offset, bytes, len } => {
                 let frame = FrameHeader::data(header.request_id, offset, len as u64);
                 let sent = write_frame(stream, &frame, &bytes[..len]);
