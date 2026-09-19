@@ -74,7 +74,8 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 [ストレージを外した場合](docs/benchmark-null-backend.md)、
 [sendfile を採らない理由](docs/sendfile.md)、
 [io_uring を採らない理由](docs/benchmark-uring.md)、
-[先読みの効果](docs/benchmark-fadvise.md))。Linux 機での測定は
+[先読みの効果](docs/benchmark-fadvise.md)、
+[非連続選択の歩き方](docs/benchmark-gather-walk.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、mdx2 の VM 2 台を実ネットワークで
 繋いだ測定は [docs/benchmark-mdx2.md](docs/benchmark-mdx2.md)、そこに遅延を足した測定は
 [docs/benchmark-delay.md](docs/benchmark-delay.md)、gather が省く往復の測定は
