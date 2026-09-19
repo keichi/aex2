@@ -723,15 +723,32 @@ impl Gathered {
         Ok(Gathered { base, dims })
     }
 
-    /// Call `f(source element, count)` for each run of consecutive source
-    /// elements behind output elements `[first, first + count)`, in order.
-    fn for_each_run(
+    /// Call `f` for each stretch of output elements `[first, first + count)`,
+    /// in order.
+    ///
+    /// The innermost dimension is handed over whole rather than walked: it is
+    /// the one that describes itself, so its elements can be copied in one
+    /// loop. The dimensions above it advance like an odometer, once per row.
+    fn for_each_stretch(
         &self,
+        itemsize: u64,
         first: u64,
         count: u64,
-        mut f: impl FnMut(u64, u64) -> Result<()>,
+        mut f: impl FnMut(Stretch) -> Result<()>,
     ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
         let ndim = self.dims.len();
+        let Some(inner) = self.dims.last() else {
+            // Every axis was folded into the base, so there is one element.
+            return f(Stretch {
+                src: self.base,
+                step: 1,
+                count: 1,
+            });
+        };
+        let inner_len = inner.len();
 
         let mut index = vec![0u64; ndim];
         let mut rest = first;
@@ -749,20 +766,47 @@ impl Gathered {
         };
         refresh(&mut prefix, &index, 0);
 
-        let mut run: Option<(u64, u64)> = None;
-        for _ in 0..count {
-            let element = prefix[ndim];
-            run = match run {
-                Some((start, len)) if start + len == element => Some((start, len + 1)),
-                Some((start, len)) => {
-                    f(start, len)?;
-                    Some((element, 1))
-                }
-                None => Some((element, 1)),
+        // Held back so that a row carrying on from the one before is one
+        // stretch rather than two.
+        let mut pending: Option<Stretch> = None;
+        let mut done = 0;
+        while done < count {
+            let k = index[ndim - 1];
+            let take = (inner_len - k).min(count - done);
+            let row = prefix[ndim - 1];
+
+            // Elements further apart than a span would ever join are read one
+            // by one anyway; keeping them in one stretch would only make the
+            // scratch buffer as large as the gaps between them.
+            let stride = match inner {
+                Dim::Stride { step, .. } => step.unsigned_abs() * itemsize,
+                Dim::List(_) => u64::MAX,
+            };
+            let per = match inner {
+                Dim::Stride { step, .. } if *step == 1 => take,
+                _ if stride <= SPAN_GAP_BYTES => (SPAN_MAX_BYTES / stride).max(1),
+                _ => 1,
             };
 
-            // Advance like an odometer, recomputing only what changed.
-            let mut i = ndim;
+            let mut i = 0;
+            while i < take {
+                let n = per.min(take - i);
+                let s = Stretch {
+                    src: row.wrapping_add(inner.term(k + i)),
+                    step: match inner {
+                        Dim::Stride { step, .. } => *step,
+                        Dim::List(_) => 1,
+                    },
+                    count: n,
+                };
+                hold(&mut pending, s, &mut f)?;
+                i += n;
+            }
+
+            done += take;
+            // Advance past the row, recomputing only what changed.
+            index[ndim - 1] = 0;
+            let mut i = ndim - 1;
             while i > 0 {
                 i -= 1;
                 index[i] += 1;
@@ -773,8 +817,8 @@ impl Gathered {
             }
             refresh(&mut prefix, &index, i);
         }
-        match run {
-            Some((start, len)) => f(start, len),
+        match pending {
+            Some(s) => f(s),
             None => Ok(()),
         }
     }
@@ -803,34 +847,69 @@ impl Gathered {
             &mut aside
         };
 
-        // Runs close together in the source are read as one span, then cut
-        // out of it by walking the same runs again.
-        // ponytail: the walk is per element (~600 MiB/s for every other f32);
-        // copying a strided innermost dimension in one loop is the upgrade.
-        let mut span: Option<Span> = None;
-        let mut next = first;
-        self.for_each_run(first, count, |element, len| {
-            let joined = span
-                .as_mut()
-                .is_some_and(|w| w.join(element, len, itemsize));
-            if !joined {
-                if let Some(w) = span.take() {
-                    self.read_span(&w, first, itemsize, out, &mut read_src)?;
+        // Stretches close together in the source are read as one span, then
+        // cut out of it.
+        STRETCHES.with(|held| {
+            let mut held = held.borrow_mut();
+            held.clear();
+            let mut span: Option<Span> = None;
+            let mut out_at = 0;
+            self.for_each_stretch(itemsize, first, count, |s| {
+                let (lo, hi) = s.extent();
+                let joined = span
+                    .as_mut()
+                    .is_some_and(|w| w.join(lo, hi, s.count, itemsize));
+                if !joined {
+                    if let Some(w) = span.take() {
+                        copy_span(&w, itemsize, &held, out, &mut read_src)?;
+                        held.clear();
+                    }
+                    span = Some(Span {
+                        lo,
+                        hi,
+                        out_at,
+                        out_count: s.count,
+                    });
                 }
-                span = Some(Span::new(element, len, next));
+                held.push(s);
+                out_at += s.count;
+                Ok(())
+            })?;
+            match span {
+                Some(w) => copy_span(&w, itemsize, &held, out, &mut read_src),
+                None => Ok(()),
             }
-            next += len;
-            Ok(())
         })?;
-        if let Some(w) = span {
-            self.read_span(&w, first, itemsize, out, &mut read_src)?;
-        }
 
         if !aligned {
             let len = dst.len();
             dst.copy_from_slice(&aside[skip..skip + len]);
         }
         Ok(())
+    }
+}
+
+/// Hold `s` back if the stretch before it can absorb it.
+fn hold(
+    pending: &mut Option<Stretch>,
+    s: Stretch,
+    f: &mut impl FnMut(Stretch) -> Result<()>,
+) -> Result<()> {
+    // One element has no step of its own; calling it 1 lets the next one join.
+    let s = if s.count == 1 {
+        Stretch { step: 1, ..s }
+    } else {
+        s
+    };
+    if let Some(p) = pending.as_mut() {
+        if p.step == 1 && s.step == 1 && p.src + p.count == s.src {
+            p.count += s.count;
+            return Ok(());
+        }
+    }
+    match pending.replace(s) {
+        Some(p) => f(p),
+        None => Ok(()),
     }
 }
 
@@ -844,77 +923,129 @@ const SPAN_MAX_BYTES: u64 = 1 << 20;
 thread_local! {
     // Kept per thread so that a transfer in progress does not allocate.
     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static STRETCHES: std::cell::RefCell<Vec<Stretch>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Source elements `[lo, hi)` holding output elements `[out_first, +out_count)`.
+/// Output elements taken from the source at a fixed step.
+///
+/// `step == 1` is a run of consecutive source elements, which is what a
+/// contiguous innermost dimension gives. Anything else is one row of a strided
+/// selection, named in one piece so that it can be copied out in one loop
+/// instead of one call per element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stretch {
+    /// Source element of the first.
+    src: u64,
+    step: i64,
+    count: u64,
+}
+
+impl Stretch {
+    /// The source elements it touches, as `[lo, hi)`.
+    fn extent(&self) -> (u64, u64) {
+        let last = self
+            .src
+            .wrapping_add((self.count - 1).wrapping_mul(self.step as u64));
+        (self.src.min(last), self.src.max(last) + 1)
+    }
+}
+
+/// Source elements `[lo, hi)`, holding `out_count` output elements from
+/// `out_at` bytes-worth into the output.
 struct Span {
     lo: u64,
     hi: u64,
-    out_first: u64,
+    out_at: u64,
     out_count: u64,
-    runs: u32,
 }
 
 impl Span {
-    fn new(element: u64, len: u64, out_first: u64) -> Self {
-        Span {
-            lo: element,
-            hi: element + len,
-            out_first,
-            out_count: len,
-            runs: 1,
-        }
-    }
-
-    /// Take in the next run if it lies close enough, in either direction.
-    fn join(&mut self, element: u64, len: u64, itemsize: u64) -> bool {
+    /// Take in the next stretch if it lies close enough, in either direction.
+    fn join(&mut self, lo: u64, hi: u64, count: u64, itemsize: u64) -> bool {
         let gap = SPAN_GAP_BYTES / itemsize;
-        let (lo, hi) = (self.lo.min(element), self.hi.max(element + len));
-        let near = element + len + gap >= self.lo && element <= self.hi + gap;
-        if !near || (hi - lo) * itemsize > SPAN_MAX_BYTES {
+        let (new_lo, new_hi) = (self.lo.min(lo), self.hi.max(hi));
+        let near = hi + gap >= self.lo && lo <= self.hi + gap;
+        if !near || (new_hi - new_lo) * itemsize > SPAN_MAX_BYTES {
             return false;
         }
-        (self.lo, self.hi) = (lo, hi);
-        self.out_count += len;
-        self.runs += 1;
+        (self.lo, self.hi) = (new_lo, new_hi);
+        self.out_count += count;
         true
     }
 }
 
-impl Gathered {
-    /// Read the elements of `span` into `out`, whose first element is output
-    /// element `out_base`.
-    fn read_span(
-        &self,
-        span: &Span,
-        out_base: u64,
-        itemsize: u64,
-        out: &mut [u8],
-        read_src: &mut impl FnMut(u64, &mut [u8]) -> Result<()>,
-    ) -> Result<()> {
-        let at = ((span.out_first - out_base) * itemsize) as usize;
-        let bytes = (span.out_count * itemsize) as usize;
-        if span.runs == 1 {
+/// Read the source behind `span` and cut its stretches out into `out`.
+fn copy_span(
+    span: &Span,
+    itemsize: u64,
+    stretches: &[Stretch],
+    out: &mut [u8],
+    read_src: &mut impl FnMut(u64, &mut [u8]) -> Result<()>,
+) -> Result<()> {
+    let at = (span.out_at * itemsize) as usize;
+    let bytes = (span.out_count * itemsize) as usize;
+    // One run of consecutive elements: read it where it is going.
+    if let [only] = stretches {
+        if only.step == 1 {
             return read_src(span.lo * itemsize, &mut out[at..at + bytes]);
         }
+    }
 
-        SCRATCH.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
-            let len = ((span.hi - span.lo) * itemsize) as usize;
-            if scratch.len() < len {
-                scratch.resize(len, 0);
-            }
-            read_src(span.lo * itemsize, &mut scratch[..len])?;
+    SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let len = ((span.hi - span.lo) * itemsize) as usize;
+        if scratch.len() < len {
+            scratch.resize(len, 0);
+        }
+        read_src(span.lo * itemsize, &mut scratch[..len])?;
 
-            let mut pos = at;
-            self.for_each_run(span.out_first, span.out_count, |element, count| {
-                let from = ((element - span.lo) * itemsize) as usize;
-                let n = (count * itemsize) as usize;
+        let mut pos = at;
+        for s in stretches {
+            let n = (s.count * itemsize) as usize;
+            let from = ((s.src - span.lo) * itemsize) as usize;
+            if s.step == 1 {
                 out[pos..pos + n].copy_from_slice(&scratch[from..from + n]);
-                pos += n;
-                Ok(())
-            })
-        })
+            } else {
+                take_strided(
+                    &mut out[pos..pos + n],
+                    &scratch[..len],
+                    from,
+                    s.step,
+                    itemsize,
+                );
+            }
+            pos += n;
+        }
+        Ok(())
+    })
+}
+
+/// Fill `dst` from every `step`-th element of `src` starting at `from`.
+fn take_strided(dst: &mut [u8], src: &[u8], from: usize, step: i64, itemsize: u64) {
+    match itemsize {
+        1 => strided::<1>(dst, src, from, step),
+        2 => strided::<2>(dst, src, from, step),
+        4 => strided::<4>(dst, src, from, step),
+        8 => strided::<8>(dst, src, from, step),
+        16 => strided::<16>(dst, src, from, step),
+        other => {
+            let n = other as usize;
+            let stride = step as isize * n as isize;
+            for (i, d) in dst.chunks_exact_mut(n).enumerate() {
+                let at = from.wrapping_add_signed(i as isize * stride);
+                d.copy_from_slice(&src[at..at + n]);
+            }
+        }
+    }
+}
+
+/// The same with the element size known, so each element is one move.
+fn strided<const N: usize>(dst: &mut [u8], src: &[u8], from: usize, step: i64) {
+    let stride = step as isize * N as isize;
+    for (i, d) in dst.chunks_exact_mut(N).enumerate() {
+        let at = from.wrapping_add_signed(i as isize * stride);
+        d.copy_from_slice(&src[at..at + N]);
     }
 }
 

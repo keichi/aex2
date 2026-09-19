@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 aex-client.workspace = true
+aex-core.workspace = true
 clap.workspace = true
 libc = "0.2"
 
