@@ -4,8 +4,12 @@
 #
 # `fadvise` is what `read_buffers = 1` would become: one thread, one buffer,
 # and the next pieces hinted to the kernel. It is compared with both of the
-# shapes the server has now (`serial` = read_buffers 1, `pair` = 3), over
-# memory-resident and cold data, contiguous and strided.
+# shapes the server has now (`serial` = read_buffers 1, `pair` = 3) and with
+# the two together, over memory-resident and cold data, contiguous and strided.
+#
+# The two buy different things — a second core, and read depth — so compare at
+# equal thread counts too: `pair-fadvise` at 4 connections is 8 threads, and so
+# is `fadvise` at 8.
 #
 # Usage: benchmarks/mdx2/fadvise-sweep.sh [rounds]
 
@@ -36,7 +40,7 @@ trap 'ssh "$CLIENT" "pkill -x poolbench || true"' EXIT
 
 for _ in $(seq "$ROUNDS"); do
     for s in 1 4 8 16; do
-        for m in serial pair fadvise; do
+        for m in serial pair fadvise pair-fadvise; do
             run $MEM "$s" "$m"
             run $MEM "$s" "$m" $STRIDED
             run $DISK "$s" "$m" --cold
