@@ -81,6 +81,13 @@ enum Command {
         verify: bool,
         #[arg(long, default_value_t = 524288)]
         piece: usize,
+        /// Bytes per fragment. 0 reads a piece as one run, which is what a
+        /// contiguous selection does; smaller is what a strided one does.
+        #[arg(long, default_value_t = 0)]
+        frag: usize,
+        /// Bytes skipped between fragments.
+        #[arg(long, default_value_t = 0)]
+        gap: u64,
         /// Where the data starts; 128 is where a `.npy` header usually ends.
         #[arg(long, default_value_t = 128)]
         offset: u64,
@@ -90,6 +97,68 @@ enum Command {
         #[arg(long)]
         cold: bool,
     },
+}
+
+/// How one piece's payload is laid out in the file.
+///
+/// `frag = 0` is one run, which is what a contiguous selection reads. Fragments
+/// with a gap between them are what a strided selection reads once
+/// `selection.rs` has joined what it can: the gap is what it could not join.
+#[derive(Clone, Copy)]
+struct Shape {
+    piece: usize,
+    frag: usize,
+    gap: u64,
+}
+
+impl Shape {
+    fn frag_bytes(&self) -> usize {
+        if self.frag == 0 {
+            self.piece
+        } else {
+            self.frag
+        }
+    }
+
+    /// Fragments one piece is read in.
+    fn frags(&self) -> usize {
+        self.piece.div_ceil(self.frag_bytes())
+    }
+
+    /// Fragment `j` of the piece at file offset `at`: where in the file, where
+    /// in the piece, how many bytes.
+    fn frag(&self, at: u64, j: usize) -> (u64, usize, usize) {
+        let frag = self.frag_bytes();
+        let into = j * frag;
+        (
+            at + j as u64 * (frag as u64 + self.gap),
+            into,
+            frag.min(self.piece - into),
+        )
+    }
+
+    /// File bytes one piece spans, gaps included.
+    fn span(&self) -> u64 {
+        let frag = self.frag_bytes() as u64;
+        self.frags() as u64 * (frag + self.gap) - self.gap
+    }
+
+    fn read(&self, file: &File, at: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        for j in 0..self.frags() {
+            let (from, into, len) = self.frag(at, j);
+            file.read_exact_at(&mut buf[into..into + len], from)?;
+        }
+        Ok(())
+    }
+
+    /// Start the read of every fragment of the piece at `at`.
+    fn will_need(&self, file: &File, at: u64) -> std::io::Result<()> {
+        for j in 0..self.frags() {
+            let (from, _, len) = self.frag(at, j);
+            will_need(file, from, len)?;
+        }
+        Ok(())
+    }
 }
 
 /// One connection's share: `[start, end)` of the file.
@@ -113,18 +182,25 @@ fn main() -> std::io::Result<()> {
             depth,
             verify,
             piece,
+            frag,
+            gap,
             offset,
             reps,
             cold,
         } => {
             let file = Arc::new(File::open(&path)?);
+            let shape = Shape { piece, frag, gap };
+            // `--bytes` is the file the run walks over; what reaches the sink is
+            // less when the fragments have gaps between them.
             let share = bytes / streams as u64;
+            let pieces = share / shape.span();
             let ranges: Vec<Range> = (0..streams as u64)
                 .map(|i| Range {
                     start: offset + i * share,
-                    end: offset + (i + 1) * share,
+                    end: offset + i * share + pieces * shape.span(),
                 })
                 .collect();
+            let payload = pieces * piece as u64 * streams as u64;
 
             let stats = uring::Stats::default();
             let mut runs = Vec::new();
@@ -143,14 +219,14 @@ fn main() -> std::io::Result<()> {
                 let cpu = cpu_seconds();
                 let started = Instant::now();
                 match mode {
-                    Mode::Serial => serial(&file, &ranges, conns, piece),
-                    Mode::Pair => pair(&file, &ranges, conns, piece, buffers),
-                    Mode::Pool => pool(&file, &ranges, conns, piece, buffers, readers),
-                    Mode::Fadvise => fadvise(&file, &ranges, conns, piece, depth),
-                    _ => uring::run(&file, &ranges, conns, piece, depth, mode, verify, &stats),
+                    Mode::Serial => serial(&file, &ranges, conns, shape),
+                    Mode::Pair => pair(&file, &ranges, conns, shape, buffers),
+                    Mode::Pool => pool(&file, &ranges, conns, shape, buffers, readers),
+                    Mode::Fadvise => fadvise(&file, &ranges, conns, shape, depth),
+                    _ => uring::run(&file, &ranges, conns, shape, depth, mode, verify, &stats),
                 }?;
                 runs.push(Run {
-                    bytes: share * streams as u64,
+                    bytes: payload,
                     elapsed: started.elapsed(),
                     cpu: cpu_seconds() - cpu,
                 });
@@ -166,7 +242,12 @@ fn main() -> std::io::Result<()> {
             };
             report(
                 &format!(
-                    "{label} streams={streams}{}",
+                    "{label} streams={streams}{}{}",
+                    if frag == 0 {
+                        String::new()
+                    } else {
+                        format!(" frag={frag} gap={gap}")
+                    },
                     if cold { " cold" } else { "" }
                 ),
                 &runs,
@@ -275,10 +356,6 @@ fn finish(mut conn: TcpStream) -> std::io::Result<()> {
     conn.read(&mut rest).map(|_| ())
 }
 
-fn read_piece(file: &File, at: u64, buf: &mut [u8]) -> std::io::Result<()> {
-    file.read_exact_at(buf, at)
-}
-
 /// Spawn one thread per connection and wait for them all.
 fn per_conn(
     ranges: &[Range],
@@ -305,16 +382,15 @@ fn serial(
     file: &File,
     ranges: &[Range],
     conns: Vec<TcpStream>,
-    piece: usize,
+    shape: Shape,
 ) -> std::io::Result<()> {
     per_conn(ranges, conns, |_, range, mut conn| {
-        let mut buf = vec![0u8; piece];
+        let mut buf = vec![0u8; shape.piece];
         let mut at = range.start;
         while at < range.end {
-            let len = piece.min((range.end - at) as usize);
-            read_piece(file, at, &mut buf[..len])?;
-            send_piece(&mut conn, &buf[..len])?;
-            at += len as u64;
+            shape.read(file, at, &mut buf)?;
+            send_piece(&mut conn, &buf)?;
+            at += shape.span();
         }
         finish(conn)
     })
@@ -328,30 +404,29 @@ fn fadvise(
     file: &File,
     ranges: &[Range],
     conns: Vec<TcpStream>,
-    piece: usize,
+    shape: Shape,
     depth: usize,
 ) -> std::io::Result<()> {
     per_conn(ranges, conns, |_, range, mut conn| {
-        let mut buf = vec![0u8; piece];
-        let window = (depth * piece) as u64;
+        let mut buf = vec![0u8; shape.piece];
+        let window = depth as u64 * shape.span();
         let advise = |at: u64| {
             if at < range.end {
-                will_need(file, at, piece.min((range.end - at) as usize))
+                shape.will_need(file, at)
             } else {
                 Ok(())
             }
         };
         for i in 0..depth as u64 {
-            advise(range.start + i * piece as u64)?;
+            advise(range.start + i * shape.span())?;
         }
         let mut at = range.start;
         while at < range.end {
-            let len = piece.min((range.end - at) as usize);
             // Keep the hint `depth` pieces ahead of where the reading is.
             advise(at + window)?;
-            read_piece(file, at, &mut buf[..len])?;
-            send_piece(&mut conn, &buf[..len])?;
-            at += len as u64;
+            shape.read(file, at, &mut buf)?;
+            send_piece(&mut conn, &buf)?;
+            at += shape.span();
         }
         finish(conn)
     })
@@ -361,24 +436,23 @@ fn pair(
     file: &File,
     ranges: &[Range],
     conns: Vec<TcpStream>,
-    piece: usize,
+    shape: Shape,
     buffers: usize,
 ) -> std::io::Result<()> {
     per_conn(ranges, conns, |_, range, mut conn| {
         let (free_tx, free_rx) = channel::<Vec<u8>>();
         let (full_tx, full_rx) = sync_channel::<(Vec<u8>, usize)>(buffers);
         for _ in 0..buffers {
-            free_tx.send(vec![0u8; piece]).unwrap();
+            free_tx.send(vec![0u8; shape.piece]).unwrap();
         }
         std::thread::scope(|scope| {
             let reader = scope.spawn(move || -> std::io::Result<()> {
                 let mut at = range.start;
                 while at < range.end {
                     let mut buf = free_rx.recv().expect("writer alive");
-                    let len = piece.min((range.end - at) as usize);
-                    read_piece(file, at, &mut buf[..len])?;
-                    full_tx.send((buf, len)).expect("writer alive");
-                    at += len as u64;
+                    shape.read(file, at, &mut buf)?;
+                    full_tx.send((buf, shape.piece)).expect("writer alive");
+                    at += shape.span();
                 }
                 Ok(())
             });
@@ -404,7 +478,7 @@ fn pool(
     file: &File,
     ranges: &[Range],
     conns: Vec<TcpStream>,
-    piece: usize,
+    shape: Shape,
     buffers: usize,
     readers: usize,
 ) -> std::io::Result<()> {
@@ -426,7 +500,7 @@ fn pool(
                     mut buf,
                     done,
                 } = job;
-                let result = read_piece(file, at, &mut buf[..len]).map(|()| (buf, len));
+                let result = shape.read(file, at, &mut buf[..len]).map(|()| (buf, len));
                 let _ = done.send(result);
             });
         }
@@ -437,23 +511,22 @@ fn pool(
             let (done_tx, done_rx) = channel();
             let mut next = range.start;
             let submit = |buf: Vec<u8>, next: &mut u64| {
-                let len = piece.min((range.end - *next) as usize);
                 job_tx
                     .send(Job {
                         at: *next,
-                        len,
+                        len: shape.piece,
                         buf,
                         done: done_tx.clone(),
                     })
                     .expect("readers alive");
-                *next += len as u64;
+                *next += shape.span();
             };
             // Each buffer is out at most once, so the readers can run ahead of
             // this connection by `buffers` pieces and no further.
             let mut out = 0;
             for _ in 0..buffers {
                 if next < range.end {
-                    submit(vec![0u8; piece], &mut next);
+                    submit(vec![0u8; shape.piece], &mut next);
                     out += 1;
                 }
             }
@@ -479,13 +552,12 @@ fn pool(
 /// thread: the locality of `serial` with the overlap of `pair`, and no handoff.
 #[cfg(target_os = "linux")]
 mod uring {
-    use super::{finish, per_conn, send_piece, Mode, Range, HEADER_LEN};
+    use super::{finish, per_conn, send_piece, Mode, Range, Shape, HEADER_LEN};
     use std::collections::VecDeque;
     use std::fs::File;
     use std::io;
     use std::net::TcpStream;
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::FileExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use io_uring::{cqueue, opcode, squeue, types, IoUring};
@@ -495,8 +567,10 @@ mod uring {
     const SEND_ZC_REPORT_USAGE: u16 = 8;
     const NOTIF_ZC_COPIED: u32 = 1 << 31;
 
-    /// Completion kind, in the top bits of `user_data`; the rest is the slot.
-    const SEND_TAG: u64 = 1 << 32;
+    /// Completion kind, in the top bit of `user_data`; then the fragment, then
+    /// the slot.
+    const SEND_TAG: u64 = 1 << 63;
+    const SLOT_BITS: u32 = 16;
 
     #[derive(Clone, Copy, PartialEq)]
     enum How {
@@ -529,12 +603,15 @@ mod uring {
     }
 
     /// One piece in flight: its buffer holds the header and the payload next to
-    /// each other so a ring send is one SQE.
+    /// each other so a ring send is one SQE. A piece is read in one SQE per
+    /// fragment, which complete in any order.
     struct Slot {
         buf: Vec<u8>,
         at: u64,
-        len: usize,
-        got: usize,
+        /// Bytes read so far, per fragment.
+        got: Vec<usize>,
+        /// Fragments not yet whole.
+        pending: usize,
         sent: usize,
         ready: bool,
         done: bool,
@@ -542,18 +619,12 @@ mod uring {
         notifs: u32,
     }
 
-    impl Slot {
-        fn frame(&self) -> usize {
-            HEADER_LEN + self.len
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         file: &File,
         ranges: &[Range],
         conns: Vec<TcpStream>,
-        piece: usize,
+        shape: Shape,
         depth: usize,
         mode: Mode,
         verify: bool,
@@ -566,7 +637,7 @@ mod uring {
             _ => unreachable!("only the uring modes come here"),
         };
         per_conn(ranges, conns, |_, range, conn| {
-            connection(file, range, conn, piece, depth, how, verify, stats)
+            connection(file, range, conn, shape, depth, how, verify, stats)
         })
     }
 
@@ -583,23 +654,21 @@ mod uring {
         Ok(())
     }
 
-    fn read_sqe(fd: types::Fd, slot: &mut Slot, i: usize) -> squeue::Entry {
-        let at = slot.got;
+    fn read_sqe(fd: types::Fd, shape: Shape, slot: &mut Slot, i: usize, j: usize) -> squeue::Entry {
+        let (from, into, len) = shape.frag(slot.at, j);
+        let got = slot.got[j];
         opcode::Read::new(
             fd,
-            slot.buf[HEADER_LEN + at..].as_mut_ptr(),
-            (slot.len - at) as u32,
+            slot.buf[HEADER_LEN + into + got..].as_mut_ptr(),
+            (len - got) as u32,
         )
-        .offset(slot.at + at as u64)
+        .offset(from + got as u64)
         .build()
-        .user_data(i as u64)
+        .user_data((j as u64) << SLOT_BITS | i as u64)
     }
 
-    fn send_sqe(fd: types::Fd, slot: &Slot, i: usize, how: How) -> squeue::Entry {
-        let (ptr, len) = (
-            slot.buf[slot.sent..].as_ptr(),
-            (slot.frame() - slot.sent) as u32,
-        );
+    fn send_sqe(fd: types::Fd, frame: usize, slot: &Slot, i: usize, how: How) -> squeue::Entry {
+        let (ptr, len) = (slot.buf[slot.sent..].as_ptr(), (frame - slot.sent) as u32);
         // MSG_WAITALL: let the kernel finish the piece rather than come back
         // with a partial send and leave the socket idle until it is resubmitted.
         let entry = if how == How::Zc {
@@ -615,10 +684,10 @@ mod uring {
         entry.user_data(SEND_TAG | i as u64)
     }
 
-    fn check(file: &File, slot: &Slot) -> io::Result<()> {
-        let mut want = vec![0u8; slot.len];
-        file.read_exact_at(&mut want, slot.at)?;
-        if want != slot.buf[HEADER_LEN..slot.frame()] {
+    fn check(file: &File, shape: Shape, slot: &Slot) -> io::Result<()> {
+        let mut want = vec![0u8; shape.piece];
+        shape.read(file, slot.at, &mut want)?;
+        if want != slot.buf[HEADER_LEN..HEADER_LEN + shape.piece] {
             return Err(io::Error::other("piece read through the ring differs"));
         }
         Ok(())
@@ -629,14 +698,17 @@ mod uring {
         file: &File,
         range: Range,
         mut conn: TcpStream,
-        piece: usize,
+        shape: Shape,
         depth: usize,
         how: How,
         verify: bool,
         stats: &Stats,
     ) -> io::Result<()> {
-        // Enough room for every read plus the send and a retry.
-        let mut ring = IoUring::new(((depth + 4) as u32).next_power_of_two())?;
+        let frags = shape.frags();
+        let frame = HEADER_LEN + shape.piece;
+        // Room for every fragment of every slot, plus the send and a retry.
+        let entries = ((depth * frags + 4) as u32).next_power_of_two().min(4096);
+        let mut ring = IoUring::new(entries)?;
         let file_fd = types::Fd(file.as_raw_fd());
         let sock_fd = types::Fd(conn.as_raw_fd());
         // A blocking socket makes io_uring punt the send to a kernel worker
@@ -647,10 +719,10 @@ mod uring {
 
         let mut slots: Vec<Slot> = (0..depth)
             .map(|_| Slot {
-                buf: vec![0u8; HEADER_LEN + piece],
+                buf: vec![0u8; frame],
                 at: 0,
-                len: 0,
-                got: 0,
+                got: vec![0; frags],
+                pending: 0,
                 sent: 0,
                 ready: false,
                 done: false,
@@ -669,15 +741,21 @@ mod uring {
 
             while next < range.end {
                 let Some(i) = free.pop() else { break };
-                let len = piece.min((range.end - next) as usize);
-                let slot = &mut slots[i];
-                (slot.at, slot.len, slot.got, slot.sent) = (next, len, 0, 0);
-                (slot.ready, slot.done) = (false, false);
-                let sqe = read_sqe(file_fd, slot, i);
-                // SAFETY: the slot is not touched again until its completion.
-                unsafe { push(&mut ring, &sqe)? };
+                {
+                    let slot = &mut slots[i];
+                    slot.at = next;
+                    slot.got.iter_mut().for_each(|got| *got = 0);
+                    slot.pending = frags;
+                    slot.sent = 0;
+                    (slot.ready, slot.done) = (false, false);
+                }
+                for j in 0..frags {
+                    let sqe = read_sqe(file_fd, shape, &mut slots[i], i, j);
+                    // SAFETY: the slot is not touched again until its completion.
+                    unsafe { push(&mut ring, &sqe)? };
+                }
                 order.push_back(i);
-                next += len as u64;
+                next += shape.span();
                 progress = true;
             }
 
@@ -685,15 +763,14 @@ mod uring {
                 if let Some(&head) = order.front() {
                     if slots[head].ready {
                         if verify {
-                            check(file, &slots[head])?;
+                            check(file, shape, &slots[head])?;
                         }
                         if how == How::Blocking {
-                            let slot = &slots[head];
-                            send_piece(&mut conn, &slot.buf[HEADER_LEN..slot.frame()])?;
+                            send_piece(&mut conn, &slots[head].buf[HEADER_LEN..frame])?;
                             order.pop_front();
                             free.push(head);
                         } else {
-                            let sqe = send_sqe(sock_fd, &slots[head], head, how);
+                            let sqe = send_sqe(sock_fd, frame, &slots[head], head, how);
                             // SAFETY: the buffer is held until the send, and any
                             // notification, has completed.
                             unsafe { push(&mut ring, &sqe)? };
@@ -710,8 +787,9 @@ mod uring {
 
             ring.submit_and_wait(usize::from(!progress))?;
             for cqe in ring.completion().collect::<Vec<cqueue::Entry>>() {
-                let i = (cqe.user_data() & 0xffff_ffff) as usize;
+                let i = (cqe.user_data() & ((1 << SLOT_BITS) - 1)) as usize;
                 if cqe.user_data() & SEND_TAG == 0 {
+                    let j = ((cqe.user_data() & !SEND_TAG) >> SLOT_BITS) as usize;
                     let n = cqe.result();
                     if n < 0 {
                         return Err(io::Error::from_raw_os_error(-n));
@@ -719,12 +797,14 @@ mod uring {
                     if n == 0 {
                         return Err(io::ErrorKind::UnexpectedEof.into());
                     }
+                    let (_, _, len) = shape.frag(slots[i].at, j);
                     let slot = &mut slots[i];
-                    slot.got += n as usize;
-                    if slot.got == slot.len {
-                        slot.ready = true;
+                    slot.got[j] += n as usize;
+                    if slot.got[j] == len {
+                        slot.pending -= 1;
+                        slot.ready = slot.pending == 0;
                     } else {
-                        let sqe = read_sqe(file_fd, slot, i);
+                        let sqe = read_sqe(file_fd, shape, slot, i, j);
                         // SAFETY: as above; the slot stays put.
                         unsafe { push(&mut ring, &sqe)? };
                     }
@@ -748,7 +828,7 @@ mod uring {
                     // Out of pinned memory for zero copy; this piece goes the
                     // ordinary way. No notification follows a failed send.
                     stats.enobufs.fetch_add(1, Ordering::Relaxed);
-                    let sqe = send_sqe(sock_fd, &slots[i], i, How::Copy);
+                    let sqe = send_sqe(sock_fd, frame, &slots[i], i, How::Copy);
                     // SAFETY: as above; the slot stays put.
                     unsafe { push(&mut ring, &sqe)? };
                     continue;
@@ -762,8 +842,8 @@ mod uring {
                 }
                 let slot = &mut slots[i];
                 slot.sent += n as usize;
-                if slot.sent < slot.frame() {
-                    let sqe = send_sqe(sock_fd, slot, i, how);
+                if slot.sent < frame {
+                    let sqe = send_sqe(sock_fd, frame, slot, i, how);
                     // SAFETY: as above; the slot stays put.
                     unsafe { push(&mut ring, &sqe)? };
                     continue;
@@ -786,7 +866,7 @@ mod uring {
 
 #[cfg(not(target_os = "linux"))]
 mod uring {
-    use super::{Mode, Range};
+    use super::{Mode, Range, Shape};
     use std::fs::File;
     use std::net::TcpStream;
 
@@ -802,7 +882,7 @@ mod uring {
         _file: &File,
         _ranges: &[Range],
         _conns: Vec<TcpStream>,
-        _piece: usize,
+        _shape: Shape,
         _depth: usize,
         _mode: Mode,
         _verify: bool,
