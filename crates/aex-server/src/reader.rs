@@ -98,7 +98,14 @@ impl ReadPipeline {
     /// Ask for a range. The pieces of it come back from [`Self::next_piece`].
     pub fn request(&self, entry: Arc<TransferEntry>, offset: u64, len: u64) {
         let mut inline = self.inline.borrow_mut();
-        inline.hinted = offset;
+        // A fetch that carries on from where the last window reached keeps it;
+        // one that jumps somewhere else starts again. Fetches are what the
+        // client chose to cut the stream into, and the storage does not care
+        // where one ends.
+        let carries_on = offset <= inline.hinted && inline.hinted - offset <= READ_AHEAD_BYTES;
+        if !carries_on {
+            inline.hinted = offset;
+        }
         inline.pending = Some(ReadRequest { entry, offset, len });
     }
 
@@ -130,8 +137,13 @@ impl Inline {
         let at = request.offset;
 
         // Ask for what comes after this piece before blocking on this one, so
-        // that a cold read is already under way by the time it is wanted.
-        let window = at.saturating_add(READ_AHEAD_BYTES).min(at + request.len);
+        // that a cold read is already under way by the time it is wanted. The
+        // window runs past the end of this fetch, into the rest of the
+        // selection: stopping at the fetch boundary leaves the storage idle
+        // for the whole of the last piece's send.
+        let window = at
+            .saturating_add(READ_AHEAD_BYTES)
+            .min(request.entry.layout().total_bytes);
         if window > self.hinted {
             let from = self.hinted.max(at);
             request
