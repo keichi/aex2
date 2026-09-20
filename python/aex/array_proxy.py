@@ -177,6 +177,11 @@ class ArrayProxy:
         n-th element per axis, or ``abs_error`` / ``rel_error`` for lossy
         compression. A server that cannot do it sends the exact data and the
         view warns; ``applied_quality`` says what was done.
+
+        Only ``abs_error`` is implemented, on float32 and float64, and only by
+        a server and an extension module built with the ``sz`` feature. A bound
+        relative to the value range would have to mean the range of the whole
+        selection, and a compressed block only ever sees its own.
         """
         self._require_base("at")
         quality: dict[str, Any] = {}

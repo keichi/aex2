@@ -60,7 +60,10 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
   `dtype` / `out` / `where` / `initial` を指定したものは同様にローカルで計算する
 - **サーバの集約は 1 スレッドで逐次読む**。float の総和は numpy (pairwise) と
   ビット単位では一致しない
-- **適応品質は未実装**。`at()` は常に EXACT で返し、`AexQualityWarning` を出す
+- **適応品質は誤差上限のみ**。`sz` feature を有効にしたビルドで `at(abs_error=...)`
+  が SZ3 による誤差保証圧縮になる ([測定](docs/benchmark-sz.md))。dtype キャスト・
+  間引き・値域相対の誤差、および float32 / float64 以外の dtype は EXACT で返し、
+  `AexQualityWarning` を出す。既定ビルドと Python の wheel には入っていない
 - **多次元の整数インデックス配列は非対応**。1 次元にして送り、結果を reshape すること
 - **credit は固定値** (既定 16、`AEX_CREDIT`)。RTT と帯域から自動で決める処理は
   入れていない。**遅延のある回線では `streams × credit × chunk_bytes` が転送の
@@ -75,7 +78,8 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 [sendfile を採らない理由](docs/sendfile.md)、
 [io_uring を採らない理由](docs/benchmark-uring.md)、
 [先読みの効果](docs/benchmark-fadvise.md)、
-[非連続選択の歩き方](docs/benchmark-gather-walk.md))。Linux 機での測定は
+[非連続選択の歩き方](docs/benchmark-gather-walk.md)、
+[誤差保証圧縮](docs/benchmark-sz.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、mdx2 の VM 2 台を実ネットワークで
 繋いだ測定は [docs/benchmark-mdx2.md](docs/benchmark-mdx2.md)、そこに遅延を足した測定は
 [docs/benchmark-delay.md](docs/benchmark-delay.md)、gather が省く往復の測定は
@@ -115,6 +119,12 @@ macOS (M4) ではメモリ上のデータで単一接続 12,048 MiB/s (iPerf3 �
 `protoc` が必要である (`brew install protobuf` / `apt install protobuf-compiler`)。
 HDF5 バックエンド (`hdf5` feature) には libhdf5 1.14 以降が要る
 (`brew install hdf5` / `apt install libhdf5-dev`。Ubuntu は 26.04 以降)。
+
+誤差保証圧縮 (`sz` feature) は SZ3 をソースからビルドするため、cmake・C++17
+コンパイラ・libclang が要る (`brew install cmake` / `apt install cmake libclang-dev`)。
+既定では無効で、そのぶん素のビルドはこれらを必要としない。リンクする `sz3-sys` は
+GPL-3.0-only である (SZ3 本体は BSD)。Python から使うには拡張モジュールを
+`maturin develop --features aex-py/sz` でビルドする。
 
 ```console
 $ cargo test --all-features

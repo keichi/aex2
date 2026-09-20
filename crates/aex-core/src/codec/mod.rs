@@ -8,8 +8,9 @@
 //!
 //! Shape is the point of the header. Every error-bounded compressor predicts
 //! from neighbours in every axis, so handing it a flat run of elements throws
-//! away most of what it could do: measured on a 128 x 1024 float32 slab, SZ3
-//! reaches 71.7x told the true shape and 15.6x told it is one long row.
+//! away much of what it could do. End to end on the same 256 MiB of float32,
+//! SZ3 at a bound of 1e-3 reached 9.70x told the array is 32768 x 2048 and
+//! 5.85x told the same bytes are one long row.
 
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
