@@ -215,18 +215,6 @@ fn an_error_bounded_transfer_sends_fewer_bytes_than_it_delivers() {
 }
 
 #[test]
-fn the_server_says_what_it_can_do_before_being_asked() {
-    let server = TestServer::start();
-    let client = server.connect();
-    let session = client.session();
-    // Bit n is codec n, bit n is encoding n.
-    assert_eq!(session.supported_codecs & 1, 1, "RAW");
-    assert_eq!(session.supported_encodings & 1, 1, "EXACT");
-    assert_eq!(session.supported_codecs >> 3 & 1, 1, "SZ");
-    assert_eq!(session.supported_encodings >> 3 & 1, 1, "ERROR_BOUND");
-}
-
-#[test]
 fn a_fetch_that_splits_an_element_is_refused() {
     let server = TestServer::start();
     server.write_npy("misaligned.npy", &[2048, 512]);

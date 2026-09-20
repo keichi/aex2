@@ -59,10 +59,6 @@ struct Cli {
     /// every element is read on its own.
     #[arg(long, default_value_t = 1)]
     step: u64,
-    /// Elements in a row of the fixture, when it is 2-d. 0 means 1-d, and the
-    /// selection slices elements rather than rows.
-    #[arg(long, default_value_t = 0)]
-    row_elements: u64,
     /// Ask for error-bounded lossy transfer with this absolute bound. 0 asks
     /// for exact data.
     #[arg(long, default_value_t = 0.0)]
@@ -92,14 +88,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let handle = client.open_as(&cli.file, &cli.format)?;
 
+    // A slice of the leading axis: the whole of every other axis comes with
+    // it, which is what gives a codec an array slab rather than one long row.
     let elements = cli.bytes / cli.itemsize;
-    // A slice of the leading axis takes whole rows of a 2-d fixture, which is
-    // what gives a codec an array slab rather than one long row.
-    let per_row = cli.row_elements.max(1);
-    let rows = elements / per_row;
     let indices = [Index::Slice {
         start: Some(0),
-        stop: Some((rows * cli.step) as i64),
+        stop: Some((elements * cli.step) as i64),
         step: Some(cli.step as i64),
     }];
     let quality = if cli.abs_error > 0.0 {
@@ -121,6 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut wire_bytes = 0;
+    let mut ratio = 0.0;
     let mut runs = Vec::with_capacity(cli.reps);
     for _ in 0..cli.reps {
         // The prepare is inside the timing, as it was when this called
@@ -148,6 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // explain, so the run is not one to average in.
         assert_eq!(result.retries, 0, "a fetch had to be retried");
         wire_bytes = result.wire_bytes;
+        ratio = result.compression_ratio();
         runs.push(Run {
             bytes: result.bytes,
             elapsed,
@@ -167,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             //
             // Through f32 first: past 2^24 the fixture itself cannot hold the
             // index exactly, and the value that arrived is the rounded one.
-            let last = (((rows - 1) * cli.step * per_row + per_row - 1) as f32) as f64;
+            let last = (((elements - 1) * cli.step) as f32) as f64;
             let off_by = |got: f64, want: f64| (got - want).abs();
             assert!(
                 off_by(value_at(0), 0.0) <= cli.abs_error,
@@ -205,11 +201,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Printed only when something was compressed, so every existing sweep
         // produces exactly the output it did before.
         println!(
-            "  abs_error={} compressed {:.2}x ({} -> {} bytes on the wire)",
-            cli.abs_error,
-            cli.bytes as f64 / wire_bytes as f64,
-            cli.bytes,
-            wire_bytes
+            "  abs_error={} compressed {ratio:.2}x ({} -> {wire_bytes} bytes on the wire)",
+            cli.abs_error, cli.bytes
         );
     }
     client.disconnect()?;

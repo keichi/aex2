@@ -20,14 +20,14 @@ use crate::quality::Codec;
 mod sz;
 
 /// Bytes of block header before the codec's own stream.
-pub const BLOCK_HEADER_LEN: usize = 24;
+const BLOCK_HEADER_LEN: usize = 24;
 
 /// The most axes a block is described with.
 ///
-/// Every codec here takes a shape of at most four, and the gain from the fourth
-/// is small next to the gain from the first two, so the fold to three keeps one
-/// rule for every array rank.
-pub const MAX_BLOCK_DIMS: usize = 3;
+/// SZ3 takes at most four, and the gain from the fourth is small next to the
+/// gain from the first two, so the fold to three keeps one rule for every
+/// array rank.
+const MAX_BLOCK_DIMS: usize = 3;
 
 const VERSION: u8 = 1;
 

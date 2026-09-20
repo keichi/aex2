@@ -47,4 +47,4 @@ for h in "$@"; do
     pids+=($!)
 done
 for p in "${pids[@]}"; do wait "$p"; done
-echo "synced $rev to $*"
+echo "synced $rev to $* (features: $FEATURES)"

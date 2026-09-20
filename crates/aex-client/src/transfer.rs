@@ -171,8 +171,6 @@ impl TransferResult {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClientStats {
     pub bytes: u64,
-    /// Payload bytes read off the data plane, summed over transfers.
-    pub wire_bytes: u64,
     /// Time spent filling buffers, summed over transfers.
     pub elapsed: Duration,
     pub chunks: u64,
@@ -186,7 +184,6 @@ pub struct ClientStats {
 impl ClientStats {
     pub(crate) fn add(&mut self, transfer: &TransferResult) {
         self.bytes += transfer.bytes;
-        self.wire_bytes += transfer.wire_bytes;
         self.elapsed += transfer.elapsed;
         self.chunks += u64::from(transfer.chunks);
         self.retries += u64::from(transfer.retries);

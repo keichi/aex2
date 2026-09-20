@@ -68,8 +68,8 @@ impl Encoding {
     }
 }
 
-/// Every encoding, for enumeration.
-pub const ALL_ENCODINGS: [Encoding; 4] = [
+/// Every encoding, for the capability bitmask below.
+const ALL_ENCODINGS: [Encoding; 4] = [
     Encoding::Exact,
     Encoding::DtypeCast,
     Encoding::Subsample,
@@ -130,8 +130,8 @@ impl Codec {
     }
 }
 
-/// Every codec, for enumeration.
-pub const ALL_CODECS: [Codec; 4] = [Codec::Raw, Codec::Lz4, Codec::Zstd, Codec::Sz];
+/// Every codec, for the capability bitmask below.
+const ALL_CODECS: [Codec; 4] = [Codec::Raw, Codec::Lz4, Codec::Zstd, Codec::Sz];
 
 /// The codecs this build can produce, as the wire's bitmask: bit n for codec n.
 pub fn supported_codecs() -> u32 {
