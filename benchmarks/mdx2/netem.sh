@@ -25,8 +25,12 @@ set_rtt_rate() {
     half=$(echo "$1 / 2" | bc -l)
     for pair in "$SERVER $CLIENT_IP" "$CLIENT $SERVER_IP"; do
         set -- $pair
-        # A 20 Gbit/s flow queues about 180k packets at 100 ms; the default 1000 drops.
-        ssh "$1" "sudo tc qdisc replace dev enp3s0 root handle 1: prio bands 4 &&
+        # Torn down first, because netem's `replace` keeps whatever the last
+        # call set and did not mention: asking for a delay with no rate after
+        # a call that set one leaves the rate in place, and the sweep then
+        # measures the cap it thinks it removed.
+        ssh "$1" "sudo tc qdisc del dev enp3s0 root 2>/dev/null;
+            sudo tc qdisc replace dev enp3s0 root handle 1: prio bands 4 &&
             sudo tc qdisc replace dev enp3s0 parent 1:4 handle 40: netem delay ${half}ms ${rate:+rate $rate} limit 1000000 &&
             sudo tc filter replace dev enp3s0 parent 1: protocol ip prio 1 u32 match ip dst $2/32 flowid 1:4"
     done
