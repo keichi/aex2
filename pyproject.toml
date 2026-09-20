@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "aex"
-description = "Array Exchange v2 — partial, on-demand transfer of array data over wide-area networks"
+description = "Array Exchange v2: partial, on-demand transfer of array data over wide-area networks"
 requires-python = ">=3.11"
 dynamic = ["version"]
 dependencies = ["numpy>=1.24"]
