@@ -456,7 +456,7 @@ mod tests {
         #[test]
         fn any_header_survives_a_roundtrip(
             type_index in 0usize..ALL_TYPES.len(),
-            codec_index in 0u8..3,
+            codec_index in 0u8..4,
             encoding_index in 0u8..4,
             flags in any::<u8>(),
             request_id in any::<u32>(),

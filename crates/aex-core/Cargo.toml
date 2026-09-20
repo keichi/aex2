@@ -16,6 +16,7 @@ thiserror.workspace = true
 flate2 = { workspace = true, optional = true }
 hdf5 = { workspace = true, optional = true }
 hdf5-sys = { workspace = true, optional = true }
+sz3 = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # posix_fadvise, to start a read before it is wanted.
@@ -24,8 +25,12 @@ libc = "0.2"
 [features]
 # Needs libhdf5 >= 1.14 at build time.
 hdf5 = ["dep:flate2", "dep:hdf5", "dep:hdf5-sys"]
+# Error-bounded lossy compression. Builds SZ3 from source: needs cmake, a
+# C++17 compiler and libclang.
+sz = ["dep:sz3"]
 
 [dev-dependencies]
 # Element types the HDF5 tests write.
 num-complex = "0.4"
+proptest.workspace = true
 tempfile.workspace = true

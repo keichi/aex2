@@ -10,6 +10,7 @@
 
 pub mod backend;
 pub mod backends;
+pub mod codec;
 pub mod dtype;
 pub mod error;
 pub mod quality;
@@ -23,6 +24,7 @@ pub use backends::decode_cache::DecodeCache;
 pub use backends::hdf5::{Hdf5Dataset, Hdf5File};
 pub use backends::npy::{NpyDataset, NpyFile};
 pub use backends::null::{NullDataset, NullFile};
+pub use codec::BlockSpec;
 pub use dtype::{DType, ALL_DTYPES};
 pub use error::{AexError, ErrorClass, Result};
 pub use quality::{Codec, Encoding, QualitySpec};

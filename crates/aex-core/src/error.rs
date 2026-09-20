@@ -108,6 +108,11 @@ pub enum AexError {
             .offset.saturating_add(*.len))]
     OutOfRange { offset: u64, len: u64, total: u64 },
 
+    /// A compressed block that cannot be expanded: a header this build does not
+    /// understand, a codec it cannot produce, or bytes that do not decode.
+    #[error("compressed block: {0}")]
+    BadBlock(String),
+
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 }
@@ -133,6 +138,8 @@ impl AexError {
             | AexError::NotAGroup(_)
             | AexError::OutOfRange { .. } => ErrorClass::Request,
             AexError::MalformedNpy(_) | AexError::MalformedHdf5(_) => ErrorClass::Permanent,
+            // Both sides agreed a codec and then failed to speak it.
+            AexError::BadBlock(_) => ErrorClass::Protocol,
             AexError::Io(e) => match e.kind() {
                 // A missing or unreadable file is the requester's problem.
                 io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => ErrorClass::Request,

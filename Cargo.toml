@@ -36,6 +36,8 @@ npyz = "0.9"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 socket2 = { version = "0.6", features = ["all"] }
+# Vendors and builds SZ3; needs cmake, a C++17 compiler and libclang.
+sz3 = "0.4"
 thiserror = "2"
 tokio = "1"
 tokio-stream = { version = "0.1", features = ["net"] }

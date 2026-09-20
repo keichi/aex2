@@ -74,6 +74,8 @@ pub enum Codec {
     Raw = 0,
     Lz4 = 1,
     Zstd = 2,
+    /// Error-bounded and lossy: only ever paired with [`Encoding::ErrorBound`].
+    Sz = 3,
 }
 
 impl Codec {
@@ -91,6 +93,7 @@ impl Codec {
             0 => Some(Codec::Raw),
             1 => Some(Codec::Lz4),
             2 => Some(Codec::Zstd),
+            3 => Some(Codec::Sz),
             _ => None,
         }
     }
@@ -171,7 +174,7 @@ mod tests {
             assert_eq!(Encoding::from_u8(encoding.as_u8()), Some(encoding));
             assert_eq!(Encoding::from_i32(encoding.as_i32()), Some(encoding));
         }
-        for codec in [Codec::Raw, Codec::Lz4, Codec::Zstd] {
+        for codec in [Codec::Raw, Codec::Lz4, Codec::Zstd, Codec::Sz] {
             assert_eq!(Codec::from_u8(codec.as_u8()), Some(codec));
             assert_eq!(Codec::from_u32(codec.as_u32()), Some(codec));
         }
@@ -180,6 +183,7 @@ mod tests {
         assert_eq!(Encoding::ErrorBound.as_u8(), 3);
         assert_eq!(Codec::Raw.as_u8(), 0);
         assert_eq!(Codec::Zstd.as_u8(), 2);
+        assert_eq!(Codec::Sz.as_u8(), 3);
     }
 
     #[test]
@@ -188,7 +192,7 @@ mod tests {
         assert_eq!(Encoding::from_u8(255), None);
         assert_eq!(Encoding::from_i32(-1), None);
         assert_eq!(Encoding::from_i32(1 << 20), None);
-        assert_eq!(Codec::from_u8(3), None);
+        assert_eq!(Codec::from_u8(4), None);
         assert_eq!(Codec::from_u32(1 << 20), None);
     }
 
