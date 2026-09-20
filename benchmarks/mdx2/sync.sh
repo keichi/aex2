@@ -29,9 +29,16 @@ done
 # A login shell, because .bashrc stops before it puts cargo on PATH.
 # The extension is rebuilt too, so Python never imports a stale one.
 # The server gets the hdf5 feature by default; the VMs have libhdf5 in
-# /usr/local. bindgen wants a libclang and the VMs carry only the runtime one,
-# so it is pointed at that rather than the -dev symlink it looks for.
-build="cd aex2 && export LIBCLANG_PATH=/usr/lib/llvm-18/lib &&
+# /usr/local.
+#
+# The two bindgen variables are for the sz feature. The VMs have llvm-18's
+# runtime libclang but none of the clang dev packages, so libclang has to be
+# named by path, and it is then left without its own stddef.h and friends --
+# gcc's are lent to it instead, which is cheaper than installing a toolchain
+# on the VMs to build one crate.
+build="cd aex2 &&
+    export LIBCLANG_PATH=/usr/lib/llvm-18/lib &&
+    export BINDGEN_EXTRA_CLANG_ARGS=\"-isystem \$(ls -d /usr/lib/gcc/*/*/include | tail -1)\" &&
     cargo build --release --features $FEATURES &&
     if [ -d .venv ]; then . .venv/bin/activate && maturin develop --release -q; fi"
 pids=()
