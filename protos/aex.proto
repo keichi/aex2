@@ -155,8 +155,8 @@ message Index {
 // ---------------------------------------------------------------------------
 
 enum Encoding {
-    EXACT       = 0;  // Lossless. The only one implemented so far
-    DTYPE_CAST  = 1;  // float64 -> float32/float16, etc.
+    EXACT       = 0;  // Lossless, and what everything falls back to
+    DTYPE_CAST  = 1;  // float64 -> float32, or float32 -> float16
     ERROR_BOUND = 2;  // Error-bounded lossy compression (ZFP, SZ, ...)
 }
 

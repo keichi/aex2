@@ -96,6 +96,7 @@ dependencies = [
  "aex-proto",
  "aex-server",
  "aex-wire",
+ "half",
  "hdf5-metno",
  "npyz",
  "tempfile",

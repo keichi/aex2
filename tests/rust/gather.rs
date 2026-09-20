@@ -150,14 +150,15 @@ fn a_quality_the_server_lacks_falls_back_to_exact() {
     let client = server.connect();
     let handle = client.open("grid.npy").expect("open");
 
-    let half = QualitySpec {
+    // Float32 does not narrow to float64, and nothing pretends otherwise.
+    let widened = QualitySpec {
         encoding: Encoding::DtypeCast,
-        cast_dtype: Some(DType::Float16),
+        cast_dtype: Some(DType::Float64),
         ..QualitySpec::exact()
     };
     let indices = rows(0, 10);
     let selection = Selection {
-        quality: &half,
+        quality: &widened,
         ..Selection::exact(handle, "array", &indices)
     };
     let plan = client.prepare_selection(&selection).expect("prepare");
@@ -165,6 +166,52 @@ fn a_quality_the_server_lacks_falls_back_to_exact() {
     assert_eq!(plan.dtype, DType::Float32);
     let (data, _) = fill_all(&client, &[plan], &[selection]).expect("fill");
     assert_eq!(data[0], expected[..10 * ROW]);
+}
+
+#[test]
+fn a_gathered_selection_is_cast_on_the_way_out() {
+    // The gather walk steps the array's own elements while the stream counts
+    // the narrowed ones, so this is where the two itemsizes have to be kept
+    // apart.
+    let server = TestServer::start();
+    let expected = server.write_counting_npy("grid.npy", &[64, ROW]);
+    let client = server.connect();
+    let handle = client.open("grid.npy").expect("open");
+
+    let narrowed = QualitySpec {
+        encoding: Encoding::DtypeCast,
+        cast_dtype: Some(DType::Float16),
+        ..QualitySpec::exact()
+    };
+    // Every third row, which is a gather rather than one run.
+    let indices = vec![Index::Slice {
+        start: Some(0),
+        stop: Some(30),
+        step: Some(3),
+    }];
+    let selection = Selection {
+        quality: &narrowed,
+        ..Selection::exact(handle, "array", &indices)
+    };
+    let plan = client.prepare_selection(&selection).expect("prepare");
+    assert_eq!(plan.applied_quality.encoding, Encoding::DtypeCast);
+    assert_eq!(plan.dtype, DType::Float16);
+    assert_eq!(plan.shape, vec![10, ROW as u64]);
+    assert_eq!(plan.total_bytes, (10 * ROW * 2) as u64);
+
+    let mut buf = vec![0u8; plan.total_bytes as usize];
+    client
+        .fill_many(&[plan], &[selection], &mut [&mut buf])
+        .expect("fill");
+    let got: Vec<f32> = buf
+        .chunks_exact(2)
+        .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect();
+    let want: Vec<f32> = (0..10)
+        .flat_map(|r| expected[r * 3 * ROW..(r * 3 + 1) * ROW].iter())
+        .map(|v| half::f16::from_f32(*v).to_f32())
+        .collect();
+    assert_eq!(got, want);
 }
 
 #[test]

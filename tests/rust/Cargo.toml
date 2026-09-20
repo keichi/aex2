@@ -25,6 +25,8 @@ hdf5 = { workspace = true, optional = true }
 
 [dev-dependencies]
 aex-client.workspace = true
+# Checks what a float32 becomes when the server narrows it.
+half = "2"
 aex-core.workspace = true
 aex-proto.workspace = true
 aex-server.workspace = true

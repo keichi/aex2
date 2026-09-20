@@ -6,10 +6,9 @@
 //! fail to understand each other.
 //!
 //! What a build can produce depends on its features: [`Encoding::Exact`],
-//! [`Codec::Raw`] and [`Codec::Gzip`] always, [`Codec::Sz`] with `sz`,
-//! [`Codec::Zfp`] with `zfp`, and [`Encoding::ErrorBound`] with either. The
-//! rest of the values exist because they travel on the wire in a fixed-width
-//! field, and a decoder has to name what it is refusing.
+//! [`Encoding::DtypeCast`], [`Codec::Raw`] and [`Codec::Gzip`] always,
+//! [`Codec::Sz`] with `sz`, [`Codec::Zfp`] with `zfp`, and
+//! [`Encoding::ErrorBound`] with either.
 
 /// What was done to the elements before they were put on the wire.
 ///
@@ -18,10 +17,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum Encoding {
-    /// Lossless. The only one this release produces.
+    /// Lossless, and what everything falls back to.
     #[default]
     Exact = 0,
-    /// Elements narrowed to another dtype, e.g. float64 to float32.
+    /// Elements narrowed to another dtype: float64 to float32, or float32 to
+    /// float16, and nothing else.
     DtypeCast = 1,
     /// Lossy, within a stated error bound.
     ErrorBound = 2,
@@ -61,7 +61,8 @@ impl Encoding {
             Encoding::Exact => true,
             // Needs a codec to carry it.
             Encoding::ErrorBound => cfg!(feature = "sz") || cfg!(feature = "zfp"),
-            Encoding::DtypeCast => false,
+            // Narrowing a float is arithmetic this build always has.
+            Encoding::DtypeCast => true,
         }
     }
 }
@@ -235,7 +236,21 @@ impl QualitySpec {
                         .abs_error_bound
                         .is_some_and(|bound| bound.is_finite() && bound > 0.0)
             }
-            Encoding::DtypeCast => false,
+            // Only these two. Both halve the element and keep it a float, so
+            // the wire length is exactly half and the values still mean what
+            // they meant. A cast that changes the kind of number — a float to
+            // an integer, say — is a different question, about saturation and
+            // rounding and signedness, and is not answered here.
+            //
+            // Nothing checks that the values fit: float32 to float16 overflows
+            // to infinity above 65504, the way `numpy.astype` does. Finding
+            // out would mean reading the whole selection before agreeing to
+            // send it, and the plan says what was applied, so a caller that
+            // cares can look at what arrived.
+            Encoding::DtypeCast => matches!(
+                (dtype, self.cast_dtype),
+                (DType::Float64, Some(DType::Float32)) | (DType::Float32, Some(DType::Float16))
+            ),
         }
     }
 
@@ -258,6 +273,18 @@ impl QualitySpec {
                 .codec
                 .filter(|codec| !codec.is_error_bounded() && codec.is_supported())
                 .unwrap_or(Codec::Raw),
+        }
+    }
+
+    /// The element type that travels, given the array's own.
+    ///
+    /// Only a cast this quality can actually apply changes it, so an applied
+    /// quality is what this wants; a request that was going to fall back
+    /// would otherwise name a dtype the transfer never uses.
+    pub fn wire_dtype(&self, dtype: crate::dtype::DType) -> crate::dtype::DType {
+        match self.encoding {
+            Encoding::DtypeCast if self.can_apply(dtype) => self.cast_dtype.unwrap_or(dtype),
+            _ => dtype,
         }
     }
 
@@ -307,8 +334,9 @@ mod tests {
     #[test]
     fn what_this_build_can_produce_is_what_it_advertises() {
         assert!(Encoding::Exact.is_supported());
+        assert!(Encoding::DtypeCast.is_supported());
         assert!(Codec::Raw.is_supported());
-        assert!(!Encoding::DtypeCast.is_supported());
+        assert!(Codec::Gzip.is_supported());
         assert_eq!(Codec::Sz.is_supported(), cfg!(feature = "sz"));
         assert_eq!(Codec::Zfp.is_supported(), cfg!(feature = "zfp"));
         // Either codec carries an error bound; neither is needed for the other.
@@ -317,20 +345,25 @@ mod tests {
 
         // Bit n of the mask is codec n, which is what the client reads.
         assert_eq!(supported_codecs() & 1, 1);
-        assert_eq!(supported_encodings() & 1, 1);
+        assert_eq!(supported_codecs() >> 3 & 1, 1);
+        assert_eq!(supported_encodings() & 3, 3);
         assert_eq!(supported_codecs() >> 1 & 1, cfg!(feature = "sz") as u32);
         assert_eq!(supported_codecs() >> 2 & 1, cfg!(feature = "zfp") as u32);
         assert_eq!(supported_encodings() >> 2 & 1, lossy as u32);
     }
 
+    fn cast(to: DType) -> QualitySpec {
+        QualitySpec {
+            encoding: Encoding::DtypeCast,
+            cast_dtype: Some(to),
+            ..QualitySpec::default()
+        }
+    }
+
     #[test]
     fn an_encoding_this_server_lacks_falls_back_to_exact() {
-        let requested = QualitySpec {
-            encoding: Encoding::DtypeCast,
-            cast_dtype: Some(DType::Float16),
-            ..QualitySpec::default()
-        };
-        let applied = requested.applied(DType::Float32);
+        // Widening is not one of the two narrowings, so it is refused.
+        let applied = cast(DType::Float64).applied(DType::Float32);
         assert!(applied.is_exact());
         // The fallback drops the settings that belonged to the encoding it
         // could not apply, so the plan reports exactly what was done.
@@ -339,6 +372,30 @@ mod tests {
         // A request it can honour comes back untouched.
         let exact = QualitySpec::exact();
         assert_eq!(exact.applied(DType::Float32), exact);
+    }
+
+    #[test]
+    fn only_the_two_float_narrowings_are_cast() {
+        for (from, to) in [
+            (DType::Float64, DType::Float32),
+            (DType::Float32, DType::Float16),
+        ] {
+            let applied = cast(to).applied(from);
+            assert_eq!(applied.encoding, Encoding::DtypeCast, "{from} to {to}");
+            assert_eq!(applied.wire_dtype(from), to);
+        }
+        // Skipping a step, widening, changing the kind of number, and asking
+        // for the type the array already has.
+        for (from, to) in [
+            (DType::Float64, DType::Float16),
+            (DType::Float32, DType::Float64),
+            (DType::Float32, DType::Int16),
+            (DType::Int64, DType::Int32),
+            (DType::Float32, DType::Float32),
+        ] {
+            assert!(cast(to).applied(from).is_exact(), "{from} to {to}");
+            assert_eq!(cast(to).wire_dtype(from), from, "{from} to {to}");
+        }
     }
 
     fn error_bound(abs: Option<f64>, rel: Option<f64>) -> QualitySpec {

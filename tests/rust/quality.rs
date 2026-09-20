@@ -215,13 +215,13 @@ fn a_quality_the_server_cannot_apply_comes_back_as_exact() {
     assert_eq!(applied.encoding, Encoding::Exact);
     assert_eq!(values, expected(shape[0] * shape[1]), "exact means exact");
 
-    // And an encoding nothing implements.
-    let cast = QualitySpec {
+    // And a cast that is not one of the two narrowings.
+    let widened = QualitySpec {
         encoding: Encoding::DtypeCast,
-        cast_dtype: Some(aex_core::DType::Float16),
+        cast_dtype: Some(aex_core::DType::Float64),
         ..QualitySpec::default()
     };
-    let (applied, _, _) = read(&server, "cast.npy", &shape, &[], &cast);
+    let (applied, _, _) = read(&server, "widened.npy", &shape, &[], &widened);
     assert_eq!(applied.encoding, Encoding::Exact);
 }
 
@@ -373,4 +373,101 @@ fn an_error_bounded_codec_asked_for_on_an_exact_transfer_is_not_used() {
     assert_eq!(applied.codec, Some(Codec::Raw));
     assert_eq!(values, expected(1024 * 512));
     assert_eq!(result.wire_bytes, result.bytes);
+}
+
+#[test]
+fn a_cast_halves_the_transfer_and_says_so() {
+    // Large enough to go over the data plane in several pieces, so the
+    // conversion is exercised at the boundaries between them as well.
+    let server = TestServer::start();
+    let shape = [2048, 512];
+    let quality = QualitySpec {
+        encoding: Encoding::DtypeCast,
+        cast_dtype: Some(aex_core::DType::Float16),
+        ..QualitySpec::exact()
+    };
+    server.write_npy("cast.npy", &shape);
+    let client = server.connect();
+    let handle = client.open("cast.npy").expect("open");
+    let selection = Selection {
+        quality: &quality,
+        ..Selection::exact(handle, "array", &[])
+    };
+    let plan = client.prepare_selection(&selection).expect("prepare");
+
+    assert_eq!(plan.applied_quality.encoding, Encoding::DtypeCast);
+    assert_eq!(
+        plan.applied_quality.cast_dtype,
+        Some(aex_core::DType::Float16)
+    );
+    assert_eq!(plan.dtype, aex_core::DType::Float16);
+    assert_eq!(plan.total_bytes, (shape[0] * shape[1] * 2) as u64);
+
+    let mut bytes = vec![0u8; plan.total_bytes as usize];
+    let result = client
+        .fill_many(
+            std::slice::from_ref(&plan),
+            std::slice::from_ref(&selection),
+            &mut [&mut bytes],
+        )
+        .expect("fill");
+    // Nothing is compressed, so the wire carries the halved stream and no
+    // more: the receiver reads it straight into the array.
+    assert_eq!(result.wire_bytes, result.bytes);
+    assert_eq!(result.bytes, plan.total_bytes);
+
+    let got: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect();
+    let want: Vec<f32> = expected(shape[0] * shape[1])
+        .into_iter()
+        .map(|v| half::f16::from_f32(v).to_f32())
+        .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn a_cast_that_overflows_gives_back_what_the_cast_gives_back() {
+    // float16 stops at 65504 and the server does not go looking: reading the
+    // whole selection to find out would cost more than the transfer, and the
+    // values that arrive say it plainly enough.
+    let server = TestServer::start();
+    let shape = [256, 512];
+    let quality = QualitySpec {
+        encoding: Encoding::DtypeCast,
+        cast_dtype: Some(aex_core::DType::Float16),
+        ..QualitySpec::exact()
+    };
+    let (applied, _, _) = read(&server, "overflow.npy", &shape, &[], &quality);
+    assert_eq!(
+        applied.encoding,
+        Encoding::DtypeCast,
+        "applied all the same"
+    );
+
+    server.write_npy("overflow2.npy", &shape);
+    let client = server.connect();
+    let handle = client.open("overflow2.npy").expect("open");
+    let selection = Selection {
+        quality: &quality,
+        ..Selection::exact(handle, "array", &[])
+    };
+    let plan = client.prepare_selection(&selection).expect("prepare");
+    let mut bytes = vec![0u8; plan.total_bytes as usize];
+    client
+        .fill_many(
+            std::slice::from_ref(&plan),
+            std::slice::from_ref(&selection),
+            &mut [&mut bytes],
+        )
+        .expect("fill");
+    let got: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect();
+    // The fixture counts up past 65504 and everything above it is infinite.
+    assert_eq!(got[0], 0.0);
+    assert!(got[65504].is_finite());
+    assert!(got[70000].is_infinite(), "{}", got[70000]);
 }

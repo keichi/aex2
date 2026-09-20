@@ -46,14 +46,14 @@ fn a_session_reports_what_the_server_granted() {
     assert_eq!(session.protocol_version, aex_client::PROTOCOL_VERSION);
     assert_eq!(session.default_chunk_bytes, 4 * 1024 * 1024);
     assert_eq!(session.max_fetch_bytes, 16 * 1024 * 1024);
-    // Bits 0 and 3 are RAW and GZIP, always, as bit 0 of the encodings is
-    // EXACT. Bit 1 is SZ and bit 2 ZFP, each only in a build that has it;
-    // ERROR_BOUND rides on bit 2 of the encodings as soon as there is any
-    // codec to carry it.
+    // Bits 0 and 3 are RAW and GZIP, always, as bits 0 and 1 of the encodings
+    // are EXACT and DTYPE_CAST. Bit 1 is SZ and bit 2 ZFP, each only in a
+    // build that has it; ERROR_BOUND rides on bit 2 of the encodings as soon
+    // as there is any codec to carry it.
     let sz = cfg!(feature = "sz") as u32;
     let zfp = cfg!(feature = "zfp") as u32;
     assert_eq!(session.supported_codecs, 1 | sz << 1 | zfp << 2 | 1 << 3);
-    assert_eq!(session.supported_encodings, 1 | (sz | zfp) << 2);
+    assert_eq!(session.supported_encodings, 1 | 1 << 1 | (sz | zfp) << 2);
 
     // The server advertises no host, so the client keeps the one it dialled,
     // and the port is the one the data plane really bound.

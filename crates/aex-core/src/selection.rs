@@ -484,8 +484,13 @@ pub enum LayoutKind {
 pub struct SelectionLayout {
     /// Shape of the result, as it will be reported to the client.
     pub out_shape: Vec<u64>,
-    /// Element type actually transferred.
+    /// Element type actually transferred. Narrower than `src_dtype` under a
+    /// cast, and the same otherwise.
     pub dtype: DType,
+    /// Element type the array holds. The logical stream is in `dtype`, so
+    /// everything that reaches into the source scales by the ratio between
+    /// the two.
+    pub src_dtype: DType,
     /// Length of the logical byte stream.
     pub total_bytes: u64,
     /// What is done to the elements on the way out. The send path reads it
@@ -507,11 +512,18 @@ impl SelectionLayout {
         quality: &QualitySpec,
     ) -> Result<Self> {
         // ERROR_BOUND changes the values, never the shape or the length, so
-        // everything below is the same work as for EXACT.
-        if !matches!(
-            quality.encoding,
-            crate::quality::Encoding::Exact | crate::quality::Encoding::ErrorBound
-        ) {
+        // everything below is the same work as for EXACT. DTYPE_CAST changes
+        // the element type, and with it the length, but not the shape.
+        use crate::quality::Encoding;
+        let wire = quality.wire_dtype(dtype);
+        let understood = match quality.encoding {
+            Encoding::Exact | Encoding::ErrorBound => true,
+            // `wire_dtype` narrows only for a cast this build agrees to, so
+            // one that comes through unchanged is one the control plane
+            // should already have turned into EXACT.
+            Encoding::DtypeCast => wire != dtype,
+        };
+        if !understood {
             return Err(AexError::UnsupportedSelection(format!(
                 "{:?} encoding is not implemented",
                 quality.encoding
@@ -520,9 +532,9 @@ impl SelectionLayout {
 
         let resolved = resolve(shape, indices)?;
         let num_elements = resolved.num_elements();
-        let total_bytes = num_elements.checked_mul(dtype.itemsize()).ok_or_else(|| {
+        let total_bytes = num_elements.checked_mul(wire.itemsize()).ok_or_else(|| {
             AexError::BadSelection(format!(
-                "a selection of {num_elements} {dtype} elements is larger than the byte range"
+                "a selection of {num_elements} {wire} elements is larger than the byte range"
             ))
         })?;
 
@@ -535,6 +547,8 @@ impl SelectionLayout {
             Some((offset_elements, len_elements)) => {
                 debug_assert_eq!(len_elements, num_elements);
                 LayoutKind::Contiguous {
+                    // A source byte offset, so it counts the array's own
+                    // elements rather than the ones that travel.
                     src_offset: offset_elements * dtype.itemsize(),
                     len: total_bytes,
                 }
@@ -544,7 +558,8 @@ impl SelectionLayout {
 
         Ok(SelectionLayout {
             out_shape: resolved.out_shape,
-            dtype,
+            dtype: wire,
+            src_dtype: dtype,
             total_bytes,
             quality: quality.clone(),
             kind,
@@ -582,15 +597,57 @@ impl SelectionLayout {
         &self,
         offset: u64,
         dst: &mut [u8],
-        mut read_src: impl FnMut(u64, &mut [u8]) -> Result<()>,
+        read_src: impl FnMut(u64, &mut [u8]) -> Result<()>,
     ) -> Result<()> {
         self.check_range(offset, dst.len() as u64)?;
+        if self.dtype == self.src_dtype {
+            return self.read_source(self.dtype.itemsize(), offset, dst, read_src);
+        }
+        self.read_cast(offset, dst, read_src)
+    }
+
+    /// The same read in the array's own element type, which is what the
+    /// source-side walk is expressed in whether or not a cast follows.
+    fn read_source(
+        &self,
+        itemsize: u64,
+        offset: u64,
+        dst: &mut [u8],
+        mut read_src: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
         match &self.kind {
             LayoutKind::Contiguous { src_offset, .. } => read_src(src_offset + offset, dst),
-            LayoutKind::Gathered(gathered) => {
-                gathered.read(self.dtype.itemsize(), offset, dst, read_src)
-            }
+            LayoutKind::Gathered(gathered) => gathered.read(itemsize, offset, dst, read_src),
         }
+    }
+
+    /// Read whole source elements covering the range, and narrow them.
+    ///
+    /// The range is in the cast element's bytes and need not land on an
+    /// element boundary, so the elements it touches are read and converted
+    /// aside and the asked-for bytes cut out of them.
+    fn read_cast(
+        &self,
+        offset: u64,
+        dst: &mut [u8],
+        read_src: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        let (wide, narrow) = (self.src_dtype.itemsize(), self.dtype.itemsize());
+        let first = offset / narrow;
+        let count = (offset + dst.len() as u64).div_ceil(narrow) - first;
+        let skip = (offset - first * narrow) as usize;
+
+        CAST.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let (wide_bytes, narrow_bytes) = ((count * wide) as usize, (count * narrow) as usize);
+            scratch.clear();
+            scratch.resize(wide_bytes + narrow_bytes, 0);
+            let (source, narrowed) = scratch.split_at_mut(wide_bytes);
+            self.read_source(wide, first * wide, source, read_src)?;
+            cast_into(self.src_dtype, self.dtype, source, narrowed)?;
+            dst.copy_from_slice(&narrowed[skip..skip + dst.len()]);
+            Ok(())
+        })
     }
 
     /// Where `[offset, offset + len)` of the logical stream lies in the source,
@@ -604,7 +661,15 @@ impl SelectionLayout {
         match &self.kind {
             LayoutKind::Contiguous { src_offset, .. } => {
                 let len = len.min(self.total_bytes.checked_sub(offset)?);
-                (len > 0).then_some((src_offset + offset, len))
+                if len == 0 {
+                    return None;
+                }
+                // Under a cast the stream is narrower than what backs it, so
+                // both ends grow to whole source elements.
+                let (wide, narrow) = (self.src_dtype.itemsize(), self.dtype.itemsize());
+                let first = offset / narrow;
+                let count = (offset + len).div_ceil(narrow) - first;
+                Some((src_offset + first * wide, count * wide))
             }
             LayoutKind::Gathered(_) => None,
         }
@@ -957,6 +1022,34 @@ thread_local! {
     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     static STRETCHES: std::cell::RefCell<Vec<Stretch>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Source elements and their narrowed form, end to end in one buffer.
+    static CAST: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Narrow every element of `src` into `dst`.
+///
+/// Only the two casts a `QualitySpec` agrees to; anything else never reaches
+/// here, and says so rather than writing something wrong.
+fn cast_into(from: DType, to: DType, src: &[u8], dst: &mut [u8]) -> Result<()> {
+    match (from, to) {
+        (DType::Float64, DType::Float32) => {
+            for (wide, narrow) in src.chunks_exact(8).zip(dst.chunks_exact_mut(4)) {
+                let v = f64::from_le_bytes(wide.try_into().expect("8 bytes")) as f32;
+                narrow.copy_from_slice(&v.to_le_bytes());
+            }
+            Ok(())
+        }
+        (DType::Float32, DType::Float16) => {
+            for (wide, narrow) in src.chunks_exact(4).zip(dst.chunks_exact_mut(2)) {
+                let v = f32::from_le_bytes(wide.try_into().expect("4 bytes"));
+                narrow.copy_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            Ok(())
+        }
+        _ => Err(AexError::UnsupportedSelection(format!(
+            "{from} does not narrow to {to}"
+        ))),
+    }
 }
 
 /// Output elements taken from the source at a fixed step.
