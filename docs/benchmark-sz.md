@@ -134,5 +134,7 @@ SZ3 は単スレッドである。`sz3` crate の `openmp` feature は既定で�
 - **credit を圧縮率で伸ばす**。RTT 50 で圧縮側が 17 % 落ちるのは in-flight が
   論理バイト建てだからで、観測した圧縮率で credit を掛けてやれば取り戻せるはずである
 - **実データでの圧縮率**。ここで使った場は合成である
-- **ZFP との比較**。`Codec` に値を 1 つと `codec::compress` / `decompress_into` に腕を
-  1 つ足せば載る
+- ~~**ZFP との比較**~~ → [benchmark-zfp.md](benchmark-zfp.md)。圧縮率は SZ3 が
+  4.83 〜 72.7 倍に対し ZFP が 1.64 〜 5.82 倍、速度は ZFP が 1.2 〜 2.4 倍。
+  狭い回線では圧縮率が、広い回線では CPU が単独で効くので、2.5 〜 7.4 Gbit/s で
+  勝ち負けが入れ替わる

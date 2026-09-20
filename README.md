@@ -61,16 +61,23 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 - **サーバの集約は 1 スレッドで逐次読む**。float の総和は numpy (pairwise) と
   ビット単位では一致しない
 - **適応品質は誤差上限のみ**。`sz` / `zfp` feature を有効にしたビルドで
-  `at(abs_error=...)` が SZ3 または ZFP による誤差保証圧縮になる。
-  `at(abs_error=..., codec="zfp")` のように転送ごとに選べ、実際に使われたものは
-  `applied_quality["codec"]` に返る。ZFP は誤差上限を 2 の冪に切り下げて守り、
-  **NaN / Inf を含む配列では上限を保証しない** (SZ3 にこの制限は無い)。圧縮率 4.83 〜 72.7 倍で、**帯域が 4.7 〜 24.8 Gbit/s
-  より狭い回線で無損失より速く届く** (1 Gbit/s なら 4.6 〜 13.8 倍。分岐点の幅は
-  誤差上限と接続数による。[測定](docs/benchmark-sz.md))。SZ3 は単スレッドで走るので、
-  **圧縮転送では `streams` がそのまま何コアで圧縮するかを決める**。既定の 8 は
-  無損失転送に合わせた値で、コア数まで上げると 1.7 倍になる。dtype キャスト・
-  間引き・値域相対の誤差、および float32 / float64 以外の dtype は EXACT で返し、
-  `AexQualityWarning` を出す。既定ビルドと Python の wheel には入っていない
+  `at(abs_error=...)` が誤差保証圧縮になる。コーデックは転送ごとに選べ
+  (`at(abs_error=1e-3, codec="zfp")`)、実際に使われたものが
+  `applied_quality["codec"]` に返る。既定は SZ3
+- **無損失より速く届くのは、帯域が 4.7 〜 31.9 Gbit/s より狭い回線**
+  (誤差上限・接続数・コーデックによる)。1 Gbit/s なら SZ3 で 4.6 〜 13.8 倍
+  ([測定](docs/benchmark-sz.md))
+- **2 つのコーデックは狭い回線と広い回線で勝ち負けが入れ替わる**。圧縮率は
+  SZ3 が 4.83 〜 72.7 倍、ZFP は 1.64 〜 5.82 倍。速度は逆に ZFP が 1.2 〜 2.4 倍。
+  狭い回線では圧縮率が、広い回線では CPU が単独で効くので、2.5 〜 7.4 Gbit/s で
+  入れ替わる: 1 Gbit/s では SZ3 が 2.8 倍速く、26 Gbit/s では ZFP が 2.3 倍速い
+  ([比較](docs/benchmark-zfp.md))。ZFP は誤差上限を 2 の冪に切り下げて守り、
+  **NaN / Inf を含む配列では上限を保証しない** (SZ3 にこの制限は無い)
+- **どちらのコーデックも単スレッドで走る**ので、圧縮転送では `streams` がそのまま
+  何コアで圧縮するかを決める。既定の 8 は無損失転送に合わせた値で、コア数まで
+  上げると 1.7 〜 1.9 倍になる。dtype キャスト・間引き・値域相対の誤差、および
+  float32 / float64 以外の dtype は EXACT で返し、`AexQualityWarning` を出す。
+  既定ビルドと Python の wheel にはどちらのコーデックも入っていない
 - **多次元の整数インデックス配列は非対応**。1 次元にして送り、結果を reshape すること
 - **credit は固定値** (既定 16、`AEX_CREDIT`)。RTT と帯域から自動で決める処理は
   入れていない。**遅延のある回線では `streams × credit × chunk_bytes` が転送の
@@ -86,7 +93,8 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 [io_uring を採らない理由](docs/benchmark-uring.md)、
 [先読みの効果](docs/benchmark-fadvise.md)、
 [非連続選択の歩き方](docs/benchmark-gather-walk.md)、
-[誤差保証圧縮](docs/benchmark-sz.md))。Linux 機での測定は
+[誤差保証圧縮 (SZ3)](docs/benchmark-sz.md)、
+[SZ3 と ZFP の比較](docs/benchmark-zfp.md))。Linux 機での測定は
 [docs/benchmark-linux.md](docs/benchmark-linux.md)、mdx2 の VM 2 台を実ネットワークで
 繋いだ測定は [docs/benchmark-mdx2.md](docs/benchmark-mdx2.md)、そこに遅延を足した測定は
 [docs/benchmark-delay.md](docs/benchmark-delay.md)、gather が省く往復の測定は
