@@ -151,10 +151,24 @@ def test_at_warns_once_per_view(array_proxy):
         view[1]
 
 
-@pytest.mark.parametrize("kwargs", [{}, {"dtype": "f2", "step": (2,)}])
+@pytest.mark.parametrize("kwargs", [{}, {"dtype": "f2", "step": (2,)}, {"codec": "zfp"}])
 def test_at_takes_exactly_one_kind_of_quality(array_proxy, kwargs):
     with pytest.raises(ValueError):
         array_proxy.at(**kwargs)
+
+
+def test_at_carries_the_codec_alongside_the_bound(array_proxy):
+    # The codec says how a bound travels, not which quality is asked for, so
+    # it rides along with abs_error rather than counting as a second kind.
+    assert array_proxy.at(abs_error=1e-3, codec="zfp").quality == {
+        "abs_error": 1e-3,
+        "codec": "zfp",
+    }
+
+
+def test_at_rejects_a_codec_that_is_not_one(array_proxy):
+    with pytest.raises(ValueError):
+        array_proxy.at(abs_error=1e-3, codec="gzip")[0:10]
 
 
 def test_at_accepts_both_error_bounds(array_proxy):

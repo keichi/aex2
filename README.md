@@ -60,8 +60,11 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
   `dtype` / `out` / `where` / `initial` を指定したものは同様にローカルで計算する
 - **サーバの集約は 1 スレッドで逐次読む**。float の総和は numpy (pairwise) と
   ビット単位では一致しない
-- **適応品質は誤差上限のみ**。`sz` feature を有効にしたビルドで `at(abs_error=...)`
-  が SZ3 による誤差保証圧縮になる。圧縮率 4.83 〜 72.7 倍で、**帯域が 4.7 〜 24.8 Gbit/s
+- **適応品質は誤差上限のみ**。`sz` / `zfp` feature を有効にしたビルドで
+  `at(abs_error=...)` が SZ3 または ZFP による誤差保証圧縮になる。
+  `at(abs_error=..., codec="zfp")` のように転送ごとに選べ、実際に使われたものは
+  `applied_quality["codec"]` に返る。ZFP は誤差上限を 2 の冪に切り下げて守り、
+  **NaN / Inf を含む配列では上限を保証しない** (SZ3 にこの制限は無い)。圧縮率 4.83 〜 72.7 倍で、**帯域が 4.7 〜 24.8 Gbit/s
   より狭い回線で無損失より速く届く** (1 Gbit/s なら 4.6 〜 13.8 倍。分岐点の幅は
   誤差上限と接続数による。[測定](docs/benchmark-sz.md))。SZ3 は単スレッドで走るので、
   **圧縮転送では `streams` がそのまま何コアで圧縮するかを決める**。既定の 8 は
@@ -124,11 +127,12 @@ macOS (M4) ではメモリ上のデータで単一接続 12,048 MiB/s (iPerf3 �
 HDF5 バックエンド (`hdf5` feature) には libhdf5 1.14 以降が要る
 (`brew install hdf5` / `apt install libhdf5-dev`。Ubuntu は 26.04 以降)。
 
-誤差保証圧縮 (`sz` feature) は SZ3 をソースからビルドするため、cmake・C++17
-コンパイラ・libclang が要る (`brew install cmake` / `apt install cmake libclang-dev`)。
-既定では無効で、そのぶん素のビルドはこれらを必要としない。リンクする `sz3-sys` は
-GPL-3.0-only である (SZ3 本体は BSD)。Python から使うには拡張モジュールを
-`maturin develop --features aex-py/sz` でビルドする。
+誤差保証圧縮 (`sz` / `zfp` feature) は SZ3 と zfp をソースからビルドするため、
+cmake・C++17 コンパイラ・libclang が要る (`brew install cmake` /
+`apt install cmake libclang-dev`)。どちらも既定では無効で、そのぶん素のビルドは
+これらを必要としない。リンクする `sz3-sys` は GPL-3.0-only である (SZ3 本体は
+BSD)。`zfp-sys` は MIT で、静的リンクしている。Python から使うには拡張モジュールを
+`maturin develop --features aex-py/sz,aex-py/zfp` でビルドする。
 
 ```console
 $ cargo test --all-features

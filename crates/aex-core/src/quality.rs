@@ -125,6 +125,11 @@ impl Codec {
         Self::from_u8(v as u8)
     }
 
+    /// Whether this is one of the lossy, error-bounded codecs.
+    pub const fn is_error_bounded(self) -> bool {
+        matches!(self, Codec::Sz | Codec::Zfp)
+    }
+
     /// Whether this build can produce it.
     pub const fn is_supported(self) -> bool {
         match self {
@@ -180,6 +185,14 @@ pub struct QualitySpec {
     /// For [`Encoding::ErrorBound`].
     pub abs_error_bound: Option<f64>,
     pub rel_error_bound: Option<f64>,
+    /// Which error-bounded codec should carry it. `None` takes the build's
+    /// own, which is what a client with no preference asks for.
+    ///
+    /// Unlike the rest, this one is not a field of the proto `QualitySpec`: it
+    /// travels as `PrepareSelectionRequest.requested_codec` going out and as
+    /// `TransferPlan.codec` coming back, which is where the wire already had
+    /// room for it.
+    pub codec: Option<Codec>,
 }
 
 impl QualitySpec {
@@ -191,6 +204,7 @@ impl QualitySpec {
             subsample_step: Vec::new(),
             abs_error_bound: None,
             rel_error_bound: None,
+            codec: None,
         }
     }
 
@@ -216,7 +230,10 @@ impl QualitySpec {
         match self.encoding {
             Encoding::Exact => true,
             Encoding::ErrorBound => {
-                Encoding::ErrorBound.is_supported()
+                // A codec this build cannot produce is not quietly swapped for
+                // one it can: the client asked for a particular one, and
+                // falling back to EXACT is what tells it so.
+                self.codec().is_supported()
                     && matches!(dtype, DType::Float32 | DType::Float64)
                     // A bound relative to the value range would have to mean
                     // the range of the whole selection, and a block only ever
@@ -230,10 +247,18 @@ impl QualitySpec {
         }
     }
 
-    /// The codec that carries this quality.
+    /// The codec that carries this quality, once `codec` has had the build's
+    /// default filled in for it.
+    ///
+    /// A codec that is not one of the error-bounded ones reads as no
+    /// preference rather than as a request: a client from before there was a
+    /// choice leaves the field at RAW, and RAW cannot carry a bound.
     pub fn codec(&self) -> Codec {
         match self.encoding {
-            Encoding::ErrorBound => DEFAULT_LOSSY,
+            Encoding::ErrorBound => self
+                .codec
+                .filter(|codec| codec.is_error_bounded())
+                .unwrap_or(DEFAULT_LOSSY),
             _ => Codec::Raw,
         }
     }
@@ -375,5 +400,41 @@ mod tests {
         assert_eq!(QualitySpec::exact().eps(), None);
         assert_eq!(error_bound(Some(1e-3), None).codec(), DEFAULT_LOSSY);
         assert_eq!(error_bound(Some(1e-3), None).eps(), Some(1e-3));
+    }
+
+    #[test]
+    fn the_codec_asked_for_is_the_one_that_carries_it() {
+        for want in [Codec::Sz, Codec::Zfp] {
+            let asked = QualitySpec {
+                codec: Some(want),
+                ..error_bound(Some(1e-3), None)
+            };
+            assert_eq!(asked.codec(), want);
+            // Asking for one this build does not have falls back to the
+            // lossless default rather than quietly using the other one: the
+            // client asked for that codec's error behaviour, not any codec's.
+            let applied = asked.applied(DType::Float32);
+            assert_eq!(!applied.is_exact(), want.is_supported());
+            if want.is_supported() {
+                assert_eq!(applied.codec(), want);
+            }
+        }
+    }
+
+    #[test]
+    fn a_lossless_codec_in_that_field_reads_as_no_preference() {
+        // A client from before there was a choice leaves the field at RAW,
+        // and RAW cannot carry a bound, so it must not be read as one.
+        for codec in [Codec::Raw, Codec::Lz4, Codec::Zstd] {
+            let asked = QualitySpec {
+                codec: Some(codec),
+                ..error_bound(Some(1e-3), None)
+            };
+            assert_eq!(asked.codec(), DEFAULT_LOSSY);
+            assert_eq!(
+                !asked.applied(DType::Float32).is_exact(),
+                Encoding::ErrorBound.is_supported()
+            );
+        }
     }
 }

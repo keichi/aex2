@@ -170,6 +170,7 @@ class ArrayProxy:
         step: tuple[int, ...] | None = None,
         abs_error: float | None = None,
         rel_error: float | None = None,
+        codec: str | None = None,
     ) -> "QualityView":
         """A view that asks the server for a cheaper encoding of the data.
 
@@ -179,9 +180,14 @@ class ArrayProxy:
         view warns; ``applied_quality`` says what was done.
 
         Only ``abs_error`` is implemented, on float32 and float64, and only by
-        a server and an extension module built with the ``sz`` feature. A bound
-        relative to the value range would have to mean the range of the whole
-        selection, and a compressed block only ever sees its own.
+        a server and an extension module built with the ``sz`` or ``zfp``
+        feature. A bound relative to the value range would have to mean the
+        range of the whole selection, and a compressed block only ever sees its
+        own.
+
+        ``codec`` picks which error-bounded codec carries it, ``"sz"`` or
+        ``"zfp"``; left out, the server uses whichever it was built with.
+        ``applied_quality["codec"]`` says which one it actually used.
         """
         self._require_base("at")
         quality: dict[str, Any] = {}
@@ -196,6 +202,10 @@ class ArrayProxy:
         kinds = {"error" if k.endswith("_error") else k for k in quality}
         if len(kinds) != 1:
             raise ValueError("give exactly one of dtype, step, or abs_error / rel_error")
+        # The codec is how a quality travels, not which quality it is, so it
+        # does not count towards the check above.
+        if codec is not None:
+            quality["codec"] = str(codec)
         return QualityView(self, quality)
 
     def read_into(self, out: npt.NDArray[Any], key: Any = Ellipsis) -> None:

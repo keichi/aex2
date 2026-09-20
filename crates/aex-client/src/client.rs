@@ -784,15 +784,15 @@ fn prepare_request(session_id: Vec<u8>, selection: &Selection<'_>) -> PrepareSel
         // Asking for what this build cannot expand would get it sent: the
         // server reports what it applied, it does not ask whether we meant it.
         requested_quality: Some(quality_to_proto(&expandable(selection.quality))),
-        // The codec of a lossy encoding comes with the encoding. This field
-        // only ever asks for a lossless one on top of EXACT, and there is none.
-        requested_codec: aex_core::Codec::Raw.as_u32(),
+        // Which error-bounded codec should carry it, when there is more than
+        // one. EXACT still asks for RAW: no lossless codec is implemented.
+        requested_codec: expandable(selection.quality).codec().as_u32(),
     }
 }
 
 /// The most of `quality` this build could expand if it arrived.
 fn expandable(quality: &QualitySpec) -> QualitySpec {
-    if quality.encoding.is_supported() {
+    if quality.encoding.is_supported() && quality.codec().is_supported() {
         quality.clone()
     } else {
         QualitySpec::exact()

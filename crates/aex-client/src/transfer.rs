@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use aex_core::{DType, QualitySpec};
+use aex_core::{Codec, DType, QualitySpec};
 use aex_proto::convert::quality_from_proto;
 use aex_wire::{Ticket, TICKET_LEN};
 
@@ -82,7 +82,12 @@ impl Plan {
             dtype,
             shape,
             total_bytes: plan.total_bytes,
-            applied_quality: quality_from_proto(plan.applied_quality.as_ref()),
+            applied_quality: QualitySpec {
+                // The codec the server settled on comes back in a field of the
+                // plan, not inside the quality, so it is put back here.
+                codec: Codec::from_u32(plan.codec),
+                ..quality_from_proto(plan.applied_quality.as_ref())
+            },
             requested_quality: requested_quality.clone(),
             inline_data: plan.inline_data,
         };

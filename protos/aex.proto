@@ -68,8 +68,8 @@ message ConnectReply {
     uint32 granted_streams     = 4;
     uint32 protocol_version    = 5;
     uint64 default_chunk_bytes = 6;  // Chunk size the server recommends
-    uint32 supported_codecs    = 7;  // Bitmask: bit0=RAW, bit1=LZ4, bit2=ZSTD
-    uint32 supported_encodings = 8;  // Bitmask: bit0=EXACT, bit1=CAST, ...
+    uint32 supported_codecs    = 7;  // Bitmask: bit0=RAW, bit1=LZ4, bit2=ZSTD, bit3=SZ, bit4=ZFP
+    uint32 supported_encodings = 8;  // Bitmask: bit0=EXACT, bit1=CAST, bit2=SUBSAMPLE, bit3=ERROR_BOUND
     // Ceiling on one FETCH. Fixed for the session, so it is sent once here
     // rather than repeated in every plan.
     uint64 max_fetch_bytes = 9;
@@ -182,7 +182,9 @@ message PrepareSelectionRequest {
     string name       = 3;
     repeated Index indices = 4;
     QualitySpec requested_quality = 5;
-    uint32 requested_codec = 6;  // 0 = RAW
+    // Which codec to use. For ERROR_BOUND, which of the error-bounded ones;
+    // anything else there reads as no preference. 0 = RAW.
+    uint32 requested_codec = 6;
 }
 
 message TransferPlan {

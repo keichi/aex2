@@ -9,19 +9,31 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use aex_client::{ClientConfig, Index, Selection, TransferResult};
-use aex_core::{Encoding, ErrorClass, QualitySpec};
+use aex_core::{Codec, Encoding, ErrorClass, QualitySpec};
 
 #[path = "support.rs"]
 mod support;
 
 use support::TestServer;
 
-fn error_bound(abs: f64) -> QualitySpec {
+fn error_bound(abs: f64, codec: Codec) -> QualitySpec {
     QualitySpec {
         encoding: Encoding::ErrorBound,
         abs_error_bound: Some(abs),
+        codec: Some(codec),
         ..QualitySpec::default()
     }
+}
+
+/// The error-bounded codecs this build has.
+///
+/// Every bound these tests check is a promise each codec makes on its own, so
+/// each one is put through all of them rather than only the default.
+fn codecs() -> Vec<Codec> {
+    [Codec::Sz, Codec::Zfp]
+        .into_iter()
+        .filter(|codec| codec.is_supported())
+        .collect()
 }
 
 /// Read a selection at a given quality, and say what the server applied.
@@ -92,15 +104,21 @@ fn every_element_arrives_within_the_bound_it_asked_for() {
     // Large enough that the transfer goes over the data plane rather than
     // inline, and several read pieces wide.
     let shape = [2048, 512];
-    for eps in [1e-3, 1.0, 64.0] {
-        let name = format!("bounded-{eps}.npy");
-        let (applied, values, _) = read(&server, &name, &shape, &[], &error_bound(eps));
-        assert_eq!(applied.encoding, Encoding::ErrorBound);
-        assert_eq!(applied.abs_error_bound, Some(eps));
+    for codec in codecs() {
+        for eps in [1e-3, 1.0, 64.0] {
+            let name = format!("bounded-{codec:?}-{eps}.npy");
+            let (applied, values, _) = read(&server, &name, &shape, &[], &error_bound(eps, codec));
+            assert_eq!(applied.encoding, Encoding::ErrorBound);
+            assert_eq!(applied.abs_error_bound, Some(eps));
+            assert_eq!(applied.codec, Some(codec), "the codec asked for");
 
-        let want = expected(shape[0] * shape[1]);
-        let seen = worst(&values, &want);
-        assert!(seen <= eps, "worst error {seen:e} over a bound of {eps:e}");
+            let want = expected(shape[0] * shape[1]);
+            let seen = worst(&values, &want);
+            assert!(
+                seen <= eps,
+                "{codec:?}: worst error {seen:e} over a bound of {eps:e}"
+            );
+        }
     }
 }
 
@@ -109,24 +127,29 @@ fn the_bound_holds_across_every_connection_and_chunk() {
     let server = TestServer::start();
     let shape = [4096, 256];
     let eps = 1e-2;
-    // Several connections, small chunks: every block boundary and every
-    // stealing decision gets exercised.
-    let config = ClientConfig {
-        streams: 4,
-        chunk_bytes: 256 * 1024,
-        ..ClientConfig::default()
-    };
-    let (applied, values, _) = read_with(
-        &server,
-        "parallel.npy",
-        &shape,
-        &[],
-        &error_bound(eps),
-        config,
-    );
-    assert_eq!(applied.encoding, Encoding::ErrorBound);
-    let seen = worst(&values, &expected(shape[0] * shape[1]));
-    assert!(seen <= eps, "worst error {seen:e} over a bound of {eps:e}");
+    for codec in codecs() {
+        // Several connections, small chunks: every block boundary and every
+        // stealing decision gets exercised.
+        let config = ClientConfig {
+            streams: 4,
+            chunk_bytes: 256 * 1024,
+            ..ClientConfig::default()
+        };
+        let (applied, values, _) = read_with(
+            &server,
+            "parallel.npy",
+            &shape,
+            &[],
+            &error_bound(eps, codec),
+            config,
+        );
+        assert_eq!(applied.encoding, Encoding::ErrorBound);
+        let seen = worst(&values, &expected(shape[0] * shape[1]));
+        assert!(
+            seen <= eps,
+            "{codec:?}: worst error {seen:e} over a bound of {eps:e}"
+        );
+    }
 }
 
 #[test]
@@ -148,14 +171,25 @@ fn a_gathered_selection_is_bounded_too() {
             step: None,
         },
     ];
-    let (applied, values, _) = read(&server, "gathered.npy", &shape, &indices, &error_bound(eps));
-    assert_eq!(applied.encoding, Encoding::ErrorBound);
+    for codec in codecs() {
+        let (applied, values, _) = read(
+            &server,
+            "gathered.npy",
+            &shape,
+            &indices,
+            &error_bound(eps, codec),
+        );
+        assert_eq!(applied.encoding, Encoding::ErrorBound);
 
-    let want: Vec<f32> = (0..shape[0])
-        .flat_map(|r| (0..256).map(move |c| (r * shape[1] + c) as f32))
-        .collect();
-    let seen = worst(&values, &want);
-    assert!(seen <= eps, "worst error {seen:e} over a bound of {eps:e}");
+        let want: Vec<f32> = (0..shape[0])
+            .flat_map(|r| (0..256).map(move |c| (r * shape[1] + c) as f32))
+            .collect();
+        let seen = worst(&values, &want);
+        assert!(
+            seen <= eps,
+            "{codec:?}: worst error {seen:e} over a bound of {eps:e}"
+        );
+    }
 }
 
 #[test]
@@ -202,16 +236,46 @@ fn an_error_bounded_transfer_sends_fewer_bytes_than_it_delivers() {
     // sent raw bytes and called them encoded.
     let server = TestServer::start();
     let shape = [2048, 512];
-    let (applied, _, result) = read(&server, "smaller.npy", &shape, &[], &error_bound(1.0));
-    assert_eq!(applied.encoding, Encoding::ErrorBound);
-    assert!(!result.inline, "the transfer has to go over the data plane");
-    assert!(
-        result.wire_bytes < result.bytes,
-        "{} bytes on the wire for {} bytes of stream",
-        result.wire_bytes,
-        result.bytes
-    );
-    assert!(result.compression_ratio() > 1.0);
+    for codec in codecs() {
+        let (applied, _, result) = read(
+            &server,
+            "smaller.npy",
+            &shape,
+            &[],
+            &error_bound(1.0, codec),
+        );
+        assert_eq!(applied.encoding, Encoding::ErrorBound);
+        assert!(!result.inline, "the transfer has to go over the data plane");
+        assert!(
+            result.wire_bytes < result.bytes,
+            "{codec:?}: {} bytes on the wire for {} bytes of stream",
+            result.wire_bytes,
+            result.bytes
+        );
+        assert!(result.compression_ratio() > 1.0);
+    }
+}
+
+#[test]
+fn asking_for_a_codec_is_what_decides_which_one_runs() {
+    // Without this, a codec that never reached the request would still pass
+    // every test above: whichever one the build defaults to meets all of
+    // those bounds on its own.
+    let server = TestServer::start();
+    let shape = [2048, 512];
+    let mut wire: Vec<(Codec, u64)> = Vec::new();
+    for codec in codecs() {
+        let (applied, _, result) =
+            read(&server, "chosen.npy", &shape, &[], &error_bound(1.0, codec));
+        assert_eq!(applied.codec, Some(codec));
+        wire.push((codec, result.wire_bytes));
+    }
+    if let [(a, sent_a), (b, sent_b)] = wire[..] {
+        assert_ne!(
+            sent_a, sent_b,
+            "{a:?} and {b:?} put the same {sent_a} bytes on the wire"
+        );
+    }
 }
 
 #[test]

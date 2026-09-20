@@ -161,14 +161,16 @@ impl ControlService {
         // What the client asked for, and what this server can actually do. The
         // difference goes back in the plan rather than being an error, so that
         // a newer client still gets its data.
-        let requested = quality_from_proto(request.requested_quality.as_ref());
+        let mut requested = quality_from_proto(request.requested_quality.as_ref());
+        // The codec does not travel inside the proto QualitySpec; it has a
+        // field of its own, which is where a client names one of the several
+        // codecs that can carry an error bound.
+        requested.codec = Codec::from_u32(request.requested_codec);
         let applied = requested.applied(dataset.dtype());
-        // A lossy encoding names the codec that carries it; there is no
-        // separate choice to make, and `requested_codec` only ever asks for a
-        // lossless one on top of EXACT.
         let codec = if applied.is_exact() {
+            // No lossless codec is implemented, so this is always RAW.
             Codec::from_u32(request.requested_codec)
-                .filter(|codec| codec.is_supported())
+                .filter(|codec| codec.is_supported() && !codec.is_error_bounded())
                 .unwrap_or(Codec::Raw)
         } else {
             applied.codec()

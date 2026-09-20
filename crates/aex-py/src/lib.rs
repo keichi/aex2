@@ -8,8 +8,8 @@
 use std::sync::{Arc, RwLock};
 
 use aex_client::{
-    ClientConfig, ClientError, DType, Encoding, ErrorClass, FileHandle, FunctionArg, Index, Item,
-    QualitySpec, Selection,
+    ClientConfig, ClientError, Codec, DType, Encoding, ErrorClass, FileHandle, FunctionArg, Index,
+    Item, QualitySpec, Selection,
 };
 use half::f16;
 use numpy::{
@@ -475,7 +475,8 @@ fn selections<'a>(
 }
 
 /// A quality request as `aex.array_proxy` spells it: a dict holding one of
-/// `dtype`, `step`, or `abs_error` / `rel_error`. `None` is lossless.
+/// `dtype`, `step`, or `abs_error` / `rel_error`, and for an error bound an
+/// optional `codec`. `None` is lossless.
 fn quality_from_py(quality: Option<&Bound<'_, PyDict>>) -> PyResult<QualitySpec> {
     let mut spec = QualitySpec::exact();
     let Some(quality) = quality else {
@@ -502,8 +503,35 @@ fn quality_from_py(quality: Option<&Bound<'_, PyDict>>) -> PyResult<QualitySpec>
         if spec.abs_error_bound.is_some() || spec.rel_error_bound.is_some() {
             spec.encoding = Encoding::ErrorBound;
         }
+        spec.codec = quality
+            .get_item("codec")?
+            .map(|v| codec_from_name(&v.extract::<String>()?))
+            .transpose()?;
     }
     Ok(spec)
+}
+
+/// The codecs a caller may name, which are the error-bounded ones. A name this
+/// build has no codec for is still accepted: the server decides whether it can
+/// honour it, and says so in the plan.
+fn codec_from_name(name: &str) -> PyResult<Codec> {
+    match name {
+        "sz" => Ok(Codec::Sz),
+        "zfp" => Ok(Codec::Zfp),
+        other => Err(value_error(format!(
+            "codec must be 'sz' or 'zfp', not {other:?}"
+        ))),
+    }
+}
+
+fn codec_name(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Raw => "raw",
+        Codec::Lz4 => "lz4",
+        Codec::Zstd => "zstd",
+        Codec::Sz => "sz",
+        Codec::Zfp => "zfp",
+    }
 }
 
 /// The inverse of `quality_from_py`, with the encoding named.
@@ -523,6 +551,7 @@ fn quality_to_py<'py>(py: Python<'py>, spec: &QualitySpec) -> PyResult<Bound<'py
         Encoding::ErrorBound => {
             dict.set_item("abs_error", spec.abs_error_bound)?;
             dict.set_item("rel_error", spec.rel_error_bound)?;
+            dict.set_item("codec", codec_name(spec.codec()))?;
         }
     }
     Ok(dict)
