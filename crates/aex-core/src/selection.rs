@@ -480,7 +480,7 @@ pub enum LayoutKind {
 }
 
 /// A selection resolved into a logical byte stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectionLayout {
     /// Shape of the result, as it will be reported to the client.
     pub out_shape: Vec<u64>,
@@ -488,6 +488,9 @@ pub struct SelectionLayout {
     pub dtype: DType,
     /// Length of the logical byte stream.
     pub total_bytes: u64,
+    /// What is done to the elements on the way out. The send path reads it
+    /// here because a layout is all a fetch has to go on.
+    pub quality: QualitySpec,
     pub kind: LayoutKind,
 }
 
@@ -503,9 +506,14 @@ impl SelectionLayout {
         indices: &[Index],
         quality: &QualitySpec,
     ) -> Result<Self> {
-        if !quality.is_exact() {
+        // ERROR_BOUND changes the values, never the shape or the length, so
+        // everything below is the same work as for EXACT.
+        if !matches!(
+            quality.encoding,
+            crate::quality::Encoding::Exact | crate::quality::Encoding::ErrorBound
+        ) {
             return Err(AexError::UnsupportedSelection(format!(
-                "{:?} encoding is not implemented; only EXACT is",
+                "{:?} encoding is not implemented",
                 quality.encoding
             )));
         }
@@ -538,8 +546,29 @@ impl SelectionLayout {
             out_shape: resolved.out_shape,
             dtype,
             total_bytes,
+            quality: quality.clone(),
             kind,
         })
+    }
+
+    /// Bytes of one innermost row of the output array.
+    ///
+    /// `None` when the output has no axis to speak of, or when a row would be
+    /// empty. A range that is a whole number of these is a slab of the output
+    /// array rather than a flat run of elements, which is what a codec wants.
+    pub fn row_bytes(&self) -> Option<u64> {
+        let row = self.out_shape.last()?.checked_mul(self.dtype.itemsize())?;
+        (row > 0).then_some(row)
+    }
+
+    /// How the block covering `[offset, offset + len)` is described to a codec.
+    ///
+    /// `None` when this transfer is not encoded and the bytes go as they are.
+    pub fn block(&self, offset: u64, len: u64) -> Result<Option<crate::codec::BlockSpec>> {
+        let Some(eps) = self.quality.eps() else {
+            return Ok(None);
+        };
+        crate::codec::BlockSpec::for_range(&self.out_shape, self.dtype, eps, offset, len).map(Some)
     }
 
     /// Read `[offset, offset + dst.len())` of the logical byte stream.

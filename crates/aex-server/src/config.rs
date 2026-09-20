@@ -22,12 +22,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// almost always one that has not been tuned.
 pub const DEFAULT_STREAMS: u32 = 8;
 
-/// Codecs this server can produce. Bit 0 is RAW.
-pub const SUPPORTED_CODECS: u32 = 1;
-
-/// Encodings this server can produce. Bit 0 is EXACT.
-pub const SUPPORTED_ENCODINGS: u32 = 1;
-
 /// A config file. The single `[server]` table keeps room for other sections.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

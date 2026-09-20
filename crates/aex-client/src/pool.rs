@@ -19,10 +19,11 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use aex_core::{Codec, ErrorClass};
+use aex_core::{codec, Codec, ErrorClass};
 use aex_wire::{
     read_frame_header, write_frame, ErrorPayload, FrameHeader, FrameType, Hello, Ready,
     ScatterBuffer, ScatterSlice, Ticket, READY_LEN,
@@ -54,6 +55,9 @@ pub struct ConnSettings {
 /// One data connection, past its handshake.
 struct DataConn {
     stream: TcpStream,
+    /// Where an encoded block is read before it is expanded into place. Stays
+    /// empty for a transfer that is not encoded, which is every lossless one.
+    packed: Vec<u8>,
 }
 
 impl DataConn {
@@ -94,7 +98,10 @@ impl DataConn {
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
-        let mut conn = DataConn { stream };
+        let mut conn = DataConn {
+            stream,
+            packed: Vec::new(),
+        };
         conn.handshake(settings)?;
         Ok(conn)
     }
@@ -141,10 +148,12 @@ impl DataConn {
 
     /// Read one data frame into its place in the chunk starting at `offset`.
     ///
-    /// The bytes go from the kernel into the caller's buffer with nothing in
+    /// Raw bytes go from the kernel into the caller's buffer with nothing in
     /// between, which is the whole reason the payload is raw and the header is
-    /// fixed width. A server may answer one fetch with several frames, so the
-    /// position comes from the frame rather than from how much has arrived.
+    /// fixed width. An encoded block cannot do that: it is read somewhere else
+    /// and expanded into place. A server may answer one fetch with several
+    /// frames, and may encode some and not others, so both the position and the
+    /// codec come from the frame rather than from what the transfer agreed.
     fn receive_data(
         &mut self,
         header: &FrameHeader,
@@ -158,12 +167,24 @@ impl DataConn {
                 header.request_id
             )));
         }
-        if header.codec != Codec::Raw || header.wire_len != header.logical_len {
-            // Nothing negotiates a codec yet, so this means the server sent
-            // something this client never asked for and cannot expand.
+        if !header.codec.is_supported() {
             return Err(ClientError::Protocol(format!(
-                "a data frame arrived {:?} encoded; this client asked for raw bytes",
+                "a data frame arrived {:?} encoded, which this build cannot expand",
                 header.codec
+            )));
+        }
+        // Raw is raw, and a block is only ever sent when it came out smaller
+        // than what it holds. Either way this bounds the payload by the space
+        // already claimed for it.
+        let sane = if header.codec == Codec::Raw {
+            header.wire_len == header.logical_len
+        } else {
+            header.wire_len < header.logical_len
+        };
+        if !sane {
+            return Err(ClientError::Protocol(format!(
+                "a {:?} data frame carries {} bytes for {} bytes of the stream",
+                header.codec, header.wire_len, header.logical_len
             )));
         }
 
@@ -183,7 +204,16 @@ impl DataConn {
 
         let start = start as usize;
         let end = start + header.logical_len as usize;
-        self.stream.read_exact(&mut dst[start..end])?;
+        if header.codec == Codec::Raw {
+            self.stream.read_exact(&mut dst[start..end])?;
+            return Ok(());
+        }
+
+        self.packed.clear();
+        self.packed.resize(header.wire_len as usize, 0);
+        self.stream.read_exact(&mut self.packed)?;
+        codec::decompress_into(header.codec, &self.packed, &mut dst[start..end])
+            .map_err(|e| ClientError::Protocol(e.to_string()))?;
         Ok(())
     }
 
@@ -245,6 +275,9 @@ struct Part<'a> {
 pub struct Fetched {
     pub streams: u32,
     pub retries: u32,
+    /// Payload bytes read off the data plane, which is less than the stream
+    /// when the transfer was encoded. Headers are not counted.
+    pub wire_bytes: u64,
 }
 
 /// The session's data connections.
@@ -320,6 +353,7 @@ impl DataPool {
             return Ok(Fetched {
                 streams: 0,
                 retries: 0,
+                wire_bytes: 0,
             });
         }
 
@@ -336,6 +370,7 @@ impl DataPool {
                 last_conn_error: None,
             }),
             wake: Condvar::new(),
+            wire_bytes: AtomicU64::new(0),
         };
 
         std::thread::scope(|scope| {
@@ -366,6 +401,7 @@ impl DataPool {
         Ok(Fetched {
             streams: used as u32,
             retries: state.retries,
+            wire_bytes: transfer.wire_bytes.load(Ordering::Relaxed),
         })
     }
 
@@ -425,6 +461,8 @@ struct Transfer<'a> {
     parts: &'a [Part<'a>],
     state: Mutex<State>,
     wake: Condvar,
+    /// Payload bytes read off the wire, over every connection of this transfer.
+    wire_bytes: AtomicU64,
 }
 
 impl Transfer<'_> {
@@ -586,6 +624,10 @@ impl Transfer<'_> {
                 let front = flight.front_mut().expect("a fetch is outstanding");
                 let request_id = self.parts[front.chunk.part].request_id;
                 conn.receive_data(&header, request_id, front.chunk.offset, &mut front.slice)?;
+                // Counted here rather than under the lock: one atomic add a
+                // frame against one lock acquisition a frame.
+                self.wire_bytes
+                    .fetch_add(header.wire_len, Ordering::Relaxed);
                 front.received += header.logical_len;
                 if front.received >= front.chunk.len {
                     flight.pop_front();

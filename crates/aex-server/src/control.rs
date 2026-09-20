@@ -30,7 +30,7 @@ use aex_proto::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::config::{ServerConfig, PROTOCOL_VERSION, SUPPORTED_CODECS, SUPPORTED_ENCODINGS};
+use crate::config::{ServerConfig, PROTOCOL_VERSION};
 use crate::error::{Result, ServerError};
 use crate::paths::PathPolicy;
 use crate::session::SessionRegistry;
@@ -162,10 +162,17 @@ impl ControlService {
         // difference goes back in the plan rather than being an error, so that
         // a newer client still gets its data.
         let requested = quality_from_proto(request.requested_quality.as_ref());
-        let applied = requested.applied();
-        let codec = Codec::from_u32(request.requested_codec)
-            .filter(|codec| codec.is_supported())
-            .unwrap_or(Codec::Raw);
+        let applied = requested.applied(dataset.dtype());
+        // A lossy encoding names the codec that carries it; there is no
+        // separate choice to make, and `requested_codec` only ever asks for a
+        // lossless one on top of EXACT.
+        let codec = if applied.is_exact() {
+            Codec::from_u32(request.requested_codec)
+                .filter(|codec| codec.is_supported())
+                .unwrap_or(Codec::Raw)
+        } else {
+            applied.codec()
+        };
 
         let layout = dataset.layout(&indices, &applied)?;
         self.check_decode_cache(&*dataset, session.granted_streams());
@@ -249,8 +256,8 @@ impl AexControl for ControlService {
             granted_streams: session.granted_streams(),
             protocol_version: PROTOCOL_VERSION,
             default_chunk_bytes: self.config.transfer.default_chunk_bytes,
-            supported_codecs: SUPPORTED_CODECS,
-            supported_encodings: SUPPORTED_ENCODINGS,
+            supported_codecs: aex_core::quality::supported_codecs(),
+            supported_encodings: aex_core::quality::supported_encodings(),
             max_fetch_bytes: self.config.transfer.max_fetch_bytes,
         }))
     }

@@ -132,6 +132,9 @@ impl Plan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferResult {
     pub bytes: u64,
+    /// Payload bytes actually read off the data plane. Equal to `bytes` for a
+    /// lossless transfer, less for an encoded one, and 0 for an inline one.
+    pub wire_bytes: u64,
     pub elapsed: Duration,
     /// 0 for a transfer answered inline.
     pub chunks: u32,
@@ -145,6 +148,15 @@ pub struct TransferResult {
 }
 
 impl TransferResult {
+    /// Logical bytes per byte sent. 1.0 when nothing was encoded, and 0.0
+    /// when there is nothing to divide.
+    pub fn compression_ratio(&self) -> f64 {
+        if self.wire_bytes == 0 {
+            return 0.0;
+        }
+        self.bytes as f64 / self.wire_bytes as f64
+    }
+
     /// Throughput in mebibytes per second, for benchmarks.
     pub fn throughput_mib_per_sec(&self) -> f64 {
         let seconds = self.elapsed.as_secs_f64();
@@ -159,6 +171,8 @@ impl TransferResult {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClientStats {
     pub bytes: u64,
+    /// Payload bytes read off the data plane, summed over transfers.
+    pub wire_bytes: u64,
     /// Time spent filling buffers, summed over transfers.
     pub elapsed: Duration,
     pub chunks: u64,
@@ -172,6 +186,7 @@ pub struct ClientStats {
 impl ClientStats {
     pub(crate) fn add(&mut self, transfer: &TransferResult) {
         self.bytes += transfer.bytes;
+        self.wire_bytes += transfer.wire_bytes;
         self.elapsed += transfer.elapsed;
         self.chunks += u64::from(transfer.chunks);
         self.retries += u64::from(transfer.retries);
@@ -370,6 +385,7 @@ mod tests {
     fn throughput_is_reported_from_the_bytes_and_the_time() {
         let result = TransferResult {
             bytes: 1024 * 1024,
+            wire_bytes: 1024 * 1024,
             elapsed: Duration::from_millis(500),
             chunks: 1,
             streams: 1,
@@ -390,6 +406,7 @@ mod tests {
     fn stats_add_up_transfers() {
         let transfer = TransferResult {
             bytes: 1024 * 1024,
+            wire_bytes: 512 * 1024,
             elapsed: Duration::from_millis(250),
             chunks: 3,
             streams: 2,

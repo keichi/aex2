@@ -46,9 +46,11 @@ fn a_session_reports_what_the_server_granted() {
     assert_eq!(session.protocol_version, aex_client::PROTOCOL_VERSION);
     assert_eq!(session.default_chunk_bytes, 4 * 1024 * 1024);
     assert_eq!(session.max_fetch_bytes, 16 * 1024 * 1024);
-    // RAW and EXACT, and nothing else, in this release.
-    assert_eq!(session.supported_codecs, 1);
-    assert_eq!(session.supported_encodings, 1);
+    // Bit 0 is RAW and EXACT, always. Bit 3 is SZ and ERROR_BOUND, only in a
+    // build that has the codec to produce them.
+    let lossy = cfg!(feature = "sz") as u32;
+    assert_eq!(session.supported_codecs, 1 | lossy << 3);
+    assert_eq!(session.supported_encodings, 1 | lossy << 3);
 
     // The server advertises no host, so the client keeps the one it dialled,
     // and the port is the one the data plane really bound.

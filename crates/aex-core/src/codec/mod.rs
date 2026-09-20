@@ -205,15 +205,16 @@ pub fn compress(codec: Codec, spec: &BlockSpec, src: &[u8], dst: &mut Vec<u8>) -
     }
     dst.clear();
     spec.encode(dst);
-    match codec {
+    let written: Result<()> = match codec {
         #[cfg(feature = "sz")]
-        Codec::Sz => sz::compress(spec, src, dst)?,
-        other => {
-            dst.clear();
-            return Err(AexError::BadBlock(format!(
-                "{other:?} is not a codec this build can produce"
-            )));
-        }
+        Codec::Sz => sz::compress(spec, src, dst),
+        other => Err(AexError::BadBlock(format!(
+            "{other:?} is not a codec this build can produce"
+        ))),
+    };
+    if let Err(e) = written {
+        dst.clear();
+        return Err(e);
     }
     if dst.len() >= src.len() {
         dst.clear();
@@ -234,10 +235,9 @@ pub fn decompress_into(codec: Codec, src: &[u8], dst: &mut [u8]) -> Result<()> {
             dst.len()
         )));
     }
-    let payload = &src[BLOCK_HEADER_LEN..];
     match codec {
         #[cfg(feature = "sz")]
-        Codec::Sz => sz::decompress_into(&spec, payload, dst),
+        Codec::Sz => sz::decompress_into(&spec, &src[BLOCK_HEADER_LEN..], dst),
         other => Err(AexError::BadBlock(format!(
             "{other:?} is not a codec this build can expand"
         ))),

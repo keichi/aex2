@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use aex_core::AexError;
+use aex_core::{AexError, SelectionLayout};
 
 use crate::transfer::TransferEntry;
 
@@ -133,7 +133,8 @@ impl Inline {
         // Only missing if the caller dropped a buffer rather than recycling it,
         // which happens on the error path and costs one allocation.
         let mut bytes = self.buffer.take().unwrap_or_else(|| vec![0u8; piece_bytes]);
-        let piece = request.len.min(bytes.len() as u64) as usize;
+        let piece = request.len.min(bytes.len() as u64);
+        let piece = row_aligned(request.entry.layout(), request.offset, piece) as usize;
         let at = request.offset;
 
         // Ask for what comes after this piece before blocking on this one, so
@@ -173,6 +174,33 @@ impl Inline {
     }
 }
 
+/// Cut a piece so that it ends where a row of the output array does.
+///
+/// A block that holds whole rows is a slab of the output array, and a codec
+/// that can predict across rows gets several times the ratio it gets from a
+/// flat run of elements. Nothing depends on this for correctness: a block that
+/// is not whole rows is simply described as one long row instead.
+///
+/// A fetch that itself starts mid-row costs one short piece and is then back in
+/// step for the rest of its range.
+fn row_aligned(layout: &SelectionLayout, offset: u64, piece: u64) -> u64 {
+    if layout.quality.eps().is_none() {
+        return piece;
+    }
+    let aligned = match layout.row_bytes() {
+        Some(row) if (offset + piece) % row < piece => piece - (offset + piece) % row,
+        // A row longer than one piece. Cut on an element instead, and the block
+        // goes as a row of its own.
+        _ => piece - piece % layout.dtype.itemsize(),
+    };
+    // Whatever happens, a piece has to move the range forward.
+    if aligned == 0 {
+        piece
+    } else {
+        aligned
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -180,6 +208,61 @@ mod tests {
     use aex_core::{ArrayDataset, DType, QualitySpec, SelectionLayout};
 
     use super::*;
+
+    fn bounded(shape: &[u64], dtype: DType) -> SelectionLayout {
+        let quality = QualitySpec {
+            encoding: aex_core::Encoding::ErrorBound,
+            abs_error_bound: Some(1e-3),
+            ..QualitySpec::default()
+        };
+        SelectionLayout::resolve(shape, dtype, &[], &quality).expect("layout")
+    }
+
+    #[test]
+    fn an_exact_transfer_is_cut_wherever_the_buffer_ends() {
+        let layout =
+            SelectionLayout::resolve(&[64, 300], DType::Float32, &[], &QualitySpec::exact())
+                .expect("layout");
+        // 1200 bytes a row, and nothing lines up with 4096.
+        assert_eq!(row_aligned(&layout, 0, 4096), 4096);
+        assert_eq!(row_aligned(&layout, 4096, 4096), 4096);
+    }
+
+    #[test]
+    fn an_encoded_transfer_is_cut_where_a_row_ends() {
+        // 300 float32 a row: 1200 bytes.
+        let layout = bounded(&[64, 300], DType::Float32);
+        // Three whole rows out of the 3.41 that fit.
+        assert_eq!(row_aligned(&layout, 0, 4096), 3600);
+        // Already on a row, and still three.
+        assert_eq!(row_aligned(&layout, 3600, 4096), 3600);
+        // Nothing to trim.
+        assert_eq!(row_aligned(&layout, 0, 2400), 2400);
+    }
+
+    #[test]
+    fn a_fetch_that_starts_mid_row_is_back_in_step_after_one_piece() {
+        let layout = bounded(&[64, 300], DType::Float32);
+        // Starting 400 bytes into a row, the first piece ends at the third row
+        // boundary, and every piece after it is whole rows.
+        let first = row_aligned(&layout, 400, 4096);
+        assert_eq!(first, 3200);
+        assert_eq!((400 + first) % 1200, 0);
+        assert_eq!(row_aligned(&layout, 400 + first, 4096), 3600);
+    }
+
+    #[test]
+    fn a_row_longer_than_the_buffer_is_cut_on_an_element() {
+        // 4 MiB a row against a 4096 byte buffer: no boundary is reachable.
+        let layout = bounded(&[4, 1 << 20], DType::Float32);
+        assert_eq!(row_aligned(&layout, 0, 4094), 4092);
+        assert_eq!(row_aligned(&layout, 0, 4096), 4096);
+
+        // And a piece with no whole element in it still moves the range on,
+        // rather than looping forever on nothing.
+        let wide = bounded(&[4, 1 << 20], DType::Float64);
+        assert_eq!(row_aligned(&wide, 0, 3), 3);
+    }
 
     /// A dataset that reads back its own offsets, and counts its reads.
     struct Counting {

@@ -5,9 +5,10 @@
 //! what it actually applied, so that a newer client and an older server never
 //! fail to understand each other.
 //!
-//! This release produces only the fallbacks — [`Encoding::Exact`] and
-//! [`Codec::Raw`]. The rest of the values exist because they travel on the wire
-//! in a fixed-width field, and a decoder has to name what it is refusing.
+//! What a build can produce depends on its features: [`Encoding::Exact`] and
+//! [`Codec::Raw`] always, [`Encoding::ErrorBound`] and [`Codec::Sz`] with `sz`.
+//! The rest of the values exist because they travel on the wire in a
+//! fixed-width field, and a decoder has to name what it is refusing.
 
 /// What was done to the elements before they were put on the wire.
 ///
@@ -56,11 +57,24 @@ impl Encoding {
         Self::from_u8(v as u8)
     }
 
-    /// Whether this server can produce it.
+    /// Whether this build can produce it.
     pub const fn is_supported(self) -> bool {
-        matches!(self, Encoding::Exact)
+        match self {
+            Encoding::Exact => true,
+            // Needs a codec to carry it.
+            Encoding::ErrorBound => cfg!(feature = "sz"),
+            Encoding::DtypeCast | Encoding::Subsample => false,
+        }
     }
 }
+
+/// Every encoding, for enumeration.
+pub const ALL_ENCODINGS: [Encoding; 4] = [
+    Encoding::Exact,
+    Encoding::DtypeCast,
+    Encoding::Subsample,
+    Encoding::ErrorBound,
+];
 
 /// How the payload is compressed on the wire.
 ///
@@ -106,10 +120,33 @@ impl Codec {
         Self::from_u8(v as u8)
     }
 
-    /// Whether this server can produce it.
+    /// Whether this build can produce it.
     pub const fn is_supported(self) -> bool {
-        matches!(self, Codec::Raw)
+        match self {
+            Codec::Raw => true,
+            Codec::Sz => cfg!(feature = "sz"),
+            Codec::Lz4 | Codec::Zstd => false,
+        }
     }
+}
+
+/// Every codec, for enumeration.
+pub const ALL_CODECS: [Codec; 4] = [Codec::Raw, Codec::Lz4, Codec::Zstd, Codec::Sz];
+
+/// The codecs this build can produce, as the wire's bitmask: bit n for codec n.
+pub fn supported_codecs() -> u32 {
+    ALL_CODECS
+        .iter()
+        .filter(|codec| codec.is_supported())
+        .fold(0, |mask, codec| mask | 1 << codec.as_u32())
+}
+
+/// The encodings this build can produce, as the wire's bitmask.
+pub fn supported_encodings() -> u32 {
+    ALL_ENCODINGS
+        .iter()
+        .filter(|encoding| encoding.is_supported())
+        .fold(0, |mask, encoding| mask | 1 << encoding.as_u8())
 }
 
 /// What a client asks for, or what a server applied.
@@ -145,23 +182,58 @@ impl QualitySpec {
         self.encoding == Encoding::Exact
     }
 
-    /// What a server can actually produce for this request.
+    /// What a server can actually produce for this request, on `dtype`.
     ///
-    /// An encoding this build does not implement becomes `Exact` rather than an
-    /// error: the client learns what happened from the plan it gets back and
-    /// decides for itself whether the data is still worth having.
-    pub fn applied(&self) -> QualitySpec {
-        if self.encoding.is_supported() {
+    /// Anything this build cannot honour becomes `Exact` rather than an error:
+    /// the client learns what happened from the plan it gets back and decides
+    /// for itself whether the data is still worth having.
+    pub fn applied(&self, dtype: crate::dtype::DType) -> QualitySpec {
+        if self.can_apply(dtype) {
             self.clone()
         } else {
             QualitySpec::exact()
         }
+    }
+
+    fn can_apply(&self, dtype: crate::dtype::DType) -> bool {
+        use crate::dtype::DType;
+        match self.encoding {
+            Encoding::Exact => true,
+            Encoding::ErrorBound => {
+                Encoding::ErrorBound.is_supported()
+                    && matches!(dtype, DType::Float32 | DType::Float64)
+                    // A bound relative to the value range would have to mean
+                    // the range of the whole selection, and a block only ever
+                    // sees its own, so asking for one is not honoured at all.
+                    && self.rel_error_bound.is_none()
+                    && self
+                        .abs_error_bound
+                        .is_some_and(|bound| bound.is_finite() && bound > 0.0)
+            }
+            Encoding::DtypeCast | Encoding::Subsample => false,
+        }
+    }
+
+    /// The codec that carries this quality.
+    pub fn codec(&self) -> Codec {
+        match self.encoding {
+            Encoding::ErrorBound => Codec::Sz,
+            _ => Codec::Raw,
+        }
+    }
+
+    /// The error bound, when there is one.
+    pub fn eps(&self) -> Option<f64> {
+        (self.encoding == Encoding::ErrorBound)
+            .then_some(self.abs_error_bound)
+            .flatten()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dtype::DType;
 
     #[test]
     fn encodings_and_codecs_survive_a_wire_roundtrip() {
@@ -197,11 +269,21 @@ mod tests {
     }
 
     #[test]
-    fn only_the_lossless_defaults_are_produced_by_this_release() {
+    fn what_this_build_can_produce_is_what_it_advertises() {
         assert!(Encoding::Exact.is_supported());
-        assert!(!Encoding::DtypeCast.is_supported());
         assert!(Codec::Raw.is_supported());
+        assert!(!Encoding::DtypeCast.is_supported());
+        assert!(!Encoding::Subsample.is_supported());
         assert!(!Codec::Lz4.is_supported());
+        assert!(!Codec::Zstd.is_supported());
+        assert_eq!(Encoding::ErrorBound.is_supported(), cfg!(feature = "sz"));
+        assert_eq!(Codec::Sz.is_supported(), cfg!(feature = "sz"));
+
+        // Bit n of the mask is codec n, which is what the client reads.
+        assert_eq!(supported_codecs() & 1, 1);
+        assert_eq!(supported_encodings() & 1, 1);
+        assert_eq!(supported_codecs() >> 3 & 1, cfg!(feature = "sz") as u32);
+        assert_eq!(supported_encodings() >> 3 & 1, cfg!(feature = "sz") as u32);
     }
 
     #[test]
@@ -211,7 +293,7 @@ mod tests {
             subsample_step: vec![2, 2],
             ..QualitySpec::default()
         };
-        let applied = requested.applied();
+        let applied = requested.applied(DType::Float32);
         assert!(applied.is_exact());
         // The fallback drops the settings that belonged to the encoding it
         // could not apply, so the plan reports exactly what was done.
@@ -219,6 +301,58 @@ mod tests {
 
         // A request it can honour comes back untouched.
         let exact = QualitySpec::exact();
-        assert_eq!(exact.applied(), exact);
+        assert_eq!(exact.applied(DType::Float32), exact);
+    }
+
+    fn error_bound(abs: Option<f64>, rel: Option<f64>) -> QualitySpec {
+        QualitySpec {
+            encoding: Encoding::ErrorBound,
+            abs_error_bound: abs,
+            rel_error_bound: rel,
+            ..QualitySpec::default()
+        }
+    }
+
+    #[test]
+    fn an_error_bound_is_applied_only_where_it_means_something() {
+        let asked = error_bound(Some(1e-3), None);
+        let honoured = cfg!(feature = "sz");
+        assert_eq!(!asked.applied(DType::Float32).is_exact(), honoured);
+        assert_eq!(!asked.applied(DType::Float64).is_exact(), honoured);
+
+        // An integer has no error to bound, so the request is dropped rather
+        // than turned into something the client did not ask for.
+        assert!(asked.applied(DType::Int32).is_exact());
+        assert!(asked.applied(DType::Complex64).is_exact());
+        assert!(asked.applied(DType::Float16).is_exact());
+
+        // A bound that is not a bound.
+        assert!(error_bound(None, None).applied(DType::Float32).is_exact());
+        assert!(error_bound(Some(0.0), None)
+            .applied(DType::Float32)
+            .is_exact());
+        assert!(error_bound(Some(-1.0), None)
+            .applied(DType::Float32)
+            .is_exact());
+        assert!(error_bound(Some(f64::NAN), None)
+            .applied(DType::Float32)
+            .is_exact());
+
+        // A bound relative to the value range would have to mean the whole
+        // selection's range, which no single block can see.
+        assert!(error_bound(None, Some(1e-3))
+            .applied(DType::Float32)
+            .is_exact());
+        assert!(error_bound(Some(1e-3), Some(1e-3))
+            .applied(DType::Float32)
+            .is_exact());
+    }
+
+    #[test]
+    fn a_quality_names_the_codec_that_carries_it() {
+        assert_eq!(QualitySpec::exact().codec(), Codec::Raw);
+        assert_eq!(QualitySpec::exact().eps(), None);
+        assert_eq!(error_bound(Some(1e-3), None).codec(), Codec::Sz);
+        assert_eq!(error_bound(Some(1e-3), None).eps(), Some(1e-3));
     }
 }

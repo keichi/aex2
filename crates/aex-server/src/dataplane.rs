@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use aex_core::ErrorClass;
+use aex_core::{codec, ErrorClass, SelectionLayout};
 use aex_wire::{
     write_frame, ErrorPayload, FrameHeader, FrameType, Hello, Ready, Ticket, HEADER_LEN, HELLO_LEN,
     PROTOCOL_VERSION, TICKET_LEN,
@@ -318,6 +318,9 @@ fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) 
     // The buffer is allocated here and reused for the life of the connection,
     // so a transfer in progress allocates nothing.
     let pipeline = ReadPipeline::start(context.config.transfer.read_buffer_bytes as usize);
+    // Where a block is compressed before it goes out. Empty for a transfer
+    // that is not encoded, and reused for the life of the connection.
+    let mut packed = Vec::new();
 
     loop {
         let mut bytes = [0u8; HEADER_LEN];
@@ -336,7 +339,7 @@ fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) 
         // cannot be cut off by the control plane's idle timeout.
         context.sessions.touch(session);
 
-        match handle_frame(stream, &header, session, context, &pipeline)? {
+        match handle_frame(stream, &header, session, context, &pipeline, &mut packed)? {
             Disposition::Continue => {}
             Disposition::Close => return Ok(()),
         }
@@ -349,9 +352,10 @@ fn handle_frame(
     session: &SessionId,
     context: &Context,
     pipeline: &ReadPipeline,
+    packed: &mut Vec<u8>,
 ) -> Result<Disposition> {
     match header.frame_type {
-        FrameType::Fetch => handle_fetch(stream, header, session, context, pipeline),
+        FrameType::Fetch => handle_fetch(stream, header, session, context, pipeline, packed),
         FrameType::Ping => {
             write_frame(stream, &FrameHeader::bare(FrameType::Pong), &[])?;
             Ok(Disposition::Continue)
@@ -377,6 +381,7 @@ fn handle_fetch(
     session: &SessionId,
     context: &Context,
     pipeline: &ReadPipeline,
+    packed: &mut Vec<u8>,
 ) -> Result<Disposition> {
     if header.wire_len != TICKET_LEN as u64 {
         let e = ServerError::Protocol(format!(
@@ -429,6 +434,22 @@ fn handle_fetch(
         return Ok(Disposition::Continue);
     }
 
+    // An encoded transfer is cut into blocks of whole elements, so a fetch that
+    // does not name whole elements cannot be answered at all.
+    let itemsize = entry.layout().dtype.itemsize();
+    if entry.layout().quality.eps().is_some()
+        && (header.offset % itemsize != 0 || header.logical_len % itemsize != 0)
+    {
+        let e = ServerError::BadRequest(format!(
+            "an error-bounded transfer is fetched in whole {} elements, and [{}, {}) is not",
+            entry.layout().dtype,
+            header.offset,
+            header.offset.saturating_add(header.logical_len)
+        ));
+        send_error(stream, header, ErrorClass::Request, &e)?;
+        return Ok(Disposition::Continue);
+    }
+
     // Hand the range to the reader and write out each piece as it arrives. The
     // pieces go as separate DATA frames; a fetch and a frame were never
     // required to be the same size, and this is what that is for.
@@ -436,8 +457,14 @@ fn handle_fetch(
     loop {
         match pipeline.next_piece() {
             Piece::Data { offset, bytes, len } => {
-                let frame = FrameHeader::data(header.request_id, offset, len as u64);
-                let sent = write_frame(stream, &frame, &bytes[..len]);
+                let sent = send_piece(
+                    stream,
+                    header.request_id,
+                    entry.layout(),
+                    offset,
+                    &bytes[..len],
+                    packed,
+                );
                 pipeline.recycle(bytes);
                 sent?;
             }
@@ -457,6 +484,39 @@ fn handle_fetch(
     }
 
     Ok(Disposition::Continue)
+}
+
+/// Write one piece out, compressed if the transfer asked for that.
+///
+/// A block that does not shrink goes raw. The codec is named per frame, so one
+/// transfer can carry both kinds and the receiver reads each frame for what it
+/// says it is.
+fn send_piece(
+    stream: &mut TcpStream,
+    request_id: u32,
+    layout: &SelectionLayout,
+    offset: u64,
+    bytes: &[u8],
+    packed: &mut Vec<u8>,
+) -> Result<()> {
+    let len = bytes.len() as u64;
+    if let Some(spec) = layout.block(offset, len)? {
+        let codec = layout.quality.codec();
+        if codec::compress(codec, &spec, bytes, packed)? {
+            let frame = FrameHeader::data_encoded(
+                request_id,
+                offset,
+                codec,
+                layout.quality.encoding,
+                packed.len() as u64,
+                len,
+            );
+            write_frame(stream, &frame, packed)?;
+            return Ok(());
+        }
+    }
+    write_frame(stream, &FrameHeader::data(request_id, offset, len), bytes)?;
+    Ok(())
 }
 
 /// Report a failure against the fetch that caused it.

@@ -657,6 +657,7 @@ impl Client {
         let mut retries = 0;
         let mut streams = 0;
         let mut chunks = 0;
+        let mut wire_bytes = 0;
         while !remote.is_empty() {
             let spec = FetchSpec {
                 credit: self.config.credit,
@@ -682,6 +683,7 @@ impl Client {
                 Ok(fetched) => {
                     streams = fetched.streams;
                     retries += fetched.retries;
+                    wire_bytes += fetched.wire_bytes;
                     break;
                 }
                 Err(e) if e.needs_reprepare() && retries == 0 => {
@@ -719,6 +721,7 @@ impl Client {
 
         Ok(TransferResult {
             bytes,
+            wire_bytes,
             elapsed: started.elapsed(),
             chunks,
             streams,
@@ -778,9 +781,21 @@ fn prepare_request(session_id: Vec<u8>, selection: &Selection<'_>) -> PrepareSel
         handle: selection.handle.0,
         name: selection.name.to_string(),
         indices: indices_to_proto(selection.indices),
-        requested_quality: Some(quality_to_proto(selection.quality)),
-        // Uncompressed: the data plane reads straight into the caller's buffer.
+        // Asking for what this build cannot expand would get it sent: the
+        // server reports what it applied, it does not ask whether we meant it.
+        requested_quality: Some(quality_to_proto(&expandable(selection.quality))),
+        // The codec of a lossy encoding comes with the encoding. This field
+        // only ever asks for a lossless one on top of EXACT, and there is none.
         requested_codec: aex_core::Codec::Raw.as_u32(),
+    }
+}
+
+/// The most of `quality` this build could expand if it arrived.
+fn expandable(quality: &QualitySpec) -> QualitySpec {
+    if quality.encoding.is_supported() {
+        quality.clone()
+    } else {
+        QualitySpec::exact()
     }
 }
 

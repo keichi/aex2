@@ -161,6 +161,41 @@ pub struct RawSession {
 }
 
 impl RawSession {
+    pub fn open(&mut self, path: &str) -> u64 {
+        let request = aex_proto::OpenFileRequest {
+            session_id: self.id.clone(),
+            path: path.to_string(),
+            format: String::new(),
+        };
+        self.runtime
+            .block_on(self.control.open_file(request))
+            .expect("open")
+            .into_inner()
+            .handle
+    }
+
+    /// Prepare a whole dataset, for tests that then speak the data plane by
+    /// hand and so need the request id and the ticket.
+    pub fn prepare(
+        &mut self,
+        handle: u64,
+        name: &str,
+        quality: Option<aex_proto::QualitySpec>,
+    ) -> aex_proto::TransferPlan {
+        let request = aex_proto::PrepareSelectionRequest {
+            session_id: self.id.clone(),
+            handle,
+            name: name.to_string(),
+            indices: Vec::new(),
+            requested_quality: quality,
+            requested_codec: 0,
+        };
+        self.runtime
+            .block_on(self.control.prepare_selection(request))
+            .expect("prepare")
+            .into_inner()
+    }
+
     pub fn disconnect(&mut self) {
         let request = aex_proto::DisconnectRequest {
             session_id: self.id.clone(),

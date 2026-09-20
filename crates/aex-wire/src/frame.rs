@@ -123,6 +123,31 @@ impl FrameHeader {
         }
     }
 
+    /// A reply carrying one encoded block.
+    ///
+    /// `wire_len` bytes follow; they expand to `logical_len` bytes of the
+    /// stream, so the receiver reads them somewhere else and expands into
+    /// place rather than reading straight into the output array.
+    pub fn data_encoded(
+        request_id: u32,
+        offset: u64,
+        codec: Codec,
+        encoding: Encoding,
+        wire_len: u64,
+        logical_len: u64,
+    ) -> Self {
+        FrameHeader {
+            frame_type: FrameType::Data,
+            codec,
+            encoding,
+            flags: 0,
+            request_id,
+            offset,
+            wire_len,
+            logical_len,
+        }
+    }
+
     /// A failure, named by the fetch that caused it.
     ///
     /// The range is the one that failed, not the one that succeeded, so that
