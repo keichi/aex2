@@ -93,7 +93,7 @@ TCP を使う限り最低 2 回は必須)。読みバッファは使い回すた
 | 対応フォーマット | **`.npy` のみ** | §7.1。トレイト設計は 4 種を見据える |
 | 書き込み | 非対応 (読み出し専用) | プロトコルは双方向定義可能な形に |
 | サーバサイド計算 | 主要な集約関数のみ | §5.8 |
-| 可逆圧縮 (LZ4/ZSTD) | ヘッダに codec フィールドのみ確保、実装は後 | §14.1 |
+| 可逆圧縮 | gzip のみ。LZ4 / ZSTD は実装しない | §14.1 |
 | 適応品質 | 誤差上限を SZ3 と ZFP で実装 (`sz` / `zfp` feature、既定 OFF)。キャスト・値域相対は枠のみ | §5.5.1、§14.1 |
 | 対象 OS | Linux を最適化対象、macOS でも動作 | OS 固有機能は feature フラグで分離 |
 | Python API | v1 の API を維持し、性能用 API を**追加** | §10.2、§10.3 |
@@ -287,8 +287,8 @@ message ConnectReply {
     uint32 protocol_version       = 5;
     uint64 default_chunk_bytes    = 6;  // サーバ推奨のチャンクサイズ
     uint64 max_fetch_bytes        = 9;  // 1 回の FETCH で要求してよい上限 (セッション中一定)
-    uint32 supported_codecs       = 7;  // ビットマスク (bit0=RAW, bit1=LZ4, bit2=ZSTD, bit3=SZ, bit4=ZFP)
-    uint32 supported_encodings    = 8;  // ビットマスク (bit0=EXACT, bit1=CAST, bit3=ERROR_BOUND)
+    uint32 supported_codecs       = 7;  // ビットマスク (bit0=RAW, bit1=SZ, bit2=ZFP)
+    uint32 supported_encodings    = 8;  // ビットマスク (bit0=EXACT, bit1=CAST, bit2=ERROR_BOUND)
 }
 ```
 
@@ -356,18 +356,14 @@ boolean mask はクライアント側で `np.nonzero` により整数インデ�
 enum Encoding {
     EXACT      = 0;  // 無損失。どのビルドも必ず出せる
     DTYPE_CAST = 1;  // float64 -> float32/float16 等
-    ERROR_BOUND = 3; // 誤差上限付き非可逆圧縮。SZ3 か ZFP が運ぶ (§5.5.1)
-
-    reserved 2;      // かつての SUBSAMPLE。ストライド付きスライスが同じものを頼める
+    ERROR_BOUND = 2; // 誤差上限付き非可逆圧縮。SZ3 か ZFP が運ぶ (§5.5.1)
 }
 
 message QualitySpec {
     Encoding encoding = 1;
     optional DataType cast_dtype = 2;          // DTYPE_CAST 用
-    optional double abs_error_bound = 4;       // ERROR_BOUND 用
-    optional double rel_error_bound = 5;
-
-    reserved 3;                                // かつての subsample_step
+    optional double abs_error_bound = 3;       // ERROR_BOUND 用
+    optional double rel_error_bound = 4;
 }
 ```
 
@@ -636,7 +632,7 @@ v1 は `ApplyFunction` が常に**データセット全体**を読んでから�
 | offset | size | field | 説明 |
 |--------|------|-------|------|
 | 0 | 1 | `frame_type` | フレーム種別 (下表) |
-| 1 | 1 | `codec` | 0=RAW, 1=LZ4, 2=ZSTD, 3=SZ, 4=ZFP |
+| 1 | 1 | `codec` | 0=RAW, 1=SZ, 2=ZFP |
 | 2 | 1 | `encoding` | `QualitySpec.Encoding` と同じ値 |
 | 3 | 1 | `flags` | 予約 (0)。将来の拡張用 |
 | 4 | 4 | `request_id` | `TransferPlan.request_id` (u32) |
@@ -1746,7 +1742,7 @@ ZFP も単スレッドなので、`streams` が圧縮の並列度という関係
 | ~~HDF5 / netCDF-4~~ | M5 の前に実装済み (第 7.5 節) | — | — |
 | HDF5 の deflate 以外の圧縮 (szip、lzf、blosc など) | 需要が見えていない。libhdf5 に任せると全接続がロックに並ぶ | 第 7.5 節のフィルタの逆適用に 1 分岐足せばよい | 実データで必要になった時点 |
 | netCDF-3 / Zarr | Rust クレートの成熟度に差があり実装リスクが高い。まず転送性能を確立する | `ArrayFile` / `ArrayDataset` トレイト、デコードキャッシュの設計 (第 7.4 節) | M6 以降。`zarrs` が最有力 |
-| 可逆圧縮 (LZ4 / ZSTD) | LAN では逆効果、WAN では有効と環境依存。測定基盤ができてから判断すべき | フレームヘッダの `codec`、`wire_len` と `logical_len` の分離、`ConnectReply.supported_codecs` | WAN 評価環境が整った時点 |
+| ~~可逆圧縮 (LZ4 / ZSTD)~~ | 実装しない。実データの float32 では生のバイト列に LZ4 は 1.00 倍、ZSTD も 1.07〜1.39 倍しか効かない。ベースラインとして gzip だけ入れる | — | — |
 | ~~適応品質 (誤差上限)~~ | M6 の後に SZ3 で実装済み (第 5.5.1 節) | — | — |
 | 適応品質 (キャスト / 値域相対の誤差) | 誤差上限だけで研究上の論点は立つ。キャストは dtype が変わるぶん実装面が広い | `QualitySpec`、`TransferPlan` の dtype (要求と実際の分離)、フレームヘッダの `encoding` | 誤差上限の測定が済んだ時点 |
 | ~~間引き (SUBSAMPLE)~~ | 実装しない。`arr[::2]` が同じバイト列を既に頼めるので、増えるのは「ストライドを決めるのがどちらか」だけ。実データでは同じ誤差で SZ3 に圧縮率で桁違いに負ける | — | — |

@@ -33,7 +33,7 @@ use crate::pool::{ConnSettings, DataPool, FetchPart, FetchSpec};
 use crate::transfer::{ArrayData, ClientStats, Element, Plan, TransferResult, TypedArray};
 
 /// The data plane frame version this client speaks.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A file opened on the server.
 ///

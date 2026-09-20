@@ -524,8 +524,6 @@ fn codec_from_name(name: &str) -> PyResult<Codec> {
 fn codec_name(codec: Codec) -> &'static str {
     match codec {
         Codec::Raw => "raw",
-        Codec::Lz4 => "lz4",
-        Codec::Zstd => "zstd",
         Codec::Sz => "sz",
         Codec::Zfp => "zfp",
     }

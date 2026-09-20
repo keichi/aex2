@@ -68,8 +68,8 @@ message ConnectReply {
     uint32 granted_streams     = 4;
     uint32 protocol_version    = 5;
     uint64 default_chunk_bytes = 6;  // Chunk size the server recommends
-    uint32 supported_codecs    = 7;  // Bitmask: bit0=RAW, bit1=LZ4, bit2=ZSTD, bit3=SZ, bit4=ZFP
-    uint32 supported_encodings = 8;  // Bitmask: bit0=EXACT, bit1=CAST, bit3=ERROR_BOUND
+    uint32 supported_codecs    = 7;  // Bitmask: bit0=RAW, bit1=SZ, bit2=ZFP
+    uint32 supported_encodings = 8;  // Bitmask: bit0=EXACT, bit1=CAST, bit2=ERROR_BOUND
     // Ceiling on one FETCH. Fixed for the session, so it is sent once here
     // rather than repeated in every plan.
     uint64 max_fetch_bytes = 9;
@@ -157,9 +157,7 @@ message Index {
 enum Encoding {
     EXACT       = 0;  // Lossless. The only one implemented so far
     DTYPE_CAST  = 1;  // float64 -> float32/float16, etc.
-    ERROR_BOUND = 3;  // Error-bounded lossy compression (ZFP, SZ, ...)
-
-    reserved 2;  // Was SUBSAMPLE: arr[::2] already asks for the same bytes
+    ERROR_BOUND = 2;  // Error-bounded lossy compression (ZFP, SZ, ...)
 }
 
 // What the client asks for. A server that cannot honour it falls back to EXACT
@@ -168,10 +166,8 @@ enum Encoding {
 message QualitySpec {
     Encoding encoding = 1;
     optional DataType cast_dtype = 2;      // For DTYPE_CAST
-    optional double abs_error_bound = 4;   // For ERROR_BOUND
-    optional double rel_error_bound = 5;
-
-    reserved 3;  // Was subsample_step
+    optional double abs_error_bound = 3;   // For ERROR_BOUND
+    optional double rel_error_bound = 4;
 }
 
 // ---------------------------------------------------------------------------

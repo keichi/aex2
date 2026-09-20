@@ -24,9 +24,7 @@ pub enum Encoding {
     /// Elements narrowed to another dtype, e.g. float64 to float32.
     DtypeCast = 1,
     /// Lossy, within a stated error bound.
-    ///
-    /// 2 was SUBSAMPLE, which a strided selection already asks for.
-    ErrorBound = 3,
+    ErrorBound = 2,
 }
 
 impl Encoding {
@@ -44,7 +42,7 @@ impl Encoding {
         match v {
             0 => Some(Encoding::Exact),
             1 => Some(Encoding::DtypeCast),
-            3 => Some(Encoding::ErrorBound),
+            2 => Some(Encoding::ErrorBound),
             _ => None,
         }
     }
@@ -81,13 +79,11 @@ const ALL_ENCODINGS: [Encoding; 3] = [Encoding::Exact, Encoding::DtypeCast, Enco
 pub enum Codec {
     #[default]
     Raw = 0,
-    Lz4 = 1,
-    Zstd = 2,
     /// Error-bounded and lossy: only ever paired with [`Encoding::ErrorBound`].
-    Sz = 3,
+    Sz = 1,
     /// The other error-bounded one. Faster and blockier than [`Codec::Sz`],
     /// and it does not survive NaN or infinity.
-    Zfp = 4,
+    Zfp = 2,
 }
 
 impl Codec {
@@ -103,10 +99,8 @@ impl Codec {
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Codec::Raw),
-            1 => Some(Codec::Lz4),
-            2 => Some(Codec::Zstd),
-            3 => Some(Codec::Sz),
-            4 => Some(Codec::Zfp),
+            1 => Some(Codec::Sz),
+            2 => Some(Codec::Zfp),
             _ => None,
         }
     }
@@ -130,13 +124,12 @@ impl Codec {
             Codec::Raw => true,
             Codec::Sz => cfg!(feature = "sz"),
             Codec::Zfp => cfg!(feature = "zfp"),
-            Codec::Lz4 | Codec::Zstd => false,
         }
     }
 }
 
 /// Every codec, for the capability bitmask below.
-const ALL_CODECS: [Codec; 5] = [Codec::Raw, Codec::Lz4, Codec::Zstd, Codec::Sz, Codec::Zfp];
+const ALL_CODECS: [Codec; 3] = [Codec::Raw, Codec::Sz, Codec::Zfp];
 
 /// The error-bounded codec a build reaches for when the client names none.
 ///
@@ -279,22 +272,20 @@ mod tests {
         }
         // Pin the wire values.
         assert_eq!(Encoding::Exact.as_u8(), 0);
-        assert_eq!(Encoding::ErrorBound.as_u8(), 3);
+        assert_eq!(Encoding::DtypeCast.as_u8(), 1);
+        assert_eq!(Encoding::ErrorBound.as_u8(), 2);
         assert_eq!(Codec::Raw.as_u8(), 0);
-        assert_eq!(Codec::Zstd.as_u8(), 2);
-        assert_eq!(Codec::Sz.as_u8(), 3);
-        assert_eq!(Codec::Zfp.as_u8(), 4);
+        assert_eq!(Codec::Sz.as_u8(), 1);
+        assert_eq!(Codec::Zfp.as_u8(), 2);
     }
 
     #[test]
     fn unknown_wire_values_are_reported_rather_than_guessed() {
-        // 2 was SUBSAMPLE and is now one of these.
-        assert_eq!(Encoding::from_u8(2), None);
-        assert_eq!(Encoding::from_u8(4), None);
+        assert_eq!(Encoding::from_u8(3), None);
         assert_eq!(Encoding::from_u8(255), None);
         assert_eq!(Encoding::from_i32(-1), None);
         assert_eq!(Encoding::from_i32(1 << 20), None);
-        assert_eq!(Codec::from_u8(5), None);
+        assert_eq!(Codec::from_u8(3), None);
         assert_eq!(Codec::from_u32(1 << 20), None);
     }
 
@@ -303,8 +294,6 @@ mod tests {
         assert!(Encoding::Exact.is_supported());
         assert!(Codec::Raw.is_supported());
         assert!(!Encoding::DtypeCast.is_supported());
-        assert!(!Codec::Lz4.is_supported());
-        assert!(!Codec::Zstd.is_supported());
         assert_eq!(Codec::Sz.is_supported(), cfg!(feature = "sz"));
         assert_eq!(Codec::Zfp.is_supported(), cfg!(feature = "zfp"));
         // Either codec carries an error bound; neither is needed for the other.
@@ -314,9 +303,9 @@ mod tests {
         // Bit n of the mask is codec n, which is what the client reads.
         assert_eq!(supported_codecs() & 1, 1);
         assert_eq!(supported_encodings() & 1, 1);
-        assert_eq!(supported_codecs() >> 3 & 1, cfg!(feature = "sz") as u32);
-        assert_eq!(supported_codecs() >> 4 & 1, cfg!(feature = "zfp") as u32);
-        assert_eq!(supported_encodings() >> 3 & 1, lossy as u32);
+        assert_eq!(supported_codecs() >> 1 & 1, cfg!(feature = "sz") as u32);
+        assert_eq!(supported_codecs() >> 2 & 1, cfg!(feature = "zfp") as u32);
+        assert_eq!(supported_encodings() >> 2 & 1, lossy as u32);
     }
 
     #[test]
@@ -412,16 +401,14 @@ mod tests {
     fn a_lossless_codec_in_that_field_reads_as_no_preference() {
         // A client from before there was a choice leaves the field at RAW,
         // and RAW cannot carry a bound, so it must not be read as one.
-        for codec in [Codec::Raw, Codec::Lz4, Codec::Zstd] {
-            let asked = QualitySpec {
-                codec: Some(codec),
-                ..error_bound(Some(1e-3), None)
-            };
-            assert_eq!(asked.codec(), DEFAULT_LOSSY);
-            assert_eq!(
-                !asked.applied(DType::Float32).is_exact(),
-                Encoding::ErrorBound.is_supported()
-            );
-        }
+        let asked = QualitySpec {
+            codec: Some(Codec::Raw),
+            ..error_bound(Some(1e-3), None)
+        };
+        assert_eq!(asked.codec(), DEFAULT_LOSSY);
+        assert_eq!(
+            !asked.applied(DType::Float32).is_exact(),
+            Encoding::ErrorBound.is_supported()
+        );
     }
 }
