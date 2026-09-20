@@ -94,9 +94,11 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/mem.h5` | `mem.npy` と同じ中身の HDF5 (contiguous) | `.venv/bin/python benchmarks/mdx2/mkh5.py /mnt/aexram/mem.h5 1073741824 contiguous counting` |
 | `/mnt/aexram/mem-gzip.h5` | 同じ中身を 4 MiB チャンク・shuffle + gzip 1 で圧縮 (約 1 %) | `... mem-gzip.h5 1073741824 gzip counting` |
 | `/mnt/aexram/mem-gzip-noisy.h5` | 圧縮の効きにくい中身 (`i % 1000` + 0〜15 の乱数) を同じ設定で圧縮。`--pattern none` で読む | `... mem-gzip-noisy.h5 1073741824 gzip noisy` |
-| `/mnt/aexram/wave.npy` | 4 GiB、524288 × 2048 の float32。滑らかな場 + 下位ビットの雑音で、誤差保証圧縮の測定用。`--pattern none` で読む | `target/release/mknpy /mnt/aexram/wave.npy 1073741824 --row-elements 2048 --field wave` |
+| `/mnt/aexram/wave.npy` | 1 GiB、131072 × 2048 の float32。滑らかな場 + 下位ビットの雑音で、誤差保証圧縮の測定用。`--pattern none` で読む | `target/release/mknpy /mnt/aexram/wave.npy 268435456 --row-elements 2048 --field wave` |
 
 - `mknpy` の第 2 引数はバイト数ではなく**要素数**
+- `wave.npy` だけ 1 GiB なのは tmpfs の空き容量の都合である (HDF5 のフィクスチャで
+  86 % 埋まっている)。`sz-sweep.sh` は 1 点 1 GiB なので、これで足りる
 - 誤差保証圧縮を測るときは、サーバもクライアントも `sz` feature 付きでビルドする:
   `FEATURES=aex-server/hdf5,aex-server/sz,aex-client/sz benchmarks/mdx2/sync.sh`。
   VM には `libclang-dev` が無いので `sync.sh` が `LIBCLANG_PATH` を渡している。

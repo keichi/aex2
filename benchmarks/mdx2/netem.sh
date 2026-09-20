@@ -8,13 +8,26 @@ SERVER=${SERVER:-aex2-eval1} SERVER_IP=${SERVER_IP:-192.168.100.207}
 CLIENT=${CLIENT:-aex2-eval2} CLIENT_IP=${CLIENT_IP:-192.168.101.235}
 
 set_rtt() {
-    local half
+    set_rtt_rate "$1" ""
+}
+
+# Added RTT, and optionally a bandwidth cap (a tc rate such as `1gbit`).
+#
+# The cap goes on both sides at its full value rather than half: two shapers of
+# the same rate in series still pass that rate, and the link is only ever
+# measured in one direction anyway.
+#
+# Wanted because delay alone cannot answer what compression is for. This link
+# runs at 26 to 133 Gbit/s, so even at 50 ms of round trip an exact transfer
+# beats a compressed one; the trade only turns over on a narrow link.
+set_rtt_rate() {
+    local half rate=$2
     half=$(echo "$1 / 2" | bc -l)
     for pair in "$SERVER $CLIENT_IP" "$CLIENT $SERVER_IP"; do
         set -- $pair
         # A 20 Gbit/s flow queues about 180k packets at 100 ms; the default 1000 drops.
         ssh "$1" "sudo tc qdisc replace dev enp3s0 root handle 1: prio bands 4 &&
-            sudo tc qdisc replace dev enp3s0 parent 1:4 handle 40: netem delay ${half}ms limit 1000000 &&
+            sudo tc qdisc replace dev enp3s0 parent 1:4 handle 40: netem delay ${half}ms ${rate:+rate $rate} limit 1000000 &&
             sudo tc filter replace dev enp3s0 parent 1: protocol ip prio 1 u32 match ip dst $2/32 flowid 1:4"
     done
 }
