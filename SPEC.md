@@ -287,7 +287,7 @@ message ConnectReply {
     uint32 protocol_version       = 5;
     uint64 default_chunk_bytes    = 6;  // サーバ推奨のチャンクサイズ
     uint64 max_fetch_bytes        = 9;  // 1 回の FETCH で要求してよい上限 (セッション中一定)
-    uint32 supported_codecs       = 7;  // ビットマスク (bit0=RAW, bit1=SZ, bit2=ZFP)
+    uint32 supported_codecs       = 7;  // ビットマスク (bit0=RAW, bit1=SZ, bit2=ZFP, bit3=GZIP)
     uint32 supported_encodings    = 8;  // ビットマスク (bit0=EXACT, bit1=CAST, bit2=ERROR_BOUND)
 }
 ```
@@ -678,7 +678,7 @@ v1 は `ApplyFunction` が常に**データセット全体**を読んでから�
 | offset | size | field | 説明 |
 |--------|------|-------|------|
 | 0 | 1 | `frame_type` | フレーム種別 (下表) |
-| 1 | 1 | `codec` | 0=RAW, 1=SZ, 2=ZFP |
+| 1 | 1 | `codec` | 0=RAW, 1=SZ, 2=ZFP, 3=GZIP |
 | 2 | 1 | `encoding` | `QualitySpec.Encoding` と同じ値 |
 | 3 | 1 | `flags` | 予約 (0)。将来の拡張用 |
 | 4 | 4 | `request_id` | `TransferPlan.request_id` (u32) |
@@ -1774,6 +1774,34 @@ RTT にもほぼ依存しない (CPU 律速) ので、無損失がその値よ�
 (1 Gbit/s で SZ3 が 2.8 倍、26 Gbit/s で ZFP が 2.3 倍)。既定は SZ3 のままとした:
 狭い回線ほど差が大きく、しかも狭い回線ほど圧縮を使う理由があるためである。
 ZFP も単スレッドなので、`streams` が圧縮の並列度という関係は変わらない。
+
+### M9 ベースライン (GZIP / DTYPE_CAST)
+
+- `Codec::Gzip` (既定 ON)。比較対象としての可逆圧縮
+- `Encoding::DtypeCast` (既定 ON)。float64 → float32 と float32 → float16
+- 実装しないと決めたものの削除: `SUBSAMPLE`、`Codec::Lz4`、`Codec::Zstd`
+
+**完了条件**: `at(codec="gzip")` と `at(dtype=...)` が転送でき、誤差上限付きコーデックと
+同じ土俵で比べられる
+
+**完了**。実データ (CMIP6 MRI-AGCM3-2-S、20 km、960 × 1920 の float32 3 面) で
+4 MiB 行揃えブロック単位に測った結果、**汎用の可逆圧縮は生の float には効かない**:
+LZ4 は 1.00 倍、ZSTD-1 が 1.31 倍、gzip-6 が 1.36 倍。効いているのはコーデックではなく
+**バイトシャッフル**で、4 バイトを面ごとに転置するとどれもほぼ倍になる (shuf+zstd-1 で
+2.01 倍、1.45 GiB/s)。それでも誤差上限付きコーデックには遠く及ばない: 同じデータに
+SZ3 を値域の 0.1 % の誤差で掛けると 61.8 倍になる。
+
+この測定が 3 つの判断を決めた。**LZ4 と ZSTD は入れない** (シャッフル込みでも zstd-1 の
+下位互換か、両軸で gzip に勝てない)。**間引きは入れない** (stride 2 で 4 倍・誤差 2.7 % に
+対し、SZ3 は 62 倍・誤差 0.1 %)。**量子化も入れない** (自前の量子化 + エントロピー符号は
+同じ誤差で SZ3 に 3.5 〜 4 倍負け、誤差の質でも負ける。SZ3 が中でやっていることの
+劣化版にしかならない)。
+
+`DTYPE_CAST` だけは圧縮率以外の理由で残した。比は 2 倍止まりだが、
+`wire_len == logical_len` が保たれる唯一の品質で、受信側の展開コストがゼロになり、
+転送量が事前に確定し、クライアントが確保する配列も半分になる (§5.5.3)。
+桁を跨ぐ場では誤差の性質も違う: 同じ最大絶対誤差で、SZ3 が小さい値を相対で中央値
+17.8 % 壊すところを float16 は 0.40 % に保つ。
 
 ---
 

@@ -68,7 +68,7 @@ message ConnectReply {
     uint32 granted_streams     = 4;
     uint32 protocol_version    = 5;
     uint64 default_chunk_bytes = 6;  // Chunk size the server recommends
-    uint32 supported_codecs    = 7;  // Bitmask: bit0=RAW, bit1=SZ, bit2=ZFP
+    uint32 supported_codecs    = 7;  // Bitmask: bit0=RAW, bit1=SZ, bit2=ZFP, bit3=GZIP
     uint32 supported_encodings = 8;  // Bitmask: bit0=EXACT, bit1=CAST, bit2=ERROR_BOUND
     // Ceiling on one FETCH. Fixed for the session, so it is sent once here
     // rather than repeated in every plan.
