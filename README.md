@@ -9,6 +9,8 @@ Rust 実装で、メタデータ操作を担う**コントロールプレーン*
 
 設計の全体像・プロトコル仕様・マイルストーンは [SPEC.md](SPEC.md) を参照のこと。
 
+Python API のリファレンスは <https://keichi.github.io/aex2/> にある。
+
 ## 状態
 
 **M6 (評価) まで実装済み。** Python と Rust の両方から
