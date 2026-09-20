@@ -1,4 +1,6 @@
-# AEX2
+<p align="center">
+  <img src="docs/logo.svg" alt="AEX2" width="480">
+</p>
 
 [![Python API reference](https://img.shields.io/badge/docs-Python%20API-blue)](https://keichi.github.io/aex2/)
 
