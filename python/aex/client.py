@@ -29,6 +29,7 @@ class Client:
         self._lock = threading.Lock()
 
     def open(self, path: str) -> "FileProxy":
+        """Open a file, at a path relative to the server's data root."""
         return FileProxy(self, self._native.open(path))
 
     def _submit(self, fn: Callable[..., T], *args: Any) -> "Future[T]":
@@ -86,7 +87,13 @@ def _proxy(
 
 
 class GroupProxy:
-    """A group in an open file. Indexing it with a path yields its items."""
+    """A group in an open file.
+
+    ``group[name]`` is the item at that path: an ``ArrayProxy`` for a dataset,
+    a ``GroupProxy`` for a group. A leading ``/`` makes the path absolute.
+    Iterating yields the children as proxies, ``len`` counts them, and ``in``
+    tests for a path without raising.
+    """
 
     def __init__(self, client: Client, handle: int, name: str) -> None:
         self._client = client
@@ -137,6 +144,7 @@ class FileProxy(GroupProxy):
         super().__init__(client, handle, "/")
 
     def close(self) -> None:
+        """Release the file on the server. The proxies it produced stop working."""
         self._native.close_file(self.handle)
 
     def __repr__(self) -> str:

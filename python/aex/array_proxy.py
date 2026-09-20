@@ -84,8 +84,18 @@ _LOCAL = object()
 class ArrayProxy:
     """An array on the server. Indexing it transfers the selection.
 
+    ``arr[key]`` takes what numpy takes, integers, slices, ``...``, ``None``
+    and integer or boolean arrays, and gives back a read-only ndarray.
+
     ``arr.view[key]`` is a proxy for a selection that transfers nothing, so
     that ``np.sum(arr.view[0:100])`` reads 100 rows on the server.
+
+    These numpy functions run on the server, and only the result is sent:
+    ``sum``, ``prod``, ``mean``, ``max``, ``min``, ``std``, ``var``, ``all``,
+    ``any``, ``argmax``, ``argmin``, and the ``nan`` forms of sum, mean, max
+    and min. Only ``axis``, ``keepdims`` and ``ddof`` go with them, and only
+    results under 64 KiB. Anything else downloads the array and computes it
+    here; ``set_fallback_policy`` says how loudly.
     """
 
     def __init__(
@@ -122,6 +132,7 @@ class ArrayProxy:
 
     @property
     def nbytes(self) -> int:
+        """What the whole array would take, were all of it transferred."""
         return self.size * self.dtype.itemsize
 
     def __len__(self) -> int:
@@ -369,7 +380,11 @@ def _warn_as_numpy(name: str, out: npt.NDArray[Any], count: int, ddof: Any) -> N
 
 
 class QualityView:
-    """An array read at a requested quality. Made by ``ArrayProxy.at``."""
+    """An array read at a requested quality. Made by ``ArrayProxy.at``.
+
+    ``applied_quality`` is None until the first read, then names the
+    encoding the server chose and the codec that carried it.
+    """
 
     def __init__(self, array: ArrayProxy, quality: dict[str, Any]) -> None:
         self.array = array
