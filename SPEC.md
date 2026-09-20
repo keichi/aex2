@@ -94,7 +94,7 @@ TCP を使う限り最低 2 回は必須)。読みバッファは使い回すた
 | 書き込み | 非対応 (読み出し専用) | プロトコルは双方向定義可能な形に |
 | サーバサイド計算 | 主要な集約関数のみ | §5.8 |
 | 可逆圧縮 (LZ4/ZSTD) | ヘッダに codec フィールドのみ確保、実装は後 | §14.1 |
-| 適応品質 | 誤差上限を SZ3 と ZFP で実装 (`sz` / `zfp` feature、既定 OFF)。キャスト・間引き・値域相対は枠のみ | §5.5.1、§14.1 |
+| 適応品質 | 誤差上限を SZ3 と ZFP で実装 (`sz` / `zfp` feature、既定 OFF)。キャスト・値域相対は枠のみ | §5.5.1、§14.1 |
 | 対象 OS | Linux を最適化対象、macOS でも動作 | OS 固有機能は feature フラグで分離 |
 | Python API | v1 の API を維持し、性能用 API を**追加** | §10.2、§10.3 |
 | numpy 未対応関数 | 警告を出してローカルフォールバック | §10.4 |
@@ -288,7 +288,7 @@ message ConnectReply {
     uint64 default_chunk_bytes    = 6;  // サーバ推奨のチャンクサイズ
     uint64 max_fetch_bytes        = 9;  // 1 回の FETCH で要求してよい上限 (セッション中一定)
     uint32 supported_codecs       = 7;  // ビットマスク (bit0=RAW, bit1=LZ4, bit2=ZSTD, bit3=SZ, bit4=ZFP)
-    uint32 supported_encodings    = 8;  // ビットマスク (bit0=EXACT, bit1=CAST, bit2=SUBSAMPLE, bit3=ERROR_BOUND)
+    uint32 supported_encodings    = 8;  // ビットマスク (bit0=EXACT, bit1=CAST, bit3=ERROR_BOUND)
 }
 ```
 
@@ -356,16 +356,18 @@ boolean mask はクライアント側で `np.nonzero` により整数インデ�
 enum Encoding {
     EXACT      = 0;  // 無損失。どのビルドも必ず出せる
     DTYPE_CAST = 1;  // float64 -> float32/float16 等
-    SUBSAMPLE  = 2;  // 軸ごとのストライド間引き
     ERROR_BOUND = 3; // 誤差上限付き非可逆圧縮。SZ3 か ZFP が運ぶ (§5.5.1)
+
+    reserved 2;      // かつての SUBSAMPLE。ストライド付きスライスが同じものを頼める
 }
 
 message QualitySpec {
     Encoding encoding = 1;
     optional DataType cast_dtype = 2;          // DTYPE_CAST 用
-    repeated int64 subsample_step = 3;         // SUBSAMPLE 用 (軸ごと)
     optional double abs_error_bound = 4;       // ERROR_BOUND 用
     optional double rel_error_bound = 5;
+
+    reserved 3;                                // かつての subsample_step
 }
 ```
 
@@ -382,7 +384,7 @@ message QualitySpec {
 | `SZ` (3) | `sz` | `sz3` crate (SZ3 を vendor し cmake + C++17 でビルド) | 予測と量子化。誤差上限を与えた数値のまま守る |
 | `ZFP` (4) | `zfp` | `zfp-sys` crate (LLNL の zfp を vendor し cmake でビルド) | ブロック変換。誤差上限は**2 の冪に切り下げて**守る。**NaN / Inf を含むブロックは壊れる** |
 
-適用するのは float32 / float64 のみで、それ以外の dtype と、`rel_error_bound`・`DTYPE_CAST`・`SUBSAMPLE` は EXACT にフォールバックする。
+適用するのは float32 / float64 のみで、それ以外の dtype と、`rel_error_bound`・`DTYPE_CAST` は EXACT にフォールバックする。
 
 **どちらを使うかは転送ごとにクライアントが選ぶ**。`PrepareSelectionRequest.requested_codec` に入れ、サーバが実際に使ったものが `TransferPlan.codec` で返る。この 2 つのフィールドはもともと可逆コーデック用に取ってあったもので、誤差上限付きのコーデックが 2 つになった時点で意味を持った。指名を省いたとき (および `RAW` のような誤差上限付きでない値が入っていたとき) は、サーバが自分の既定を使う。古いクライアントはこのフィールドを 0 のまま送るので、0 を「指定なし」と読むことが互換性の条件である。
 
@@ -772,7 +774,7 @@ struct Fragment {
 
 **`mmap` と `sendfile` は採用しない。読み出しは `pread`、送信は `writev` に統一する。**
 
-ゼロコピー送信 (mmap + writev で 1 コピー、sendfile で 0 コピー) が成立するのは、**非圧縮フォーマットの無加工転送に限られる**。将来扱う Zarr / HDF5 は圧縮チャンクが前提でありデコードを経てバッファに載る。さらに本研究の核である適応品質転送 (dtype キャスト、間引き、誤差上限付き圧縮) を実装した時点で、加工経路が主となる。すなわちゼロコピー送信は「初版の `.npy` にしか効かず、将来消える最適化」であり、そのために `Source` の分岐・`IoSlice` のライフタイム管理・OS 分岐を恒久的に抱えるのは割に合わない。**バックエンドの内部事情を送信コードから完全に隠す**ことを優先する。副次的に、mmap の SIGBUS (転送中に truncate されるとプロセスが落ちる) と、ページフォルトがコールドキャッシュで I/O キューを深くできない問題も回避できる。
+ゼロコピー送信 (mmap + writev で 1 コピー、sendfile で 0 コピー) が成立するのは、**非圧縮フォーマットの無加工転送に限られる**。将来扱う Zarr / HDF5 は圧縮チャンクが前提でありデコードを経てバッファに載る。さらに本研究の核である適応品質転送 (dtype キャスト、誤差上限付き圧縮) を実装した時点で、加工経路が主となる。すなわちゼロコピー送信は「初版の `.npy` にしか効かず、将来消える最適化」であり、そのために `Source` の分岐・`IoSlice` のライフタイム管理・OS 分岐を恒久的に抱えるのは割に合わない。**バックエンドの内部事情を送信コードから完全に隠す**ことを優先する。副次的に、mmap の SIGBUS (転送中に truncate されるとプロセスが落ちる) と、ページフォルトがコールドキャッシュで I/O キューを深くできない問題も回避できる。
 
 代償はサーバ送信側のユーザ空間コピー 1 回だが、10 GbE ではメモリ帯域に対して十分小さい (第 1.3 節)。**クライアント側のゼロコピー受信は維持される** (第 6.6 節)。高速リンクで必要になった場合、`sendfile` 経路は**フレームプロトコルを変えずに後から追加できる** (第 7.1 節)。
 
@@ -1746,7 +1748,8 @@ ZFP も単スレッドなので、`streams` が圧縮の並列度という関係
 | netCDF-3 / Zarr | Rust クレートの成熟度に差があり実装リスクが高い。まず転送性能を確立する | `ArrayFile` / `ArrayDataset` トレイト、デコードキャッシュの設計 (第 7.4 節) | M6 以降。`zarrs` が最有力 |
 | 可逆圧縮 (LZ4 / ZSTD) | LAN では逆効果、WAN では有効と環境依存。測定基盤ができてから判断すべき | フレームヘッダの `codec`、`wire_len` と `logical_len` の分離、`ConnectReply.supported_codecs` | WAN 評価環境が整った時点 |
 | ~~適応品質 (誤差上限)~~ | M6 の後に SZ3 で実装済み (第 5.5.1 節) | — | — |
-| 適応品質 (キャスト / 間引き / 値域相対の誤差) | 誤差上限だけで研究上の論点は立つ。キャストと間引きは shape / dtype が変わるぶん実装面が広い | `QualitySpec`、`TransferPlan` の dtype/shape (要求と実際の分離)、フレームヘッダの `encoding` | 誤差上限の測定が済んだ時点 |
+| 適応品質 (キャスト / 値域相対の誤差) | 誤差上限だけで研究上の論点は立つ。キャストは dtype が変わるぶん実装面が広い | `QualitySpec`、`TransferPlan` の dtype (要求と実際の分離)、フレームヘッダの `encoding` | 誤差上限の測定が済んだ時点 |
+| ~~間引き (SUBSAMPLE)~~ | 実装しない。`arr[::2]` が同じバイト列を既に頼めるので、増えるのは「ストライドを決めるのがどちらか」だけ。実データでは同じ誤差で SZ3 に圧縮率で桁違いに負ける | — | — |
 | ~~ZFP~~ | SZ3 の後に実装済み (第 5.5.1 節)。枠の見積りどおり `Codec` の値 1 つ・feature 1 つ・モジュール 1 つ・`match` の腕 2 つで載った | — | — |
 | ZFP・SZ3 以外の誤差上限付きアルゴリズム | 2 つあれば比較はできる。libpressio の Rust バインディングは未公開のままで、今も使えない | `Codec` の値 1 つと `codec::compress` / `decompress_into` の腕 1 つ | この 2 つで物足りないと分かった時点 |
 | TLS | 「信頼できる環境」前提。暗号化すると受信側のゼロコピーが成立しなくなる | HELLO の `flags` にネゴシエーションビットを予約 | 公開運用を検討する時点 |
@@ -1762,7 +1765,7 @@ ZFP も単スレッドなので、`streams` が圧縮の並列度という関係
 2. **フレームヘッダのサイズは変更しない**。新しい情報が必要になったら `flags` の未使用ビットか新しいフレーム種別で表現する
 3. `protocol_version` はハンドシェイクで交換し、不一致は接続拒否とする
 
-**適応品質を実装する際の設計メモ**: `SUBSAMPLE` と `DTYPE_CAST` はサーバ側で変換が必要になるため、読みバッファとは別に変換先バッファが要り、変換コストが加わる。ただし転送量が減るため WAN では総合的に勝つ。この「変換コスト vs 転送量削減」のトレードオフをどこで切り替えるかが研究的な論点になる。`QualitySpec` をクライアントが明示指定する形から始め、自動判断は測定結果を踏まえて後から載せる。ERROR_BOUND も同じ形をとり、受信側のゼロコピーを捨てるぶんまで含めてどこで勝ちに転じるかを測る ([docs/benchmark-sz.md](docs/benchmark-sz.md))。
+**適応品質を実装する際の設計メモ**: `DTYPE_CAST` はサーバ側で変換が必要になるため、読みバッファとは別に変換先バッファが要り、変換コストが加わる。ただし転送量が減るため WAN では総合的に勝つ。この「変換コスト vs 転送量削減」のトレードオフをどこで切り替えるかが研究的な論点になる。`QualitySpec` をクライアントが明示指定する形から始め、自動判断は測定結果を踏まえて後から載せる。ERROR_BOUND も同じ形をとり、受信側のゼロコピーを捨てるぶんまで含めてどこで勝ちに転じるかを測る ([docs/benchmark-sz.md](docs/benchmark-sz.md))。
 
 ### 14.2 設計上のリスクと対応
 

@@ -285,8 +285,8 @@ mod tests {
     #[test]
     fn a_plan_says_what_quality_was_applied() {
         let requested = QualitySpec {
-            encoding: aex_core::Encoding::Subsample,
-            subsample_step: vec![2, 2],
+            encoding: aex_core::Encoding::DtypeCast,
+            cast_dtype: Some(aex_core::DType::Float16),
             ..QualitySpec::exact()
         };
         let mut proto = proto_plan(4000, vec![10, 100]);

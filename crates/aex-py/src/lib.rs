@@ -475,7 +475,7 @@ fn selections<'a>(
 }
 
 /// A quality request as `aex.array_proxy` spells it: a dict holding one of
-/// `dtype`, `step`, or `abs_error` / `rel_error`, and for an error bound an
+/// `dtype` or `abs_error` / `rel_error`, and for an error bound an
 /// optional `codec`. `None` is lossless.
 fn quality_from_py(quality: Option<&Bound<'_, PyDict>>) -> PyResult<QualitySpec> {
     let mut spec = QualitySpec::exact();
@@ -488,9 +488,6 @@ fn quality_from_py(quality: Option<&Bound<'_, PyDict>>) -> PyResult<QualitySpec>
             DType::from_descr(&dtype.extract::<String>()?)
                 .map_err(|e| value_error(e.to_string()))?,
         );
-    } else if let Some(step) = quality.get_item("step")? {
-        spec.encoding = Encoding::Subsample;
-        spec.subsample_step = step.extract()?;
     } else {
         spec.abs_error_bound = quality
             .get_item("abs_error")?
@@ -540,14 +537,12 @@ fn quality_to_py<'py>(py: Python<'py>, spec: &QualitySpec) -> PyResult<Bound<'py
     let encoding = match spec.encoding {
         Encoding::Exact => "exact",
         Encoding::DtypeCast => "dtype_cast",
-        Encoding::Subsample => "subsample",
         Encoding::ErrorBound => "error_bound",
     };
     dict.set_item("encoding", encoding)?;
     match spec.encoding {
         Encoding::Exact => {}
         Encoding::DtypeCast => dict.set_item("dtype", spec.cast_dtype.map(DType::descr))?,
-        Encoding::Subsample => dict.set_item("step", PyTuple::new(py, &spec.subsample_step)?)?,
         Encoding::ErrorBound => {
             dict.set_item("abs_error", spec.abs_error_bound)?;
             dict.set_item("rel_error", spec.rel_error_bound)?;

@@ -209,12 +209,12 @@ fn a_quality_the_server_cannot_apply_comes_back_as_exact() {
     assert_eq!(values, expected(shape[0] * shape[1]), "exact means exact");
 
     // And an encoding nothing implements.
-    let subsampled = QualitySpec {
-        encoding: Encoding::Subsample,
-        subsample_step: vec![2, 2],
+    let cast = QualitySpec {
+        encoding: Encoding::DtypeCast,
+        cast_dtype: Some(aex_core::DType::Float16),
         ..QualitySpec::default()
     };
-    let (applied, _, _) = read(&server, "subsampled.npy", &shape, &[], &subsampled);
+    let (applied, _, _) = read(&server, "cast.npy", &shape, &[], &cast);
     assert_eq!(applied.encoding, Encoding::Exact);
 }
 

@@ -167,17 +167,17 @@ class ArrayProxy:
         self,
         *,
         dtype: npt.DTypeLike | None = None,
-        step: tuple[int, ...] | None = None,
         abs_error: float | None = None,
         rel_error: float | None = None,
         codec: str | None = None,
     ) -> "QualityView":
         """A view that asks the server for a cheaper encoding of the data.
 
-        Give one of: ``dtype`` to narrow the elements, ``step`` to take every
-        n-th element per axis, or ``abs_error`` / ``rel_error`` for lossy
-        compression. A server that cannot do it sends the exact data and the
-        view warns; ``applied_quality`` says what was done.
+        Give one of: ``dtype`` to narrow the elements, or ``abs_error`` /
+        ``rel_error`` for lossy compression. A server that cannot do it sends
+        the exact data and the view warns; ``applied_quality`` says what was
+        done. To take every n-th element, slice with a step instead: that is
+        an ordinary selection and needs no quality at all.
 
         Only ``abs_error`` is implemented, on float32 and float64, and only by
         a server and an extension module built with the ``sz`` or ``zfp``
@@ -193,15 +193,13 @@ class ArrayProxy:
         quality: dict[str, Any] = {}
         if dtype is not None:
             quality["dtype"] = np.dtype(dtype).newbyteorder("<").str
-        if step is not None:
-            quality["step"] = tuple(operator.index(n) for n in step)
         if abs_error is not None:
             quality["abs_error"] = float(abs_error)
         if rel_error is not None:
             quality["rel_error"] = float(rel_error)
         kinds = {"error" if k.endswith("_error") else k for k in quality}
         if len(kinds) != 1:
-            raise ValueError("give exactly one of dtype, step, or abs_error / rel_error")
+            raise ValueError("give exactly one of dtype or abs_error / rel_error")
         # The codec is how a quality travels, not which quality it is, so it
         # does not count towards the check above.
         if codec is not None:

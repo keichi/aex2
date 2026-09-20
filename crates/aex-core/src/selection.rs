@@ -1442,7 +1442,7 @@ mod tests {
         // The control plane resolves the fallback before it gets here, so a
         // quality this code cannot honour means the two disagree.
         let quality = QualitySpec {
-            encoding: crate::quality::Encoding::Subsample,
+            encoding: crate::quality::Encoding::DtypeCast,
             ..QualitySpec::default()
         };
         let err = SelectionLayout::resolve(&[10], DType::Int8, &[], &quality).unwrap_err();

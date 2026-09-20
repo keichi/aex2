@@ -23,9 +23,9 @@ pub enum Encoding {
     Exact = 0,
     /// Elements narrowed to another dtype, e.g. float64 to float32.
     DtypeCast = 1,
-    /// Every n-th element along an axis.
-    Subsample = 2,
     /// Lossy, within a stated error bound.
+    ///
+    /// 2 was SUBSAMPLE, which a strided selection already asks for.
     ErrorBound = 3,
 }
 
@@ -44,7 +44,6 @@ impl Encoding {
         match v {
             0 => Some(Encoding::Exact),
             1 => Some(Encoding::DtypeCast),
-            2 => Some(Encoding::Subsample),
             3 => Some(Encoding::ErrorBound),
             _ => None,
         }
@@ -64,18 +63,13 @@ impl Encoding {
             Encoding::Exact => true,
             // Needs a codec to carry it.
             Encoding::ErrorBound => cfg!(feature = "sz") || cfg!(feature = "zfp"),
-            Encoding::DtypeCast | Encoding::Subsample => false,
+            Encoding::DtypeCast => false,
         }
     }
 }
 
 /// Every encoding, for the capability bitmask below.
-const ALL_ENCODINGS: [Encoding; 4] = [
-    Encoding::Exact,
-    Encoding::DtypeCast,
-    Encoding::Subsample,
-    Encoding::ErrorBound,
-];
+const ALL_ENCODINGS: [Encoding; 3] = [Encoding::Exact, Encoding::DtypeCast, Encoding::ErrorBound];
 
 /// How the payload is compressed on the wire.
 ///
@@ -173,15 +167,13 @@ pub fn supported_encodings() -> u32 {
 /// What a client asks for, or what a server applied.
 ///
 /// The fields not belonging to `encoding` are carried along rather than
-/// validated: a request for `Subsample` that falls back to `Exact` must not be
+/// validated: a request for `DtypeCast` that falls back to `Exact` must not be
 /// refused because its unused `abs_error_bound` made no sense.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct QualitySpec {
     pub encoding: Encoding,
     /// For [`Encoding::DtypeCast`].
     pub cast_dtype: Option<crate::dtype::DType>,
-    /// For [`Encoding::Subsample`], one per axis.
-    pub subsample_step: Vec<i64>,
     /// For [`Encoding::ErrorBound`].
     pub abs_error_bound: Option<f64>,
     pub rel_error_bound: Option<f64>,
@@ -201,7 +193,6 @@ impl QualitySpec {
         QualitySpec {
             encoding: Encoding::Exact,
             cast_dtype: None,
-            subsample_step: Vec::new(),
             abs_error_bound: None,
             rel_error_bound: None,
             codec: None,
@@ -243,7 +234,7 @@ impl QualitySpec {
                         .abs_error_bound
                         .is_some_and(|bound| bound.is_finite() && bound > 0.0)
             }
-            Encoding::DtypeCast | Encoding::Subsample => false,
+            Encoding::DtypeCast => false,
         }
     }
 
@@ -278,12 +269,7 @@ mod tests {
 
     #[test]
     fn encodings_and_codecs_survive_a_wire_roundtrip() {
-        for encoding in [
-            Encoding::Exact,
-            Encoding::DtypeCast,
-            Encoding::Subsample,
-            Encoding::ErrorBound,
-        ] {
+        for encoding in ALL_ENCODINGS {
             assert_eq!(Encoding::from_u8(encoding.as_u8()), Some(encoding));
             assert_eq!(Encoding::from_i32(encoding.as_i32()), Some(encoding));
         }
@@ -302,6 +288,8 @@ mod tests {
 
     #[test]
     fn unknown_wire_values_are_reported_rather_than_guessed() {
+        // 2 was SUBSAMPLE and is now one of these.
+        assert_eq!(Encoding::from_u8(2), None);
         assert_eq!(Encoding::from_u8(4), None);
         assert_eq!(Encoding::from_u8(255), None);
         assert_eq!(Encoding::from_i32(-1), None);
@@ -315,7 +303,6 @@ mod tests {
         assert!(Encoding::Exact.is_supported());
         assert!(Codec::Raw.is_supported());
         assert!(!Encoding::DtypeCast.is_supported());
-        assert!(!Encoding::Subsample.is_supported());
         assert!(!Codec::Lz4.is_supported());
         assert!(!Codec::Zstd.is_supported());
         assert_eq!(Codec::Sz.is_supported(), cfg!(feature = "sz"));
@@ -335,15 +322,15 @@ mod tests {
     #[test]
     fn an_encoding_this_server_lacks_falls_back_to_exact() {
         let requested = QualitySpec {
-            encoding: Encoding::Subsample,
-            subsample_step: vec![2, 2],
+            encoding: Encoding::DtypeCast,
+            cast_dtype: Some(DType::Float16),
             ..QualitySpec::default()
         };
         let applied = requested.applied(DType::Float32);
         assert!(applied.is_exact());
         // The fallback drops the settings that belonged to the encoding it
         // could not apply, so the plan reports exactly what was done.
-        assert!(applied.subsample_step.is_empty());
+        assert!(applied.cast_dtype.is_none());
 
         // A request it can honour comes back untouched.
         let exact = QualitySpec::exact();
