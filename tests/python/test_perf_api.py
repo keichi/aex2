@@ -130,7 +130,7 @@ def test_close_waits_for_pending_transfers(server, ds_paths):
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"dtype": np.float16}, {"step": (2, 2)}, {"abs_error": 1e-3}, {"rel_error": 1e-2}],
+    [{"dtype": np.float16}, {"abs_error": 1e-3}, {"rel_error": 1e-2}],
 )
 def test_at_falls_back_to_exact_and_warns(array_proxy, kwargs):
     view = array_proxy.at(**kwargs)
@@ -139,7 +139,7 @@ def test_at_falls_back_to_exact_and_warns(array_proxy, kwargs):
         data = view[0:10]
     np.testing.assert_array_equal(data, expected_ds1()[0:10])
     assert data.dtype == np.float32
-    assert view.applied_quality == {"encoding": "exact"}
+    assert view.applied_quality == {"encoding": "exact", "codec": "raw"}
 
 
 def test_at_warns_once_per_view(array_proxy):
@@ -151,8 +151,8 @@ def test_at_warns_once_per_view(array_proxy):
         view[1]
 
 
-@pytest.mark.parametrize("kwargs", [{}, {"dtype": "f2", "step": (2,)}, {"codec": "zfp"}])
-def test_at_takes_exactly_one_kind_of_quality(array_proxy, kwargs):
+@pytest.mark.parametrize("kwargs", [{}, {"dtype": "f2", "abs_error": 1e-3}])
+def test_at_takes_at_most_one_kind_of_quality(array_proxy, kwargs):
     with pytest.raises(ValueError):
         array_proxy.at(**kwargs)
 
@@ -168,7 +168,19 @@ def test_at_carries_the_codec_alongside_the_bound(array_proxy):
 
 def test_at_rejects_a_codec_that_is_not_one(array_proxy):
     with pytest.raises(ValueError):
-        array_proxy.at(abs_error=1e-3, codec="gzip")[0:10]
+        array_proxy.at(abs_error=1e-3, codec="deflate")[0:10]
+
+
+def test_gzip_is_asked_for_by_codec_alone(array_proxy):
+    # It is lossless, so there is no quality to go with it and no warning:
+    # only the wire is smaller.
+    view = array_proxy.at(codec="gzip")
+    assert view.quality == {"codec": "gzip"}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        data = view[:]
+    np.testing.assert_array_equal(data, expected_ds1())
+    assert view.applied_quality == {"encoding": "exact", "codec": "gzip"}
 
 
 def test_at_accepts_both_error_bounds(array_proxy):

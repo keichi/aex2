@@ -4,12 +4,19 @@
 //! back within the bound the client asked for, and the plan says truthfully
 //! what the server did — including when the answer is that it did nothing.
 
+// Only the hand-rolled FETCH below speaks to a socket, and it is not built
+// without a codec to encode a block with.
+#[cfg(any(feature = "sz", feature = "zfp"))]
 use std::io::{Read, Write};
+#[cfg(any(feature = "sz", feature = "zfp"))]
 use std::net::TcpStream;
+#[cfg(any(feature = "sz", feature = "zfp"))]
 use std::time::Duration;
 
 use aex_client::{ClientConfig, Index, Selection, TransferResult};
-use aex_core::{Codec, Encoding, ErrorClass, QualitySpec};
+#[cfg(any(feature = "sz", feature = "zfp"))]
+use aex_core::ErrorClass;
+use aex_core::{Codec, Encoding, QualitySpec};
 
 #[path = "support.rs"]
 mod support;
@@ -279,6 +286,9 @@ fn asking_for_a_codec_is_what_decides_which_one_runs() {
 }
 
 #[test]
+// Needs a server that really applies the bound; with neither codec the plan
+// comes back EXACT and there is no encoded block to split.
+#[cfg(any(feature = "sz", feature = "zfp"))]
 fn a_fetch_that_splits_an_element_is_refused() {
     let server = TestServer::start();
     server.write_npy("misaligned.npy", &[2048, 512]);
@@ -323,4 +333,44 @@ fn a_fetch_that_splits_an_element_is_refused() {
     stream.read_exact(&mut payload).expect("payload");
     let error = aex_wire::ErrorPayload::decode(&payload).expect("decode");
     assert_eq!(error.class, ErrorClass::Request, "{}", error.message);
+}
+
+#[test]
+fn gzip_delivers_the_exact_bytes_over_a_smaller_wire() {
+    // The first combination of an exact encoding with a codec, so it is also
+    // what pins down that the two are independent of each other.
+    let server = TestServer::start();
+    let shape = [2048, 512];
+    let quality = QualitySpec {
+        codec: Some(Codec::Gzip),
+        ..QualitySpec::exact()
+    };
+    let (applied, values, result) = read(&server, "gzipped.npy", &shape, &[], &quality);
+
+    assert_eq!(applied.encoding, Encoding::Exact);
+    assert_eq!(applied.codec, Some(Codec::Gzip));
+    assert_eq!(values, expected(shape[0] * shape[1]), "exact means exact");
+    assert!(!result.inline, "the transfer has to go over the data plane");
+    assert!(
+        result.wire_bytes < result.bytes,
+        "{} wire bytes for {} delivered",
+        result.wire_bytes,
+        result.bytes
+    );
+}
+
+#[test]
+fn an_error_bounded_codec_asked_for_on_an_exact_transfer_is_not_used() {
+    // SZ cannot carry an exact transfer, and swapping in GZIP for it would be
+    // answering a question nobody asked. RAW is the honest answer.
+    let server = TestServer::start();
+    let quality = QualitySpec {
+        codec: Some(Codec::Sz),
+        ..QualitySpec::exact()
+    };
+    let (applied, values, result) = read(&server, "exact-sz.npy", &[1024, 512], &[], &quality);
+    assert_eq!(applied.encoding, Encoding::Exact);
+    assert_eq!(applied.codec, Some(Codec::Raw));
+    assert_eq!(values, expected(1024 * 512));
+    assert_eq!(result.wire_bytes, result.bytes);
 }

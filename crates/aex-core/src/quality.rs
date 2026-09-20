@@ -5,11 +5,11 @@
 //! what it actually applied, so that a newer client and an older server never
 //! fail to understand each other.
 //!
-//! What a build can produce depends on its features: [`Encoding::Exact`] and
-//! [`Codec::Raw`] always, [`Codec::Sz`] with `sz`, [`Codec::Zfp`] with `zfp`,
-//! and [`Encoding::ErrorBound`] with either. The rest of the values exist
-//! because they travel on the wire in a fixed-width field, and a decoder has
-//! to name what it is refusing.
+//! What a build can produce depends on its features: [`Encoding::Exact`],
+//! [`Codec::Raw`] and [`Codec::Gzip`] always, [`Codec::Sz`] with `sz`,
+//! [`Codec::Zfp`] with `zfp`, and [`Encoding::ErrorBound`] with either. The
+//! rest of the values exist because they travel on the wire in a fixed-width
+//! field, and a decoder has to name what it is refusing.
 
 /// What was done to the elements before they were put on the wire.
 ///
@@ -84,6 +84,13 @@ pub enum Codec {
     /// The other error-bounded one. Faster and blockier than [`Codec::Sz`],
     /// and it does not survive NaN or infinity.
     Zfp = 2,
+    /// Lossless deflate. The one codec that pairs with [`Encoding::Exact`].
+    ///
+    /// It is here to be measured against, not to be reached for: on real
+    /// float32 fields it returns 1.1x to 1.4x, where an error-bounded codec
+    /// returns more than an order of magnitude at an error nobody can see.
+    /// Never the default for anything.
+    Gzip = 3,
 }
 
 impl Codec {
@@ -101,6 +108,7 @@ impl Codec {
             0 => Some(Codec::Raw),
             1 => Some(Codec::Sz),
             2 => Some(Codec::Zfp),
+            3 => Some(Codec::Gzip),
             _ => None,
         }
     }
@@ -121,7 +129,7 @@ impl Codec {
     /// Whether this build can produce it.
     pub const fn is_supported(self) -> bool {
         match self {
-            Codec::Raw => true,
+            Codec::Raw | Codec::Gzip => true,
             Codec::Sz => cfg!(feature = "sz"),
             Codec::Zfp => cfg!(feature = "zfp"),
         }
@@ -129,7 +137,7 @@ impl Codec {
 }
 
 /// Every codec, for the capability bitmask below.
-const ALL_CODECS: [Codec; 3] = [Codec::Raw, Codec::Sz, Codec::Zfp];
+const ALL_CODECS: [Codec; 4] = [Codec::Raw, Codec::Sz, Codec::Zfp, Codec::Gzip];
 
 /// The error-bounded codec a build reaches for when the client names none.
 ///
@@ -234,16 +242,22 @@ impl QualitySpec {
     /// The codec that carries this quality, once `codec` has had the build's
     /// default filled in for it.
     ///
-    /// A codec that is not one of the error-bounded ones reads as no
-    /// preference rather than as a request: a client from before there was a
-    /// choice leaves the field at RAW, and RAW cannot carry a bound.
+    /// Under an error bound, a codec that is not one of the error-bounded
+    /// ones reads as no preference rather than as a request: a client from
+    /// before there was a choice leaves the field at RAW, and RAW cannot carry
+    /// a bound. Anywhere else the answer is RAW unless a lossless codec this
+    /// build has was named. Falling back to RAW there needs no telling: a
+    /// lossless codec changes the bytes on the wire and nothing else.
     pub fn codec(&self) -> Codec {
         match self.encoding {
             Encoding::ErrorBound => self
                 .codec
                 .filter(|codec| codec.is_error_bounded())
                 .unwrap_or(DEFAULT_LOSSY),
-            _ => Codec::Raw,
+            _ => self
+                .codec
+                .filter(|codec| !codec.is_error_bounded() && codec.is_supported())
+                .unwrap_or(Codec::Raw),
         }
     }
 
@@ -277,6 +291,7 @@ mod tests {
         assert_eq!(Codec::Raw.as_u8(), 0);
         assert_eq!(Codec::Sz.as_u8(), 1);
         assert_eq!(Codec::Zfp.as_u8(), 2);
+        assert_eq!(Codec::Gzip.as_u8(), 3);
     }
 
     #[test]
@@ -285,7 +300,7 @@ mod tests {
         assert_eq!(Encoding::from_u8(255), None);
         assert_eq!(Encoding::from_i32(-1), None);
         assert_eq!(Encoding::from_i32(1 << 20), None);
-        assert_eq!(Codec::from_u8(3), None);
+        assert_eq!(Codec::from_u8(4), None);
         assert_eq!(Codec::from_u32(1 << 20), None);
     }
 

@@ -167,14 +167,9 @@ impl ControlService {
         // codecs that can carry an error bound.
         requested.codec = Codec::from_u32(request.requested_codec);
         let applied = requested.applied(dataset.dtype());
-        let codec = if applied.is_exact() {
-            // No lossless codec is implemented, so this is always RAW.
-            Codec::from_u32(request.requested_codec)
-                .filter(|codec| codec.is_supported() && !codec.is_error_bounded())
-                .unwrap_or(Codec::Raw)
-        } else {
-            applied.codec()
-        };
+        // Which is RAW unless a codec this build has was named, and the same
+        // answer the send path reads back out of the layout.
+        let codec = applied.codec();
 
         let layout = dataset.layout(&indices, &applied)?;
         self.check_decode_cache(&*dataset, session.granted_streams());

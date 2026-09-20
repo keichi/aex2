@@ -16,6 +16,7 @@ use crate::dtype::DType;
 use crate::error::{AexError, Result};
 use crate::quality::Codec;
 
+mod gzip;
 #[cfg(feature = "sz")]
 mod sz;
 #[cfg(feature = "zfp")]
@@ -176,7 +177,8 @@ impl BlockSpec {
             )));
         }
         let eps = f64::from_le_bytes(src[4..12].try_into().expect("8 bytes"));
-        if !eps.is_finite() || eps <= 0.0 {
+        // 0 is the bound of a lossless codec, which was given none.
+        if !eps.is_finite() || eps < 0.0 {
             return Err(bad(format!("{eps} is not an error bound")));
         }
         let mut dims = [0u32; MAX_BLOCK_DIMS];
@@ -248,6 +250,7 @@ pub fn compress(codec: Codec, spec: &BlockSpec, src: &[u8], dst: &mut Vec<u8>) -
     dst.clear();
     spec.encode(dst);
     let written: Result<()> = match codec {
+        Codec::Gzip => gzip::compress(spec, src, dst),
         #[cfg(feature = "sz")]
         Codec::Sz => sz::compress(spec, src, dst),
         #[cfg(feature = "zfp")]
@@ -280,6 +283,7 @@ pub fn decompress_into(codec: Codec, src: &[u8], dst: &mut [u8]) -> Result<()> {
         )));
     }
     match codec {
+        Codec::Gzip => gzip::decompress_into(&spec, &src[BLOCK_HEADER_LEN..], dst),
         #[cfg(feature = "sz")]
         Codec::Sz => sz::decompress_into(&spec, &src[BLOCK_HEADER_LEN..], dst),
         #[cfg(feature = "zfp")]
@@ -302,7 +306,6 @@ mod tests {
     /// Compress and expand one block, and report the worst error seen and the
     /// bytes it took. Shared with the codec modules' own tests, so that every
     /// codec is held to the same questions.
-    #[cfg(any(feature = "sz", feature = "zfp"))]
     pub(super) fn roundtrip_f32(
         codec: Codec,
         out_shape: &[u64],
@@ -329,7 +332,6 @@ mod tests {
     }
 
     /// A field a compressor can actually predict: smooth along both axes.
-    #[cfg(any(feature = "sz", feature = "zfp"))]
     pub(super) fn smooth(rows: usize, cols: usize) -> Vec<f32> {
         (0..rows * cols)
             .map(|i| {
@@ -451,9 +453,16 @@ mod tests {
             BlockSpec::decode(&nan).is_err(),
             "an error bound that is not one"
         );
+        let mut negative = good.clone();
+        negative[4..12].copy_from_slice(&(-1f64).to_le_bytes());
+        assert!(
+            BlockSpec::decode(&negative).is_err(),
+            "an error bound below zero"
+        );
+        // Zero is not one of these: it is what a lossless codec's block says.
         let mut zero = good.clone();
         zero[4..12].copy_from_slice(&0f64.to_le_bytes());
-        assert!(BlockSpec::decode(&zero).is_err(), "a zero error bound");
+        assert_eq!(BlockSpec::decode(&zero).unwrap().eps, 0.0);
     }
 
     proptest! {

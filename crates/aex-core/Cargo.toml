@@ -13,7 +13,8 @@ half = "2"
 # its data-reading API, not by header parsing.
 npyz.workspace = true
 thiserror.workspace = true
-flate2 = { workspace = true, optional = true }
+# The GZIP codec, and the inflate side of the HDF5 deflate filter.
+flate2.workspace = true
 hdf5 = { workspace = true, optional = true }
 hdf5-sys = { workspace = true, optional = true }
 sz3 = { workspace = true, optional = true }
@@ -25,7 +26,7 @@ libc = "0.2"
 
 [features]
 # Needs libhdf5 >= 1.14 at build time.
-hdf5 = ["dep:flate2", "dep:hdf5", "dep:hdf5-sys"]
+hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 # Error-bounded lossy compression. Builds SZ3 from source: needs cmake, a
 # C++17 compiler and libclang.
 sz = ["dep:sz3"]

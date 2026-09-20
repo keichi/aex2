@@ -173,11 +173,11 @@ class ArrayProxy:
     ) -> "QualityView":
         """A view that asks the server for a cheaper encoding of the data.
 
-        Give one of: ``dtype`` to narrow the elements, or ``abs_error`` /
-        ``rel_error`` for lossy compression. A server that cannot do it sends
+        Give at most one of: ``dtype`` to narrow the elements, or ``abs_error``
+        / ``rel_error`` for lossy compression. A server that cannot do it sends
         the exact data and the view warns; ``applied_quality`` says what was
-        done. To take every n-th element, slice with a step instead: that is
-        an ordinary selection and needs no quality at all.
+        done. To take every n-th element, slice with a step instead: that is an
+        ordinary selection and needs no quality at all.
 
         Only ``abs_error`` is implemented, on float32 and float64, and only by
         a server and an extension module built with the ``sz`` or ``zfp``
@@ -185,9 +185,12 @@ class ArrayProxy:
         range of the whole selection, and a compressed block only ever sees its
         own.
 
-        ``codec`` picks which error-bounded codec carries it, ``"sz"`` or
-        ``"zfp"``; left out, the server uses whichever it was built with.
-        ``applied_quality["codec"]`` says which one it actually used.
+        ``codec`` names how the bytes travel. ``"sz"`` and ``"zfp"`` carry an
+        error bound, and left out the server uses whichever it was built with.
+        ``"gzip"`` goes with no quality at all: the data is exact and only the
+        wire is smaller. It is there as a baseline, and an error bound beats it
+        by more than an order of magnitude on real data.
+        ``applied_quality["codec"]`` says what was actually used.
         """
         self._require_base("at")
         quality: dict[str, Any] = {}
@@ -198,12 +201,14 @@ class ArrayProxy:
         if rel_error is not None:
             quality["rel_error"] = float(rel_error)
         kinds = {"error" if k.endswith("_error") else k for k in quality}
-        if len(kinds) != 1:
-            raise ValueError("give exactly one of dtype or abs_error / rel_error")
+        if len(kinds) > 1:
+            raise ValueError("give at most one of dtype or abs_error / rel_error")
         # The codec is how a quality travels, not which quality it is, so it
-        # does not count towards the check above.
+        # does not count towards the check above. On its own it means GZIP.
         if codec is not None:
             quality["codec"] = str(codec)
+        if not quality:
+            raise ValueError("give a dtype, an error bound, or a codec")
         return QualityView(self, quality)
 
     def read_into(self, out: npt.NDArray[Any], key: Any = Ellipsis) -> None:
@@ -376,7 +381,7 @@ class QualityView:
         """Transfer a selection at this view's quality. The result is read-only."""
         out, plan = self.array._read(key, self.quality)
         applied = plan.applied_quality
-        if applied["encoding"] == "exact" and self.applied_quality is None:
+        if self.applied_quality is None and self._was_refused(applied):
             warnings.warn(
                 f"the server cannot apply {self.quality}; the data is exact",
                 AexQualityWarning,
@@ -384,6 +389,18 @@ class QualityView:
             )
         self.applied_quality = applied
         return out
+
+    def _was_refused(self, applied: dict[str, Any]) -> bool:
+        """Whether the server gave back something other than what was asked.
+
+        A codec on its own asks for nothing but a smaller wire, so for that one
+        the codec is the whole answer; anything else is a quality, and falling
+        back to exact is how the server says no.
+        """
+        asked_a_quality = any(k != "codec" for k in self.quality)
+        if asked_a_quality:
+            return bool(applied["encoding"] == "exact")
+        return bool(applied.get("codec") != self.quality.get("codec"))
 
     def __repr__(self) -> str:
         return f"<QualityView of {self.array!r}, quality {self.quality}>"

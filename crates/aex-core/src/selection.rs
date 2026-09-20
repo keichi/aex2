@@ -563,11 +563,14 @@ impl SelectionLayout {
 
     /// How the block covering `[offset, offset + len)` is described to a codec.
     ///
-    /// `None` when this transfer is not encoded and the bytes go as they are.
+    /// `None` when this transfer is not compressed and the bytes go as they
+    /// are. A lossless codec has no error bound to carry, so the block says
+    /// zero and the codec ignores it.
     pub fn block(&self, offset: u64, len: u64) -> Result<Option<crate::codec::BlockSpec>> {
-        let Some(eps) = self.quality.eps() else {
+        if self.quality.codec() == crate::quality::Codec::Raw {
             return Ok(None);
-        };
+        }
+        let eps = self.quality.eps().unwrap_or(0.0);
         crate::codec::BlockSpec::for_range(&self.out_shape, self.dtype, eps, offset, len).map(Some)
     }
 

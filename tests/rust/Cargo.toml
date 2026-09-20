@@ -66,4 +66,3 @@ path = "reduce.rs"
 [[test]]
 name = "quality"
 path = "quality.rs"
-required-features = ["sz"]
