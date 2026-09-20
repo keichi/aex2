@@ -98,10 +98,13 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 
 - `mknpy` の第 2 引数はバイト数ではなく**要素数**
 - `wave.npy` だけ 1 GiB なのは tmpfs の空き容量の都合である (HDF5 のフィクスチャで
-  86 % 埋まっている)。`sz-sweep.sh` は 1 点 1 GiB なので、これで足りる
-- 誤差保証圧縮を測るときは、サーバもクライアントも `sz` feature 付きでビルドする:
-  `FEATURES=aex-server/hdf5,aex-server/sz,aex-client/sz benchmarks/mdx2/sync.sh`。
+  86 % 埋まっている)。`sz-sweep.sh` と `zfp-sweep.sh` は 1 点 1 GiB なので、これで足りる
+- 誤差保証圧縮を測るときは、サーバもクライアントもコーデックの feature 付きで
+  ビルドする。両方入れておくと 1 台のサーバで掃引の途中にコーデックを切り替えられる:
+  `FEATURES=aex-server/hdf5,aex-server/sz,aex-server/zfp,aex-client/sz,aex-client/zfp benchmarks/mdx2/sync.sh`。
   VM には `libclang-dev` が無いので `sync.sh` が `LIBCLANG_PATH` を渡している。
+  **`FEATURES=` を付け忘れた `sync.sh` は両方を落とす**。サーバは誤差上限の要求を
+  黙って `EXACT` に落とすので、`aexbench` の assert が落ちるまで気づかない。
   等差数列の `mem.npy` は予測器に完全に当たってしまい圧縮率が実データについて
   何も言わないので、`wave.npy` を使う
 - 揃っているかは `ssh aex2-eval1 'ls -l /mnt/aexram /mnt/aexram/m3 ~/disk'` で確かめる。

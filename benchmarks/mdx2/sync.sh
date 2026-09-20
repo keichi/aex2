@@ -8,7 +8,7 @@
 #
 # Usage: benchmarks/mdx2/sync.sh [host...]    (default: aex2-eval1 aex2-eval2)
 #   FEATURES=... overrides what is built, for a sweep that needs more than the
-#   usual set (the sz feature, say, which most sweeps have no use for).
+#   usual set (the codec features, say, which most sweeps have no use for).
 
 set -euo pipefail
 
@@ -31,7 +31,7 @@ done
 # The server gets the hdf5 feature by default; the VMs have libhdf5 in
 # /usr/local.
 #
-# The two bindgen variables are for the sz feature. The VMs have llvm-18's
+# The two bindgen variables are for the sz and zfp features. The VMs have llvm-18's
 # runtime libclang but none of the clang dev packages, so libclang has to be
 # named by path, and it is then left without its own stddef.h and friends --
 # gcc's are lent to it instead, which is cheaper than installing a toolchain
