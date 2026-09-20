@@ -94,7 +94,7 @@ TCP を使う限り最低 2 回は必須)。読みバッファは使い回すた
 | 書き込み | 非対応 (読み出し専用) | プロトコルは双方向定義可能な形に |
 | サーバサイド計算 | 主要な集約関数のみ | §5.8 |
 | 可逆圧縮 (LZ4/ZSTD) | ヘッダに codec フィールドのみ確保、実装は後 | §14.1 |
-| 適応品質 | `QualitySpec` の枠を用意、実装は後 | §5.5、§14.1 |
+| 適応品質 | 誤差上限を SZ3 で実装 (`sz` feature、既定 OFF)。キャスト・間引き・値域相対は枠のみ | §5.5.1、§14.1 |
 | 対象 OS | Linux を最適化対象、macOS でも動作 | OS 固有機能は feature フラグで分離 |
 | Python API | v1 の API を維持し、性能用 API を**追加** | §10.2、§10.3 |
 | numpy 未対応関数 | 警告を出してローカルフォールバック | §10.4 |
@@ -285,8 +285,8 @@ message ConnectReply {
     uint32 protocol_version       = 5;
     uint64 default_chunk_bytes    = 6;  // サーバ推奨のチャンクサイズ
     uint64 max_fetch_bytes        = 9;  // 1 回の FETCH で要求してよい上限 (セッション中一定)
-    uint32 supported_codecs       = 7;  // ビットマスク (bit0=RAW, bit1=LZ4, bit2=ZSTD)
-    uint32 supported_encodings    = 8;  // ビットマスク (bit0=EXACT, bit1=CAST, ...)
+    uint32 supported_codecs       = 7;  // ビットマスク (bit0=RAW, bit1=LZ4, bit2=ZSTD, bit3=SZ)
+    uint32 supported_encodings    = 8;  // ビットマスク (bit0=EXACT, bit1=CAST, bit2=SUBSAMPLE, bit3=ERROR_BOUND)
 }
 ```
 
@@ -352,10 +352,10 @@ boolean mask はクライアント側で `np.nonzero` により整数インデ�
 
 ```proto
 enum Encoding {
-    EXACT      = 0;  // 無損失 (初版で実装)
+    EXACT      = 0;  // 無損失。どのビルドも必ず出せる
     DTYPE_CAST = 1;  // float64 -> float32/float16 等
     SUBSAMPLE  = 2;  // 軸ごとのストライド間引き
-    ERROR_BOUND = 3; // ZFP / SZ 等の誤差上限付き非可逆圧縮
+    ERROR_BOUND = 3; // 誤差上限付き非可逆圧縮。`sz` feature で SZ3 (§5.5.1)
 }
 
 message QualitySpec {
@@ -369,7 +369,7 @@ message QualitySpec {
 
 **ネゴシエーションの規約**: クライアントは希望する `QualitySpec` を送る。サーバは対応できない場合、**エラーにせず `EXACT` にフォールバック**し、実際に適用した内容を `TransferPlan.applied_quality` に入れて返す。クライアントは `applied_quality` を見て、返ってきた配列の実際の shape / dtype を決定する。
 
-この「要求と適用の分離」により、初版 (EXACT のみ) のサーバと将来のクライアントが混在しても壊れない。
+この「要求と適用の分離」により、出せるものが違うサーバとクライアントが混在しても壊れない。`EXACT` しか出せないサーバ (`sz` 無しビルド) と `ERROR_BOUND` を求めるクライアントの組み合わせは、実際に起こりうる。
 
 #### 5.5.1 ERROR_BOUND の実装
 
@@ -385,7 +385,7 @@ message QualitySpec {
 
 コーデックは接続スレッドの中で同期に走る。外部ライブラリ側のスレッド化 (SZ3 の OpenMP など) は使わない。使うと 1 接続が自分のスレッドチームを張り、接続数 × チーム数でコアを奪い合うことになる。並列度は接続数だけで決まる、という単純な関係を保つ。その代わり `streams` が圧縮の並列度そのものになるので、圧縮転送では無損失転送と最適値が違う。
 
-そのためサーバは、誤差上限付きの転送に限り読みピースを行バイト数の倍数に丸める (第 7 章)。行がピースより長い配列では要素単位で切り、そのブロックは 1 次元として扱う。揃わなくても正しさは変わらず圧縮率が落ちるだけなので、クライアントに整列の義務は課さない。ただしブロックは要素を分割できないため、要素境界に揃っていない `FETCH` だけは `REQUEST` エラーで拒否する。
+そのためサーバは、誤差上限付きの転送に限り読みピースを行バイト数の倍数に丸める (§6.5.2)。行がピースより長い配列では要素単位で切り、そのブロックは 1 次元として扱う。揃わなくても正しさは変わらず圧縮率が落ちるだけなので、クライアントに整列の義務は課さない。ただしブロックは要素を分割できないため、要素境界に揃っていない `FETCH` だけは `REQUEST` エラーで拒否する。
 
 **フレーム**: 圧縮したブロックが元より大きくなる場合 (SZ3 は数十バイトの自前ヘッダを持つため、要素数の少ないブロックでは必ず起きる) は、そのフレームだけ `RAW` で送る。`codec` はフレームごとの値なので、1 つの転送が両方を運んでもよい。
 
@@ -617,7 +617,7 @@ v1 は `ApplyFunction` が常に**データセット全体**を読んでから�
 | offset | size | field | 説明 |
 |--------|------|-------|------|
 | 0 | 1 | `frame_type` | フレーム種別 (下表) |
-| 1 | 1 | `codec` | 0=RAW, 1=LZ4, 2=ZSTD |
+| 1 | 1 | `codec` | 0=RAW, 1=LZ4, 2=ZSTD, 3=SZ |
 | 2 | 1 | `encoding` | `QualitySpec.Encoding` と同じ値 |
 | 3 | 1 | `flags` | 予約 (0)。将来の拡張用 |
 | 4 | 4 | `request_id` | `TransferPlan.request_id` (u32) |
@@ -625,7 +625,7 @@ v1 は `ApplyFunction` が常に**データセット全体**を読んでから�
 | 16 | 8 | `wire_len` | 続くペイロードのワイヤ上の長さ (u64) |
 | 24 | 8 | `logical_len` | ペイロードの論理長 = 展開後の長さ (u64) |
 
-`codec = RAW` のとき `wire_len == logical_len` であり、このときのみゼロコピー受信が成立する。圧縮を実装した際は `wire_len < logical_len` となり、受信側は一時バッファへ読んでから展開する (ゼロコピーは諦める)。
+`codec = RAW` のとき `wire_len == logical_len` であり、このときのみゼロコピー受信が成立する。圧縮されたフレームは `wire_len < logical_len` となり、受信側は一時バッファへ読んでから展開する (ゼロコピーは諦める)。codec は**フレームごと**の値なので、1 つの転送が圧縮フレームと RAW フレームを混ぜて運んでよい (§5.5.1)。
 
 **フレーム種別**
 
@@ -1269,7 +1269,8 @@ fill(plan, dst):
            完了を記録
        }
   7. 全チャンク完了を待つ (失敗チャンクは queue へ戻して再試行)
-  8. TransferResult { bytes, elapsed, streams_used, retries } を返す
+  8. TransferResult { bytes, wire_bytes, elapsed, chunks, streams, retries, inline } を返す。
+     `wire_bytes` は実際に線を流れたペイロード長で、圧縮された転送では `bytes` より小さい
 ```
 
 転送の終わりにサーバへ通知することはしない (§5.6.1)。plan は TTL と LRU で回収される。
@@ -1284,7 +1285,8 @@ pub struct ClientConfig {
     pub chunk_bytes:    u64,     // 既定 0 = サーバ推奨値に従う
     pub credit:         u32,     // 既定 16 (M6 の掃引で決定。自動計算は入れていない)
     pub connect_timeout: Duration,
-    pub codec:          Codec,   // 既定 RAW
+    // codec を選ぶ設定項目は無い。可逆 codec が 1 つも実装されておらず、
+    // 非可逆のものは Encoding が連れてくる (§5.5.1)
     pub tcp_nodelay:    bool,
     pub rcvbuf:         Option<usize>,
     pub max_retries:    u32,     // チャンク再送の上限。既定 3
@@ -1364,7 +1366,7 @@ fut = arr.get_async(np.s_[0:10000])
 do_something_else()
 data = fut.result()          # concurrent.futures.Future 互換
 
-# 4. 適応品質 (初版は EXACT にフォールバックし警告)
+# 4. 適応品質 (abs_error のみ実装。他は EXACT にフォールバックし警告)
 view = arr.at(dtype=np.float32)        # 精度を落として転送
 view = arr.at(step=(2, 2))             # 間引いて転送
 view = arr.at(abs_error=1e-3)          # 誤差上限つき非可逆
@@ -1492,6 +1494,8 @@ def test_selection_matches_numpy(key, npy_path, aex_array):
 
 集約関数についても同様に、`axis` / `keepdims` / `ddof` の組み合わせを掃引して numpy と照合する。
 
+**非可逆の転送だけは一致では検証できない。** `ERROR_BOUND` では「全要素が要求した誤差上限以内」が検証すべき性質であり、一致ではない。Python の wheel は `sz` を無効のままビルドするので `at(abs_error=...)` は EXACT に落ち、ここの一致テストは影響を受けない。誤差上限そのものは Rust の統合テスト (`tests/rust/quality.rs`、`required-features = ["sz"]`) が、接続数・チャンク境界・gathered な選択のそれぞれについて検証する。
+
 さらに **v1 と v2 の出力一致テスト**を用意する。同じ `.npy` に対して v1 クライアントと v2 クライアントで同じ選択を行い、バイト単位で一致することを確認する。v1 を参照実装として使えるのは移行期の大きな利点である。
 
 ### 11.4 並列性のテスト
@@ -1570,6 +1574,11 @@ WAN については実拠点間の確保が難しいため、必要になった�
 | 接続数 (streams) | 1, 2, 4, 8, 16 |
 | チャンクサイズ | 256 KiB, 1 MiB, 4 MiB, 16 MiB |
 | credit (パイプライン深度) | 1, 2, 4, 8, 16 |
+| 誤差上限 (`abs_error`) | 無損失, 1e-4, 1e-3, 1e-2, 1e-1, 1.0 |
+| 回線帯域 (netem `rate`) | 1, 2, 5, 10 Gbit/s |
+
+誤差上限を測るときは帯域も振る。圧縮は CPU とバイト数の交換なので、帯域を固定したままでは
+勝ち負けが決まらない (§13 の M7)。
 
 ### 12.4 実装
 
