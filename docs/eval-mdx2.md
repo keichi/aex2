@@ -97,9 +97,11 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/wave.npy` | 4 GiB、524288 × 2048 の float32。滑らかな場 + 下位ビットの雑音で、誤差保証圧縮の測定用。`--pattern none` で読む | `target/release/mknpy /mnt/aexram/wave.npy 1073741824 --row-elements 2048 --field wave` |
 
 - `mknpy` の第 2 引数はバイト数ではなく**要素数**
-- 誤差保証圧縮を測るときは、サーバもクライアントも `sz` feature 付きでビルドする
-  (`cargo build --release --features sz`)。等差数列の `mem.npy` は予測器に完全に
-  当たってしまい圧縮率が実データについて何も言わないので、`wave.npy` を使う
+- 誤差保証圧縮を測るときは、サーバもクライアントも `sz` feature 付きでビルドする:
+  `FEATURES=aex-server/hdf5,aex-server/sz,aex-client/sz benchmarks/mdx2/sync.sh`。
+  VM には `libclang-dev` が無いので `sync.sh` が `LIBCLANG_PATH` を渡している。
+  等差数列の `mem.npy` は予測器に完全に当たってしまい圧縮率が実データについて
+  何も言わないので、`wave.npy` を使う
 - 揃っているかは `ssh aex2-eval1 'ls -l /mnt/aexram /mnt/aexram/m3 ~/disk'` で確かめる。
   `/mnt/aexram` が空なら再起動で消えている
 - **`/dev/shm` は使わない。** systemd がログアウト時に中身を消す

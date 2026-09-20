@@ -7,11 +7,14 @@
 # the import. REVISION records what was copied, so a number traces to a commit.
 #
 # Usage: benchmarks/mdx2/sync.sh [host...]    (default: aex2-eval1 aex2-eval2)
+#   FEATURES=... overrides what is built, for a sweep that needs more than the
+#   usual set (the sz feature, say, which most sweeps have no use for).
 
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 [ $# -eq 0 ] && set -- aex2-eval1 aex2-eval2
+FEATURES=${FEATURES:-aex-server/hdf5}
 
 # Untracked files are copied too, and git describe --dirty would miss them.
 rev=$(git -C "$ROOT" rev-parse --short HEAD)
@@ -25,9 +28,12 @@ done
 
 # A login shell, because .bashrc stops before it puts cargo on PATH.
 # The extension is rebuilt too, so Python never imports a stale one.
-# The server gets the hdf5 feature; the VMs have libhdf5 in /usr/local.
-build='cd aex2 && cargo build --release --features aex-server/hdf5 &&
-    if [ -d .venv ]; then . .venv/bin/activate && maturin develop --release -q; fi'
+# The server gets the hdf5 feature by default; the VMs have libhdf5 in
+# /usr/local. bindgen wants a libclang and the VMs carry only the runtime one,
+# so it is pointed at that rather than the -dev symlink it looks for.
+build="cd aex2 && export LIBCLANG_PATH=/usr/lib/llvm-18/lib &&
+    cargo build --release --features $FEATURES &&
+    if [ -d .venv ]; then . .venv/bin/activate && maturin develop --release -q; fi"
 pids=()
 for h in "$@"; do
     ssh "$h" "bash -lc '$build'" 2>&1 | sed "s/^/[$h] /" &
