@@ -17,6 +17,7 @@ flate2 = { workspace = true, optional = true }
 hdf5 = { workspace = true, optional = true }
 hdf5-sys = { workspace = true, optional = true }
 sz3 = { workspace = true, optional = true }
+zfp-sys = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # posix_fadvise, to start a read before it is wanted.
@@ -28,6 +29,9 @@ hdf5 = ["dep:flate2", "dep:hdf5", "dep:hdf5-sys"]
 # Error-bounded lossy compression. Builds SZ3 from source: needs cmake, a
 # C++17 compiler and libclang.
 sz = ["dep:sz3"]
+# The other error-bounded codec. Builds zfp from source: needs cmake and
+# libclang.
+zfp = ["dep:zfp-sys"]
 
 [dev-dependencies]
 # Element types the HDF5 tests write.

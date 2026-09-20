@@ -27,8 +27,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # protoc generates the control plane code; prost-build does not bundle it.
       # libhdf5 is for the hdf5 feature; cmake, a C++ compiler and libclang are
-      # for the sz feature, which builds SZ3 from source. --all-features turns
-      # both on. macOS gets libclang from the Xcode command line tools.
+      # for the sz and zfp features, which build SZ3 and zfp from source.
+      # --all-features turns them all on. macOS gets libclang from the Xcode
+      # command line tools.
       - name: install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |

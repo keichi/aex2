@@ -47,6 +47,9 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Vendors and builds zfp; needs cmake and libclang. `static` also turns OpenMP
+# off, so one connection is one compressing core, as it is for SZ3.
+zfp-sys = { version = "0.4", features = ["static"] }
 
 proptest = "1"
 tempfile = "3"

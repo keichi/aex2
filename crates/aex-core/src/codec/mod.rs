@@ -18,9 +18,50 @@ use crate::quality::Codec;
 
 #[cfg(feature = "sz")]
 mod sz;
+#[cfg(feature = "zfp")]
+mod zfp;
 
 /// Bytes of block header before the codec's own stream.
 const BLOCK_HEADER_LEN: usize = 24;
+
+// Every codec here takes and returns typed arrays while the logical stream is
+// bytes, so each block goes through a scratch buffer of elements. The copy is
+// a few percent of what a compressor itself costs, and it means nothing here
+// depends on a byte buffer happening to be aligned for floats.
+#[cfg(any(feature = "sz", feature = "zfp"))]
+thread_local! {
+    static F32: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static F64: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Read a block's bytes as elements.
+///
+/// The logical stream is little-endian and so is every target this builds for,
+/// so the elements are already laid out the way they are wanted.
+#[cfg(any(feature = "sz", feature = "zfp"))]
+fn load<T: Copy + Default>(src: &[u8], scratch: &mut Vec<T>) {
+    let count = src.len() / std::mem::size_of::<T>();
+    scratch.clear();
+    scratch.resize(count, T::default());
+    // SAFETY: both sides span exactly count * size_of::<T>() bytes, and a
+    // float has no invalid bit pattern.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr(),
+            scratch.as_mut_ptr().cast::<u8>(),
+            count * std::mem::size_of::<T>(),
+        );
+    }
+}
+
+#[cfg(any(feature = "sz", feature = "zfp"))]
+fn store<T: Copy>(scratch: &[T], dst: &mut [u8]) {
+    debug_assert_eq!(std::mem::size_of_val(scratch), dst.len());
+    // SAFETY: as in `load`, and the lengths are equal by the caller's check.
+    unsafe {
+        std::ptr::copy_nonoverlapping(scratch.as_ptr().cast::<u8>(), dst.as_mut_ptr(), dst.len());
+    }
+}
 
 /// The most axes a block is described with.
 ///
@@ -209,6 +250,8 @@ pub fn compress(codec: Codec, spec: &BlockSpec, src: &[u8], dst: &mut Vec<u8>) -
     let written: Result<()> = match codec {
         #[cfg(feature = "sz")]
         Codec::Sz => sz::compress(spec, src, dst),
+        #[cfg(feature = "zfp")]
+        Codec::Zfp => zfp::compress(spec, src, dst),
         other => Err(AexError::BadBlock(format!(
             "{other:?} is not a codec this build can produce"
         ))),
@@ -239,6 +282,8 @@ pub fn decompress_into(codec: Codec, src: &[u8], dst: &mut [u8]) -> Result<()> {
     match codec {
         #[cfg(feature = "sz")]
         Codec::Sz => sz::decompress_into(&spec, &src[BLOCK_HEADER_LEN..], dst),
+        #[cfg(feature = "zfp")]
+        Codec::Zfp => zfp::decompress_into(&spec, &src[BLOCK_HEADER_LEN..], dst),
         other => Err(AexError::BadBlock(format!(
             "{other:?} is not a codec this build can expand"
         ))),
@@ -252,6 +297,46 @@ mod tests {
 
     fn spec(out_shape: &[u64], dtype: DType, offset: u64, len: u64) -> BlockSpec {
         BlockSpec::for_range(out_shape, dtype, 1e-3, offset, len).expect("a well-formed range")
+    }
+
+    /// Compress and expand one block, and report the worst error seen and the
+    /// bytes it took. Shared with the codec modules' own tests, so that every
+    /// codec is held to the same questions.
+    #[cfg(any(feature = "sz", feature = "zfp"))]
+    pub(super) fn roundtrip_f32(
+        codec: Codec,
+        out_shape: &[u64],
+        eps: f64,
+        values: &[f32],
+    ) -> (f64, usize) {
+        let src: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let spec =
+            BlockSpec::for_range(out_shape, DType::Float32, eps, 0, src.len() as u64).unwrap();
+        let mut packed = Vec::new();
+        if !compress(codec, &spec, &src, &mut packed).unwrap() {
+            return (0.0, src.len());
+        }
+        let mut out = vec![0u8; src.len()];
+        decompress_into(codec, &packed, &mut out).unwrap();
+        let worst = out
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .zip(values)
+            .filter(|(_, want)| want.is_finite())
+            .map(|(got, want)| (got as f64 - *want as f64).abs())
+            .fold(0.0f64, f64::max);
+        (worst, packed.len())
+    }
+
+    /// A field a compressor can actually predict: smooth along both axes.
+    #[cfg(any(feature = "sz", feature = "zfp"))]
+    pub(super) fn smooth(rows: usize, cols: usize) -> Vec<f32> {
+        (0..rows * cols)
+            .map(|i| {
+                let (r, c) = (i / cols, i % cols);
+                (c as f32 / 32.0).sin() * 100.0 + r as f32 * 0.25
+            })
+            .collect()
     }
 
     #[test]

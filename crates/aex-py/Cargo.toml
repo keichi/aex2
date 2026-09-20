@@ -21,3 +21,4 @@ pyo3 = { version = "0.29", features = ["abi3-py311"] }
 [features]
 # Error-bounded lossy compression. See aex-core for the build requirements.
 sz = ["aex-client/sz"]
+zfp = ["aex-client/zfp"]

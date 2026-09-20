@@ -17,6 +17,7 @@ autotests = false
 [features]
 hdf5 = ["dep:hdf5", "aex-server/hdf5"]
 sz = ["aex-server/sz", "aex-client/sz"]
+zfp = ["aex-server/zfp", "aex-client/zfp"]
 
 [dependencies]
 # Writes the fixtures for the HDF5 tests.
