@@ -61,7 +61,9 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 - **サーバの集約は 1 スレッドで逐次読む**。float の総和は numpy (pairwise) と
   ビット単位では一致しない
 - **適応品質は誤差上限のみ**。`sz` feature を有効にしたビルドで `at(abs_error=...)`
-  が SZ3 による誤差保証圧縮になる ([測定](docs/benchmark-sz.md))。dtype キャスト・
+  が SZ3 による誤差保証圧縮になる。圧縮率 4.83 〜 72.7 倍で、**帯域が 5 〜 13 Gbit/s
+  より狭い回線で無損失より速く届く** (1 Gbit/s なら 4.6 〜 13.7 倍、
+  [測定](docs/benchmark-sz.md))。dtype キャスト・
   間引き・値域相対の誤差、および float32 / float64 以外の dtype は EXACT で返し、
   `AexQualityWarning` を出す。既定ビルドと Python の wheel には入っていない
 - **多次元の整数インデックス配列は非対応**。1 次元にして送り、結果を reshape すること
