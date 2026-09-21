@@ -15,6 +15,9 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 [ $# -eq 0 ] && set -- aex2-eval1 aex2-eval2
 FEATURES=${FEATURES:-aex-server/hdf5}
+# The extension module has the codec features under its own names, and without
+# them the Python client cannot decode what a bounded transfer sends.
+PY_FEATURES=$(printf '%s' "$FEATURES" | tr ',' '\n' | sed -n 's|^aex-client/||p' | paste -sd, -)
 
 # Untracked files are copied too, and git describe --dirty would miss them.
 rev=$(git -C "$ROOT" rev-parse --short HEAD)
@@ -40,11 +43,12 @@ build="cd aex2 &&
     export LIBCLANG_PATH=/usr/lib/llvm-18/lib &&
     export BINDGEN_EXTRA_CLANG_ARGS=\"-isystem \$(ls -d /usr/lib/gcc/*/*/include | tail -1)\" &&
     cargo build --release --features $FEATURES &&
-    if [ -d .venv ]; then . .venv/bin/activate && maturin develop --release -q; fi"
+    if [ -d .venv ]; then . .venv/bin/activate &&
+        maturin develop --release -q ${PY_FEATURES:+--features $PY_FEATURES}; fi"
 pids=()
 for h in "$@"; do
     ssh "$h" "bash -lc '$build'" 2>&1 | sed "s/^/[$h] /" &
     pids+=($!)
 done
 for p in "${pids[@]}"; do wait "$p"; done
-echo "synced $rev to $* (features: $FEATURES)"
+echo "synced $rev to $* (features: $FEATURES${PY_FEATURES:+, extension: $PY_FEATURES})"
