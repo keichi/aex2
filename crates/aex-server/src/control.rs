@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aex_core::{
-    ArrayDataset, ArrayFile, Axis, Codec, Function, Item, NpyFile, NullFile, ReduceArgs,
+    ArrayDataset, ArrayFile, AttrValue, Axis, Codec, Function, Item, NpyFile, NullFile, ReduceArgs,
     SelectionLayout,
 };
 use aex_proto::aex_control_server::AexControl;
@@ -299,7 +299,8 @@ impl AexControl for ControlService {
         let request = request.into_inner();
         let file = self.file_of(&request.session_id, request.handle)?;
         let item = file.get_item(&request.name).map_err(ServerError::from)?;
-        Ok(Response::new(item_to_proto(&request.name, &item)?))
+        let attrs = file.attrs(&request.name).map_err(ServerError::from)?;
+        Ok(Response::new(item_to_proto(&request.name, &item, attrs)?))
     }
 
     async fn list_children(
@@ -312,9 +313,17 @@ impl AexControl for ControlService {
             .list_children(&request.name)
             .map_err(ServerError::from)?;
 
+        // The backend names children relative to their parent, so the path an
+        // attribute lookup takes has to be put back together here.
+        let parent = request.name.trim_end_matches('/');
         let items = children
             .iter()
-            .map(|(name, item)| item_to_proto(name, item))
+            .map(|(name, item)| {
+                let attrs = file
+                    .attrs(&format!("{parent}/{name}"))
+                    .map_err(ServerError::from)?;
+                item_to_proto(name, item, attrs)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Response::new(ItemList { items }))
     }
@@ -514,7 +523,11 @@ fn format_from_extension(path: &std::path::Path) -> Result<String> {
     }
 }
 
-fn item_to_proto(name: &str, item: &Item) -> Result<aex_proto::Item> {
+fn item_to_proto(
+    name: &str,
+    item: &Item,
+    attrs: Vec<(String, AttrValue)>,
+) -> Result<aex_proto::Item> {
     let data = match item {
         Item::Dataset(dataset) => aex_proto::item::Data::Dataset(dataset_to_proto(&**dataset)?),
         Item::Group => aex_proto::item::Data::Group(Group {}),
@@ -522,6 +535,27 @@ fn item_to_proto(name: &str, item: &Item) -> Result<aex_proto::Item> {
     Ok(aex_proto::Item {
         name: name.to_string(),
         data: Some(data),
+        attrs: attrs
+            .into_iter()
+            .map(|(name, value)| attr_to_proto(name, value))
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn attr_to_proto(name: String, value: AttrValue) -> Result<aex_proto::Attribute> {
+    let value = match value {
+        AttrValue::Text(text) => aex_proto::attribute::Value::Text(text),
+        AttrValue::Array { dtype, shape, data } => {
+            aex_proto::attribute::Value::Array(aex_proto::AttrArray {
+                dtype: dtype.as_i32(),
+                shape: shape_to_proto(&shape)?,
+                data,
+            })
+        }
+    };
+    Ok(aex_proto::Attribute {
+        name,
+        value: Some(value),
     })
 }
 
@@ -591,7 +625,8 @@ mod tests {
             dtype: DType::Float32,
             shape: vec![1000, 200],
         };
-        let item = item_to_proto("array", &Item::Dataset(Arc::new(dataset))).expect("convert");
+        let item =
+            item_to_proto("array", &Item::Dataset(Arc::new(dataset)), Vec::new()).expect("convert");
 
         assert_eq!(item.name, "array");
         let Some(aex_proto::item::Data::Dataset(dataset)) = item.data else {
@@ -608,7 +643,7 @@ mod tests {
             dtype: DType::Int64,
             shape: vec![],
         };
-        let item = item_to_proto("array", &Item::Dataset(Arc::new(dataset))).unwrap();
+        let item = item_to_proto("array", &Item::Dataset(Arc::new(dataset)), Vec::new()).unwrap();
         let Some(aex_proto::item::Data::Dataset(dataset)) = item.data else {
             panic!("expected a dataset");
         };
@@ -618,9 +653,43 @@ mod tests {
 
     #[test]
     fn a_group_crosses_the_wire_as_a_group() {
-        let item = item_to_proto("/", &Item::Group).expect("convert");
+        let item = item_to_proto("/", &Item::Group, Vec::new()).expect("convert");
         assert_eq!(item.name, "/");
         assert!(matches!(item.data, Some(aex_proto::item::Data::Group(_))));
+    }
+
+    #[test]
+    fn attributes_cross_the_wire_in_order_and_by_kind() {
+        let attrs = vec![
+            (
+                "_FillValue".to_string(),
+                AttrValue::Array {
+                    dtype: DType::Int16,
+                    shape: vec![],
+                    data: vec![0xfd, 0xff],
+                },
+            ),
+            ("units".to_string(), AttrValue::Text("K".into())),
+        ];
+        let item = item_to_proto("/ds", &Item::Group, attrs).expect("convert");
+
+        assert_eq!(
+            item.attrs
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["_FillValue", "units"]
+        );
+        let Some(aex_proto::attribute::Value::Array(array)) = &item.attrs[0].value else {
+            panic!("expected an array");
+        };
+        assert_eq!(array.dtype, DType::Int16.as_i32());
+        assert!(array.shape.is_empty());
+        assert_eq!(array.data, vec![0xfd, 0xff]);
+        assert_eq!(
+            item.attrs[1].value,
+            Some(aex_proto::attribute::Value::Text("K".into()))
+        );
     }
 
     #[test]
@@ -631,7 +700,8 @@ mod tests {
             dtype: DType::Uint8,
             shape: vec![u64::MAX, 0],
         };
-        let err = item_to_proto("array", &Item::Dataset(Arc::new(dataset))).unwrap_err();
+        let err =
+            item_to_proto("array", &Item::Dataset(Arc::new(dataset)), Vec::new()).unwrap_err();
         assert_eq!(err.class(), aex_core::ErrorClass::Permanent);
     }
 

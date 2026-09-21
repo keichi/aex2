@@ -99,12 +99,36 @@ message Dataset {
 // A container. Empty: it exists to distinguish a group from a dataset.
 message Group {}
 
+// One attribute of a group or a dataset: units, _FillValue, coordinates, and
+// the netCDF global attributes, which live on the root group.
+message Attribute {
+    string name = 1;
+    oneof value {
+        // UTF-8. Fixed- and variable-length HDF5 strings both arrive here.
+        string text = 2;
+        AttrArray array = 3;
+    }
+}
+
+// A numeric attribute, carried as a dataset's bytes are: little-endian, C
+// order. The element type is the stored one, so a _FillValue keeps the dtype
+// of the variable it belongs to.
+message AttrArray {
+    DataType dtype = 1;
+    repeated int64 shape = 2;  // Empty for a scalar attribute
+    bytes data = 3;
+}
+
 message Item {
     string name = 1;
     oneof data {
         Dataset dataset = 2;
         Group group = 3;
     }
+    // Sorted by name. Repeated rather than a map, which has no order. An
+    // attribute of a type AEX cannot carry is left out, the way an unservable
+    // child is left out of a listing.
+    repeated Attribute attrs = 4;
 }
 
 message ItemList { repeated Item items = 1; }

@@ -7,7 +7,7 @@ from types import TracebackType
 from typing import Any, Self, TypeVar
 
 from . import _aex
-from .array_proxy import ArrayProxy
+from .array_proxy import ArrayProxy, _attrs_from_wire
 from .errors import AexNotFoundError, AexValueError
 
 __all__ = ["ArrayProxy", "Client", "FileProxy", "GroupProxy"]
@@ -78,12 +78,17 @@ class Client:
 
 
 def _proxy(
-    client: Client, handle: int, name: str, item: tuple[str, list[int]] | None
+    client: Client,
+    handle: int,
+    name: str,
+    item: tuple[str, list[int]] | None,
+    attrs: dict[str, Any],
 ) -> "ArrayProxy | GroupProxy":
+    decoded = _attrs_from_wire(attrs)
     if item is None:
-        return GroupProxy(client, handle, name)
+        return GroupProxy(client, handle, name, decoded)
     dtype, shape = item
-    return ArrayProxy(client, handle, name, dtype, tuple(shape))
+    return ArrayProxy(client, handle, name, dtype, tuple(shape), None, decoded)
 
 
 class GroupProxy(Mapping[str, "ArrayProxy | GroupProxy"]):
@@ -96,11 +101,26 @@ class GroupProxy(Mapping[str, "ArrayProxy | GroupProxy"]):
     and cost one request for the whole group rather than one per child.
     """
 
-    def __init__(self, client: Client, handle: int, name: str) -> None:
+    def __init__(
+        self, client: Client, handle: int, name: str, attrs: dict[str, Any] | None = None
+    ) -> None:
         self._client = client
         self._native = client._native
         self.handle = handle
         self.name = name
+        # Fetched on first use when whoever built this proxy had none.
+        self._attrs = attrs
+
+    @property
+    def attrs(self) -> dict[str, Any]:
+        """The group's HDF5/netCDF attributes.
+
+        The root group carries the netCDF global attributes. Empty for a format
+        without any.
+        """
+        if self._attrs is None:
+            self._attrs = _attrs_from_wire(self._native.get_item(self.handle, self.name)[1])
+        return self._attrs
 
     @staticmethod
     def _join_names(*names: str) -> str:
@@ -116,13 +136,13 @@ class GroupProxy(Mapping[str, "ArrayProxy | GroupProxy"]):
 
     def __getitem__(self, name: str) -> "ArrayProxy | GroupProxy":
         path = self._join_names(self.name, name)
-        return _proxy(self._client, self.handle, path, self._native.get_item(self.handle, path))
+        return _proxy(self._client, self.handle, path, *self._native.get_item(self.handle, path))
 
     def _children(self) -> dict[str, "ArrayProxy | GroupProxy"]:
         """Every child, built from one listing: it already carries the metadata."""
         return {
-            name: _proxy(self._client, self.handle, self._join_names(self.name, name), item)
-            for name, item in self._native.list_children(self.handle, self.name)
+            name: _proxy(self._client, self.handle, self._join_names(self.name, name), item, attrs)
+            for name, item, attrs in self._native.list_children(self.handle, self.name)
         }
 
     def values(self) -> ValuesView["ArrayProxy | GroupProxy"]:
@@ -134,7 +154,7 @@ class GroupProxy(Mapping[str, "ArrayProxy | GroupProxy"]):
         return self._children().items()
 
     def __iter__(self) -> Iterator[str]:
-        for name, _ in self._native.list_children(self.handle, self.name):
+        for name, _, _ in self._native.list_children(self.handle, self.name):
             yield name
 
     def __len__(self) -> int:

@@ -308,7 +308,15 @@ enum DataType {
 
 message Dataset { DataType dtype = 1; int32 ndim = 2; repeated int64 shape = 3; }
 message Group   {}
-message Item    { string name = 1; oneof data { Dataset dataset = 2; Group group = 3; } }
+
+message AttrArray { DataType dtype = 1; repeated int64 shape = 2; bytes data = 3; }
+message Attribute { string name = 1; oneof value { string text = 2; AttrArray array = 3; } }
+
+message Item {
+    string name = 1;
+    oneof data { Dataset dataset = 2; Group group = 3; }
+    repeated Attribute attrs = 4;  // 名前順
+}
 
 message OpenFileRequest  { bytes session_id = 1; string path = 2; string format = 3; }
 message OpenFileReply    { uint64 handle = 1; }
@@ -317,6 +325,8 @@ message GetItemRequest   { bytes session_id = 1; uint64 handle = 2; string name 
 message ListChildrenRequest { bytes session_id = 1; uint64 handle = 2; string name = 3; }
 message ItemList         { repeated Item items = 1; }
 ```
+
+**属性** はグループにもデータセットにも付くので `Item` に持たせる。`map` ではなく `repeated` なのは、`map` に順序が無いためである。数値は dtype と shape を付けて生バイトで運ぶ。`double` に丸めると `_FillValue` が変数と違う型で届き、CF の読み手が使えなくなる。表現できない型 (compound、enum、参照、文字列の配列) の属性は一覧から落とす (第 7.5 節)。
 
 **`.npy` の階層表現** は v1 と互換を保つ。ルートグループ `/` の下に単一データセット `array` が存在する。
 
@@ -966,11 +976,19 @@ pub trait ArrayFile: Send + Sync {
     fn contains(&self, path: &str) -> bool;
     fn get_item(&self, path: &str) -> Result<Item>;
     fn list_children(&self, path: &str) -> Result<Vec<(String, Item)>>;
+
+    /// パスに付いた属性。既定は空 (属性を持たない形式向け)
+    fn attrs(&self, _path: &str) -> Result<Vec<(String, AttrValue)>> { Ok(Vec::new()) }
 }
 
 pub enum Item {
     Dataset(Arc<dyn ArrayDataset>),
-    Group(Arc<dyn ArrayGroup>),
+    Group,  // 属性はパスに付くので、グループを trait object にする必要は無かった
+}
+
+pub enum AttrValue {
+    Text(String),
+    Array { dtype: DType, shape: Vec<u64>, data: Vec<u8> },  // little-endian, C 順
 }
 
 pub trait ArrayDataset: Send + Sync {
@@ -1160,6 +1178,10 @@ enum Storage {
 **dtype の対応づけ**: 整数・浮動小数 (half を含む)・h5py の bool (enum `FALSE=0, TRUE=1`)・h5py の複素数 (compound `r`, `i`) を第 7.2 節の `DataType` へ写す。1 バイトより大きいビッグエンディアンの型、文字列、その他の compound / enum / 参照は `UnsupportedDType` とする。HDF5 2.x のネイティブ複素数型は、`hdf5-metno` が型記述に変換できないため現状は拒否される。
 
 **階層表現**: HDF5 の階層をそのまま見せる。`list_children` は名前順で、配信できない子 (未対応 dtype、壊れたリンク、名前付き型) は一覧から除外する。1 個の文字列データセットのために兄弟全部が見えなくなるのを避けるためで、そのパスを直接 `get_item` すれば理由付きのエラーが返る。
+
+**属性**: `attr_names` (libhdf5 の名前索引なので既に名前順) で列挙し、1 個ずつ読む。数値は **属性自身の型のまま `H5Aread`** して生バイトを取る。dtype の対応づけが大端と非数値型を既に弾いているので、出てきたバイトがそのままワイヤの形になり、変換も型ごとの分岐も要らない。文字列は可変長なら `VarLenUnicode` / `VarLenAscii` として読み、**固定長は生バイトを読んで末尾の NUL を落とす**。libhdf5 は文字集合をまたぐ変換 (固定長 ASCII → 可変長 UTF-8) を拒否し、`FixedAscii<N>` は N がコンパイル時定数だからである。netCDF-4 はテキスト属性を固定長 ASCII で書くので、これが主経路になる。
+
+表現できない属性 (compound、enum、オブジェクト参照、opaque、文字列の配列) と、1 個で 64 KiB を超える属性は**黙って落とす**。配信できない子を一覧から外すのと同じ規約で、netCDF-4 の `DIMENSION_LIST` は参照なのでここで消える。`GetItem` と `ListChildren` のどちらも属性を付けて返す。xarray のような読み手は全変数の属性を見るので、変数ごとに 1 往復させたら意味が無い。一覧は子ごとにオブジェクトを開き直すが、メタデータのみでホットパスではない。
 
 **external link は辿らない。** external link はホスト上の任意のファイルを指せるため、辿るとパス制限 (データルート) の外を読めてしまう。最初のファイルを開く前に `H5Lunregister(H5L_TYPE_EXTERNAL)` でプロセス全体の external link を無効にする。soft link はファイル内に閉じるので辿る。
 
@@ -1411,7 +1433,13 @@ with Client("localhost:50051") as client:
 arr[..., 0]        # Ellipsis (v1 では失敗した)
 arr[:, None]       # np.newaxis (v1 では失敗した)
 arr[arr_mask]      # boolean mask (クライアント側で nonzero に展開)
+
+f.attrs            # netCDF のグローバル属性
+f["g1"].attrs      # グループの属性
+arr.attrs          # 変数の属性。units は str、_FillValue は変数と同じ dtype の numpy スカラ
 ```
+
+`.attrs` は `f[...]` や `for child in f` が作ったプロキシには既に載っているので往復ゼロで、`client.open()` が返す `FileProxy` だけが初回に 1 往復する。
 
 ### 10.3 追加 API (性能用)
 
@@ -1828,6 +1856,25 @@ SZ3 を値域の 0.1 % の誤差で掛けると 61.8 倍になる。
 桁を跨ぐ場では誤差の性質も違う: 同じ最大絶対誤差で、SZ3 が小さい値を相対で中央値
 17.8 % 壊すところを float16 は 0.40 % に保つ。
 
+### M10 属性
+
+- `Item.attrs` (`repeated Attribute`)、HDF5 の属性読み出し、`ArrayFile::attrs`
+- `GroupProxy.attrs` / `ArrayProxy.attrs` / `FileProxy.attrs`
+
+**完了条件**: データセット・グループ・netCDF のグローバル属性が Python に届き、
+`_FillValue` が変数と同じ dtype で読める
+
+**完了**。`Item::Group` を trait object にせずに済んだ ── 属性はアイテムではなく
+パスに付くので、`ArrayFile` に既定実装つきのメソッドを 1 本足すだけで、他の
+バックエンドは無変更のままになった。libnetcdf 4.9.3 が書いたファイルで、
+グローバル属性・グループ属性・変数の属性がすべて h5py と一致することを確認した。
+
+**次元名はまだ出ていないが、参照を復号しなくても出せる**。libnetcdf は次元ごとに
+必ずデータセットを作り (座標変数が無い次元も `CLASS=DIMENSION_SCALE` と
+`_Netcdf4Dimid` を持つ)、変数側は `_Netcdf4Coordinates` に次元 id を順番どおり
+持つ。`DIMENSION_LIST` (オブジェクト参照) を読む必要はなく、id から同じ
+`_Netcdf4Dimid` を持つデータセットを引いてその名前を取ればよい。
+
 ---
 
 ## 14. 未決事項・将来課題
@@ -1848,6 +1895,8 @@ SZ3 を値域の 0.1 % の誤差で掛けると 61.8 倍になる。
 | ~~間引き (SUBSAMPLE)~~ | 実装しない。`arr[::2]` が同じバイト列を既に頼めるので、増えるのは「ストライドを決めるのがどちらか」だけ。実データでは同じ誤差で SZ3 に圧縮率で桁違いに負ける | — | — |
 | ~~ZFP~~ | SZ3 の後に実装済み (第 5.5.1 節)。枠の見積りどおり `Codec` の値 1 つ・feature 1 つ・モジュール 1 つ・`match` の腕 2 つで載った | — | — |
 | ZFP・SZ3 以外の誤差上限付きアルゴリズム | 2 つあれば比較はできる。libpressio の Rust バインディングは未公開のままで、今も使えない | `Codec` の値 1 つと `codec::compress` / `decompress_into` の腕 1 つ | この 2 つで物足りないと分かった時点 |
+| ワイヤ形を持たない属性型 (compound / enum / 参照 / 文字列の配列) と属性の書き込み | 読み出しの read-only で用途は足りる。落ちる参照は netCDF-4 の `DIMENSION_LIST` だが、次元名は `_Netcdf4Coordinates` と `_Netcdf4Dimid` から参照なしで組めるので、これが止めているものは無い | `Attribute.value` の oneof に腕を 1 つ足せばよい | 実データで compound の属性に当たった時点 |
+| 変数の次元名 (`Dataset.dims`) | 属性だけでは xarray は変数の軸を名前で呼べない。クライアント側で組み立てるか、サーバが `Dataset` に載せるかを決めていない | `Dataset` にフィールドを 1 つ、または既に届いている属性からクライアントで導出 | xarray バックエンドに着手する時点 |
 | TLS | 「信頼できる環境」前提。暗号化すると受信側のゼロコピーが成立しなくなる | HELLO の `flags` にネゴシエーションビットを予約 | 公開運用を検討する時点 |
 | 書き込み (`DoPut` 相当) | read-only で研究目的は達成できる | フレーム種別の未使用値 (0x04、0x07 以降)。`FETCH` と対になる `PUSH` を追加可能 | 要望が出た時点 |
 | ~~密な選択に対する一括 pread + 集約~~ | M4 の測定で律速と判明し実装済み (隙間 4 KiB 以下の断片を最大 1 MiB の窓で一括読み)。[docs/benchmark-m4.md](docs/benchmark-m4.md) | — | — |

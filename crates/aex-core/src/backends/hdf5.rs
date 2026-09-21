@@ -23,10 +23,10 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 use hdf5::dataset::{FillValue, Layout};
 use hdf5::datatype::ByteOrder;
 use hdf5::filters::Filter;
-use hdf5::types::{CompoundType, FloatSize, IntSize, TypeDescriptor};
+use hdf5::types::{CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenAscii, VarLenUnicode};
 use hdf5::LocationType;
 
-use crate::backend::{normalize_path, ArrayDataset, ArrayFile, Item};
+use crate::backend::{normalize_path, ArrayDataset, ArrayFile, AttrValue, Item};
 use crate::backends::decode_cache::DecodeCache;
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
@@ -146,6 +146,107 @@ impl ArrayFile for Hdf5File {
         }
         Ok(children)
     }
+
+    fn attrs(&self, path: &str) -> Result<Vec<(String, AttrValue)>> {
+        let path = normalize_path(path);
+        // The root group is where netCDF keeps the global attributes.
+        if path.is_empty() {
+            return read_attrs(&self.file);
+        }
+        let info = self
+            .file
+            .loc_info_by_name(path)
+            .map_err(|_| AexError::NotFound(path.to_string()))?;
+        match info.loc_type {
+            LocationType::Group => {
+                let group = self.file.group(path)?;
+                read_attrs(&group)
+            }
+            LocationType::Dataset => {
+                let dataset = self.file.dataset(path)?;
+                read_attrs(&dataset)
+            }
+            other => Err(AexError::NotFound(format!(
+                "{path:?} is a {other:?}, not a group or a dataset"
+            ))),
+        }
+    }
+}
+
+/// Bigger than this and one attribute could push a listing past the gRPC
+/// message limit, since a listing carries every child's attributes.
+// ponytail: a flat per-attribute cap rather than a budget for the whole reply.
+// Real netCDF attributes are tens of bytes.
+const MAX_ATTR_BYTES: u64 = 64 << 10;
+
+/// Every attribute of an object that AEX can represent.
+///
+/// libhdf5 iterates the name index in increasing order, so the result is
+/// already sorted; unlike `member_names`, this needs no sort of its own.
+fn read_attrs(location: &hdf5::Location) -> Result<Vec<(String, AttrValue)>> {
+    let mut attrs = Vec::new();
+    for name in location.attr_names()? {
+        // A type with no wire form leaves the attribute out, the way an
+        // unservable child is left out of a listing.
+        if let Ok(attr) = location.attr(&name) {
+            if let Some(value) = attr_value(&attr) {
+                attrs.push((name, value));
+            }
+        }
+    }
+    Ok(attrs)
+}
+
+/// One attribute, or `None` if AEX has no way to carry it.
+fn attr_value(attr: &hdf5::Attribute) -> Option<AttrValue> {
+    let datatype = attr.dtype().ok()?;
+    let shape: Vec<u64> = attr.shape().iter().map(|&n| n as u64).collect();
+    // A scalar dataspace has no axes and holds one element.
+    let elements: u64 = shape.iter().product();
+    match datatype.to_descriptor().ok()? {
+        // One string per attribute: an array of them has no wire form.
+        TypeDescriptor::VarLenUnicode if elements == 1 => {
+            let mut read = attr.read_raw::<VarLenUnicode>().ok()?;
+            Some(AttrValue::Text(read.pop()?.as_str().to_owned()))
+        }
+        TypeDescriptor::VarLenAscii if elements == 1 => {
+            let mut read = attr.read_raw::<VarLenAscii>().ok()?;
+            Some(AttrValue::Text(read.pop()?.as_str().to_owned()))
+        }
+        // How netCDF-4 writes text, so this is the common case rather than the
+        // odd one. The bytes are taken as they are stored: libhdf5 refuses to
+        // convert between character sets, and `FixedAscii` wants its length at
+        // compile time, so neither route to a variable-length string exists.
+        TypeDescriptor::FixedAscii(len) | TypeDescriptor::FixedUnicode(len) if elements == 1 => {
+            let raw = read_raw(attr, &datatype, len as u64)?;
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            Some(AttrValue::Text(
+                std::str::from_utf8(&raw[..end]).ok()?.to_owned(),
+            ))
+        }
+        // Compound, enum, references, opaque and arrays of strings land here
+        // and are refused by `dtype_of`.
+        _ => {
+            let dtype = dtype_of(&datatype).ok()?;
+            let data = read_raw(attr, &datatype, dtype.itemsize().checked_mul(elements)?)?;
+            Some(AttrValue::Array { dtype, shape, data })
+        }
+    }
+}
+
+/// `len` bytes of an attribute, asked for in its own type.
+///
+/// No conversion, so the bytes are what storage holds. `dtype_of` has already
+/// refused anything but little-endian numbers, which is what the wire wants.
+fn read_raw(attr: &hdf5::Attribute, datatype: &hdf5::Datatype, len: u64) -> Option<Vec<u8>> {
+    if len > MAX_ATTR_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; usize::try_from(len).ok()?];
+    let status = hdf5::sync::sync(|| unsafe {
+        hdf5_sys::h5a::H5Aread(attr.id(), datatype.id(), buf.as_mut_ptr().cast())
+    });
+    (status >= 0).then_some(buf)
 }
 
 /// Where a dataset's bytes are.
@@ -714,7 +815,7 @@ fn disable_external_links() {
 
 #[cfg(test)]
 mod tests {
-    use hdf5::types::VarLenUnicode;
+    use hdf5::types::{FixedAscii, VarLenUnicode};
     use num_complex::{Complex32, Complex64};
 
     use super::*;
@@ -1286,6 +1387,138 @@ mod tests {
         // A trailing partial element is left in place.
         assert_eq!(unshuffle(&[1, 3, 2, 4, 9], 2), [1, 2, 3, 4, 9]);
         assert!(inflate(b"not zlib", 10).is_none());
+    }
+
+    /// Write a scalar attribute of type `T` on `location`.
+    fn attr<T: hdf5::H5Type>(location: &hdf5::Location, name: &str, value: T) {
+        location
+            .new_attr::<T>()
+            .create(name)
+            .unwrap()
+            .write_scalar(&value)
+            .unwrap();
+    }
+
+    fn text(value: &str) -> VarLenUnicode {
+        value.parse().unwrap()
+    }
+
+    #[test]
+    fn attributes_keep_their_text_and_their_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.h5");
+        let h5 = hdf5::File::create(&path).unwrap();
+        let ds = h5.new_dataset::<i16>().shape([4]).create("ds").unwrap();
+        // Named out of alphabetical order, to pin that the order comes back sorted.
+        attr(&ds, "units", text("K"));
+        // How netCDF-4 writes text: fixed-length ASCII, shorter than its type.
+        attr(
+            &ds,
+            "long_name",
+            FixedAscii::<16>::from_ascii("temperature").unwrap(),
+        );
+        attr(&ds, "_FillValue", -3i16);
+        ds.new_attr::<f64>()
+            .shape([2])
+            .create("valid_range")
+            .unwrap()
+            .write_raw(&[0.0f64, 1.0])
+            .unwrap();
+        drop(h5);
+
+        let file = open(&path).unwrap();
+        let attrs = file.attrs("/ds").unwrap();
+        assert_eq!(
+            attrs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["_FillValue", "long_name", "units", "valid_range"]
+        );
+        let value = |name: &str| attrs.iter().find(|(n, _)| n == name).unwrap().1.clone();
+        assert_eq!(value("units"), AttrValue::Text("K".into()));
+        // The padding of the fixed-length type does not come with it.
+        assert_eq!(value("long_name"), AttrValue::Text("temperature".into()));
+        // A _FillValue keeps the dtype of its dataset rather than widening.
+        assert_eq!(
+            value("_FillValue"),
+            AttrValue::Array {
+                dtype: DType::Int16,
+                shape: vec![],
+                data: bytes_of(&[-3i16]),
+            }
+        );
+        assert_eq!(
+            value("valid_range"),
+            AttrValue::Array {
+                dtype: DType::Float64,
+                shape: vec![2],
+                data: bytes_of(&[0.0f64, 1.0]),
+            }
+        );
+    }
+
+    #[test]
+    fn groups_and_the_root_carry_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.h5");
+        let h5 = hdf5::File::create(&path).unwrap();
+        // netCDF keeps its global attributes on the root group.
+        attr(&h5, "Conventions", text("CF-1.8"));
+        let g = h5.create_group("g").unwrap();
+        attr(&g, "title", text("a group"));
+        drop(h5);
+
+        let file = open(&path).unwrap();
+        for root in ["", "/", "//"] {
+            assert_eq!(
+                file.attrs(root).unwrap(),
+                [("Conventions".to_string(), AttrValue::Text("CF-1.8".into()))]
+            );
+        }
+        assert_eq!(
+            file.attrs("/g").unwrap(),
+            [("title".to_string(), AttrValue::Text("a group".into()))]
+        );
+        assert!(matches!(file.attrs("/nope"), Err(AexError::NotFound(_))));
+    }
+
+    #[test]
+    fn an_attribute_with_no_wire_form_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.h5");
+        let h5 = hdf5::File::create(&path).unwrap();
+        let ds = h5.new_dataset::<i16>().shape([4]).create("ds").unwrap();
+        attr(&ds, "units", text("K"));
+        // An array of strings: one attribute cannot carry several of them.
+        ds.new_attr::<VarLenUnicode>()
+            .shape([2])
+            .create("flag_meanings")
+            .unwrap()
+            .write_raw(&[text("a"), text("b")])
+            .unwrap();
+        // A compound type has no dtype of ours, unless it is a complex number.
+        attr(&ds, "pair", Pair { a: 1, b: 2.0 });
+        // Over the per-attribute cap. An attribute this big does not fit a
+        // default object header, and libhdf5 1.14 refuses to create one at
+        // all, so the cap goes unexercised wherever that is the case rather
+        // than failing a test over the writer's limits.
+        let huge = MAX_ATTR_BYTES as usize + 1;
+        if let Ok(attr) = ds.new_attr::<u8>().shape([huge]).create("huge") {
+            attr.write_raw(&vec![0u8; huge]).unwrap();
+        }
+        drop(h5);
+
+        let file = open(&path).unwrap();
+        // The siblings we can carry survive the ones we cannot.
+        assert_eq!(
+            file.attrs("/ds").unwrap(),
+            [("units".to_string(), AttrValue::Text("K".into()))]
+        );
+    }
+
+    #[derive(hdf5::H5Type, Clone, Copy)]
+    #[repr(C)]
+    struct Pair {
+        a: i32,
+        b: f64,
     }
 
     #[test]

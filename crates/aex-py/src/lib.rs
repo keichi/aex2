@@ -8,8 +8,8 @@
 use std::sync::{Arc, RwLock};
 
 use aex_client::{
-    resolve_selection, AexError, ClientConfig, ClientError, Codec, DType, Encoding, ErrorClass,
-    FileHandle, FunctionArg, Index, Item, QualitySpec, Selection,
+    resolve_selection, AexError, AttrValue, ClientConfig, ClientError, Codec, DType, Encoding,
+    ErrorClass, FileHandle, FunctionArg, Index, Item, QualitySpec, Selection,
 };
 use half::f16;
 use numpy::{
@@ -188,30 +188,34 @@ impl Client {
         self.call(py, |c| c.close(FileHandle::from_u64(handle)))
     }
 
-    /// `(dtype, shape)` for a dataset, `None` for a group.
-    fn get_item(
+    /// `((dtype, shape), attrs)` for a dataset, `(None, attrs)` for a group.
+    #[allow(clippy::type_complexity)]
+    fn get_item<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         handle: u64,
         name: String,
-    ) -> PyResult<Option<(&'static str, Vec<u64>)>> {
+    ) -> PyResult<(Option<(&'static str, Vec<u64>)>, Bound<'py, PyDict>)> {
         let item = self.call(py, |c| c.get_item(FileHandle::from_u64(handle), &name))?;
-        Ok(item_to_py(item))
+        item_to_py(py, item)
     }
 
-    /// `(name, item)` for each child, with items as in `get_item`.
+    /// `(name, item, attrs)` for each child, with items as in `get_item`.
     #[allow(clippy::type_complexity)]
-    fn list_children(
+    fn list_children<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         handle: u64,
         name: String,
-    ) -> PyResult<Vec<(String, Option<(&'static str, Vec<u64>)>)>> {
+    ) -> PyResult<Vec<(String, Option<(&'static str, Vec<u64>)>, Bound<'py, PyDict>)>> {
         let children = self.call(py, |c| c.list_children(FileHandle::from_u64(handle), &name))?;
-        Ok(children
+        children
             .into_iter()
-            .map(|(name, item)| (name, item_to_py(item)))
-            .collect())
+            .map(|(name, item)| {
+                let (item, attrs) = item_to_py(py, item)?;
+                Ok((name, item, attrs))
+            })
+            .collect()
     }
 
     /// Resolve a selection. `key` is a tuple of int, slice, `...`, `None` and
@@ -390,11 +394,33 @@ impl Client {
     }
 }
 
-fn item_to_py(item: Item) -> Option<(&'static str, Vec<u64>)> {
-    match item {
-        Item::Dataset(info) => Some((info.dtype.descr(), info.shape)),
-        Item::Group => None,
+#[allow(clippy::type_complexity)]
+fn item_to_py(
+    py: Python<'_>,
+    item: Item,
+) -> PyResult<(Option<(&'static str, Vec<u64>)>, Bound<'_, PyDict>)> {
+    Ok(match item {
+        Item::Dataset(info) => (
+            Some((info.dtype.descr(), info.shape)),
+            attrs_to_py(py, info.attrs)?,
+        ),
+        Item::Group(attrs) => (None, attrs_to_py(py, attrs)?),
+    })
+}
+
+/// Attributes as Python sees them: text as a `str`, numbers as the
+/// `(descr, shape, bytes)` that `aex.array_proxy` turns into numpy.
+fn attrs_to_py(py: Python<'_>, attrs: Vec<(String, AttrValue)>) -> PyResult<Bound<'_, PyDict>> {
+    let dict = PyDict::new(py);
+    for (name, value) in attrs {
+        match value {
+            AttrValue::Text(text) => dict.set_item(name, text)?,
+            AttrValue::Array { dtype, shape, data } => {
+                dict.set_item(name, (dtype.descr(), shape, PyBytes::new(py, &data)))?
+            }
+        }
     }
+    Ok(dict)
 }
 
 fn function_arg(value: &Bound<'_, PyAny>) -> PyResult<FunctionArg> {

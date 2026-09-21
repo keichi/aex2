@@ -17,7 +17,11 @@ fn metadata_makes_the_round_trip() {
     let handle = client.open("ocean.npy").expect("open");
 
     // The hierarchy v1 exposed: a root group holding one dataset.
-    assert_eq!(client.get_item(handle, "/").expect("root"), Item::Group);
+    // A `.npy` has no attributes, so the root group arrives with none.
+    assert_eq!(
+        client.get_item(handle, "/").expect("root"),
+        Item::Group(Vec::new())
+    );
     let Item::Dataset(info) = client.get_item(handle, "array").expect("array") else {
         panic!("array must be a dataset");
     };
@@ -151,7 +155,7 @@ fn files_are_independent_of_each_other() {
 
     let shape = |handle| match client.get_item(handle, "array").unwrap() {
         Item::Dataset(info) => info.shape,
-        Item::Group => panic!("expected a dataset"),
+        Item::Group(_) => panic!("expected a dataset"),
     };
     assert_eq!(shape(a), vec![10]);
     assert_eq!(shape(b), vec![2, 3]);

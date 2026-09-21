@@ -28,6 +28,31 @@ pub trait ArrayFile: Send + Sync {
 
     /// The children of the group at `path`, in a stable order.
     fn list_children(&self, path: &str) -> Result<Vec<(String, Item)>>;
+
+    /// The attributes of the item at `path`, sorted by name.
+    ///
+    /// The default is right for a format that has none. An attribute whose type
+    /// has no wire form is left out rather than reported as an error, the way
+    /// an unservable child is left out of a listing.
+    fn attrs(&self, _path: &str) -> Result<Vec<(String, AttrValue)>> {
+        Ok(Vec::new())
+    }
+}
+
+/// The value of an attribute: text, or numbers as the wire carries them.
+///
+/// Numbers keep their stored element type so that a `_FillValue` has the dtype
+/// of the variable it belongs to, which is what a CF reader expects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttrValue {
+    Text(String),
+    Array {
+        dtype: DType,
+        /// Empty for a scalar attribute.
+        shape: Vec<u64>,
+        /// Little-endian, C order.
+        data: Vec<u8>,
+    },
 }
 
 /// What lives at a path in a file.
@@ -35,8 +60,9 @@ pub trait ArrayFile: Send + Sync {
 pub enum Item {
     Dataset(Arc<dyn ArrayDataset>),
     /// A container. It carries no data of its own, which is why this is a unit
-    /// variant: nothing yet distinguishes one group from another. A format with
-    /// group attributes would turn it into a trait object like `Dataset`.
+    /// variant: nothing yet distinguishes one group from another. Attributes
+    /// did not change that, since they hang off a path rather than off an item
+    /// (see `ArrayFile::attrs`).
     Group,
 }
 

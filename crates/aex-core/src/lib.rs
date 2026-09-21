@@ -17,7 +17,7 @@ pub mod quality;
 pub mod reduce;
 pub mod selection;
 
-pub use backend::{ArrayDataset, ArrayFile, Item};
+pub use backend::{ArrayDataset, ArrayFile, AttrValue, Item};
 #[cfg(feature = "hdf5")]
 pub use backends::decode_cache::DecodeCache;
 #[cfg(feature = "hdf5")]
