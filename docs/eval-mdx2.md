@@ -95,8 +95,14 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/mem-gzip.h5` | 同じ中身を 4 MiB チャンク・shuffle + gzip 1 で圧縮 (約 1 %) | `... mem-gzip.h5 1073741824 gzip counting` |
 | `/mnt/aexram/mem-gzip-noisy.h5` | 圧縮の効きにくい中身 (`i % 1000` + 0〜15 の乱数) を同じ設定で圧縮。`--pattern none` で読む | `... mem-gzip-noisy.h5 1073741824 gzip noisy` |
 | `/mnt/aexram/wave.npy` | 1 GiB、131072 × 2048 の float32。滑らかな場 + 下位ビットの雑音で、誤差保証圧縮の測定用。`--pattern none` で読む | `target/release/mknpy /mnt/aexram/wave.npy 268435456 --row-elements 2048 --field wave` |
+| `/mnt/aexram/mem.zarr` | `mem.npy` と同じ中身の Zarr v3。4 MiB チャンク 1024 個 = **ファイル 1024 個**、既定の zstd | `.venv/bin/python benchmarks/mdx2/mkzarr.py /mnt/aexram/mem.zarr 1073741824 plain counting` |
+| `/mnt/aexram/mem-shard.zarr` | 同じチャンクを 256 MiB の shard に束ねたもの = **ファイル 16 個** | `... mem-shard.zarr 1073741824 sharded counting` |
+| `/mnt/aexram/mem-noisy.zarr` | 圧縮の効きにくい中身を `plain` で。`--pattern none` で読む | `... mem-noisy.zarr 1073741824 plain noisy` |
 
-- `mknpy` の第 2 引数はバイト数ではなく**要素数**
+- `mknpy` と `mkzarr.py` の第 2 引数はバイト数ではなく**要素数**
+- Zarr のフィクスチャには `.venv` に `zarr>=3` が要る (`uv pip install 'zarr>=3'`)。
+  `plain` と `sharded` の対は**ファイル数だけが違う**ので、転送のホットパスに乗る
+  `open` の回数が効くかどうかがそのまま出る
 - `wave.npy` だけ 1 GiB なのは tmpfs の空き容量の都合である (HDF5 のフィクスチャで
   86 % 埋まっている)。`sz-sweep.sh` と `zfp-sweep.sh` は 1 点 1 GiB なので、これで足りる
 - 誤差保証圧縮を測るときは、サーバもクライアントもコーデックの feature 付きで
