@@ -2,6 +2,9 @@
 
 Every exception carries ``error_class``, the server's classification, so code
 can branch on it without parsing messages.
+
+Each one also inherits the standard exception that fits it, so ``except
+ConnectionError`` and the usual retry wrappers catch aex errors too.
 """
 
 
@@ -12,16 +15,21 @@ class AexError(Exception):
         super().__init__(message)
         self.error_class = error_class
 
+    @property
+    def is_retryable(self) -> bool:
+        """Whether retrying the same request could succeed."""
+        return self.error_class == "TRANSIENT"
+
 
 class AexProtocolError(AexError):
     """The two sides disagree about the protocol. A bug on one of them."""
 
 
-class AexConnectionError(AexError):
+class AexConnectionError(AexError, ConnectionError):
     """The server could not be reached, or refused the session."""
 
 
-class AexTransferError(AexError):
+class AexTransferError(AexError, OSError):
     """A transfer failed on the server's side."""
 
 
