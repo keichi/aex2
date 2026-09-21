@@ -413,12 +413,12 @@ impl ZarrArray {
                     let key = self.key_of(grid, chunk as u64, &mut coords);
                     let decoded =
                         self.cache
-                            .get_or_decode((self.cache_key, chunk as u64), || {
+                            .get_or_decode((self.cache_key, chunk as u64), |spare| {
                                 let Some(path) = self.root.under(&key)? else {
-                                    return Ok(self.fill_chunk(grid.chunk_bytes()));
+                                    return Ok(self.fill_chunk(grid.chunk_bytes(), spare));
                                 };
                                 let bytes = std::fs::read(&path)?;
-                                undo(&key, codecs, bytes, grid.chunk_bytes())
+                                undo(&key, codecs, bytes, grid.chunk_bytes(), spare)
                             })?;
                     let start = start as usize;
                     out.copy_from_slice(&decoded[start..start + out.len()]);
@@ -434,17 +434,23 @@ impl ZarrArray {
                     let key = self.key_of(&sharded.shards, shard as u64, &mut Vec::new());
                     sharded.inner.walk(in_shard, out, |chunk, start, out| {
                         let n = shard as u64 * per_shard + chunk as u64;
-                        let decoded = self.cache.get_or_decode((self.cache_key, n), || {
+                        let decoded = self.cache.get_or_decode((self.cache_key, n), |spare| {
                             let entry = index[n as usize];
                             if entry.is_missing() {
-                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes()));
+                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
                             }
                             let Some(path) = self.root.under(&key)? else {
-                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes()));
+                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
                             };
                             let mut bytes = vec![0u8; entry.nbytes as usize];
                             File::open(&path)?.read_exact_at(&mut bytes, entry.offset)?;
-                            undo(&key, &sharded.codecs, bytes, sharded.inner.chunk_bytes())
+                            undo(
+                                &key,
+                                &sharded.codecs,
+                                bytes,
+                                sharded.inner.chunk_bytes(),
+                                spare,
+                            )
                         })?;
                         let start = start as usize;
                         out.copy_from_slice(&decoded[start..start + out.len()]);
@@ -458,27 +464,45 @@ impl ZarrArray {
     /// A whole chunk of the fill value, for one that was never written.
     // ponytail: the fill chunk is cached like any other, so a sparse array can
     // evict real chunks. Keep one shared all-fill chunk if that shows up.
-    fn fill_chunk(&self, chunk_bytes: u64) -> Vec<u8> {
-        let mut chunk = vec![0u8; chunk_bytes as usize];
+    fn fill_chunk(&self, chunk_bytes: u64, mut chunk: Vec<u8>) -> Vec<u8> {
+        // A lent buffer is already this long, so this zeroes nothing.
+        chunk.resize(chunk_bytes as usize, 0);
         fill_from(&self.fill, 0, &mut chunk);
         chunk
     }
 }
 
 /// Undo a chunk's codecs, which are listed in the order they were applied.
-fn undo(key: &str, codecs: &[ChunkCodec], mut bytes: Vec<u8>, chunk_bytes: u64) -> Result<Vec<u8>> {
+///
+/// `spare` is the buffer the cache lent. An expanding codec writes into it and
+/// then swaps, so what it read from becomes the spare for the step after; the
+/// usual chain has one such codec, and its output is the buffer that is kept.
+fn undo(
+    key: &str,
+    codecs: &[ChunkCodec],
+    mut bytes: Vec<u8>,
+    chunk_bytes: u64,
+    mut spare: Vec<u8>,
+) -> Result<Vec<u8>> {
     let malformed = |what: String| AexError::MalformedZarr(format!("chunk {key}: {what}"));
     for codec in codecs.iter().rev() {
-        bytes = match codec {
-            ChunkCodec::Gzip => ungzip(&bytes, chunk_bytes).ok_or_else(|| {
-                malformed("the gzip stream does not expand to a chunk".to_string())
-            })?,
-            ChunkCodec::Zstd => zstd::bulk::decompress(&bytes, chunk_bytes as usize)
-                .map_err(|e| malformed(format!("zstd: {e}")))?,
-            ChunkCodec::Crc32c => {
-                strip_crc32c(bytes).ok_or_else(|| malformed("CRC-32C mismatch".to_string()))?
+        match codec {
+            ChunkCodec::Gzip => {
+                ungzip(&bytes, chunk_bytes, &mut spare).ok_or_else(|| {
+                    malformed("the gzip stream does not expand to a chunk".to_string())
+                })?;
+                std::mem::swap(&mut bytes, &mut spare);
             }
-        };
+            ChunkCodec::Zstd => {
+                unzstd(&bytes, chunk_bytes, &mut spare)
+                    .map_err(|e| malformed(format!("zstd: {e}")))?;
+                std::mem::swap(&mut bytes, &mut spare);
+            }
+            ChunkCodec::Crc32c => {
+                bytes =
+                    strip_crc32c(bytes).ok_or_else(|| malformed("CRC-32C mismatch".to_string()))?;
+            }
+        }
     }
     if bytes.len() as u64 != chunk_bytes {
         return Err(malformed(format!(
@@ -922,14 +946,25 @@ fn parse_codecs(prefix: &str, codecs: &[Named]) -> Result<Vec<ChunkCodec>> {
     Ok(chain)
 }
 
-/// Undo gzip, refusing to produce more than `limit` bytes.
-fn ungzip(bytes: &[u8], limit: u64) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(limit as usize);
+/// Undo gzip into `out`, refusing to produce more than `limit` bytes.
+fn ungzip(bytes: &[u8], limit: u64, out: &mut Vec<u8>) -> Option<()> {
+    out.clear();
+    out.reserve(limit as usize);
     flate2::read::GzDecoder::new(bytes)
         .take(limit + 1)
-        .read_to_end(&mut out)
+        .read_to_end(out)
         .ok()?;
-    Some(out)
+    Some(())
+}
+
+/// Undo zstd into `out`. The destination is one chunk, so a stream claiming to
+/// expand further fails rather than growing the buffer.
+fn unzstd(bytes: &[u8], chunk_bytes: u64, out: &mut Vec<u8>) -> std::io::Result<()> {
+    // A lent buffer is already this long, so this zeroes nothing.
+    out.resize(chunk_bytes as usize, 0);
+    let written = zstd::bulk::decompress_to_buffer(bytes, out.as_mut_slice())?;
+    out.truncate(written);
+    Ok(())
 }
 
 /// Drop the trailing CRC-32C, if it is the one the rest of the bytes have.

@@ -523,8 +523,8 @@ impl Chunked {
             } else {
                 let decoded = self
                     .cache
-                    .get_or_decode((self.cache_key, chunk as u64), || {
-                        self.decode(&dataset.raw, entry)
+                    .get_or_decode((self.cache_key, chunk as u64), |spare| {
+                        self.decode(&dataset.raw, entry, spare)
                     })?;
                 let start = start as usize;
                 out.copy_from_slice(&decoded[start..start + out.len()]);
@@ -534,7 +534,11 @@ impl Chunked {
     }
 
     /// Read one chunk and undo its filters.
-    fn decode(&self, raw: &File, entry: ChunkEntry) -> Result<Vec<u8>> {
+    ///
+    /// `spare` is the buffer the cache lent. A filter that produces a new
+    /// buffer writes into it and then swaps, so the last one to run leaves its
+    /// output there and that is what the cache keeps.
+    fn decode(&self, raw: &File, entry: ChunkEntry, mut spare: Vec<u8>) -> Result<Vec<u8>> {
         let malformed =
             |what: &str| AexError::MalformedHdf5(format!("chunk at byte {}: {what}", entry.addr));
         let mut bytes = vec![0u8; entry.size as usize];
@@ -543,14 +547,22 @@ impl Chunked {
             if entry.filter_mask & (1 << i) != 0 {
                 continue;
             }
-            bytes = match filter {
-                Filter::Fletcher32 => strip_fletcher32(bytes)
-                    .ok_or_else(|| malformed("fletcher32 checksum mismatch"))?,
-                Filter::Deflate(_) => inflate(&bytes, self.grid.chunk_bytes())
-                    .ok_or_else(|| malformed("deflate stream is corrupt"))?,
-                Filter::Shuffle => unshuffle(&bytes, self.grid.itemsize() as usize),
+            match filter {
+                Filter::Fletcher32 => {
+                    bytes = strip_fletcher32(bytes)
+                        .ok_or_else(|| malformed("fletcher32 checksum mismatch"))?;
+                }
+                Filter::Deflate(_) => {
+                    inflate(&bytes, self.grid.chunk_bytes(), &mut spare)
+                        .ok_or_else(|| malformed("deflate stream is corrupt"))?;
+                    std::mem::swap(&mut bytes, &mut spare);
+                }
+                Filter::Shuffle => {
+                    unshuffle(&bytes, self.grid.itemsize() as usize, &mut spare);
+                    std::mem::swap(&mut bytes, &mut spare);
+                }
                 other => unreachable!("{other:?} was rejected when the dataset was opened"),
-            };
+            }
         }
         if bytes.len() as u64 != self.grid.chunk_bytes() {
             return Err(malformed(&format!(
@@ -563,21 +575,25 @@ impl Chunked {
     }
 }
 
-/// Undo zlib, refusing to produce more than `limit` bytes.
-fn inflate(bytes: &[u8], limit: u64) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(limit as usize);
+/// Undo zlib into `out`, refusing to produce more than `limit` bytes.
+fn inflate(bytes: &[u8], limit: u64, out: &mut Vec<u8>) -> Option<()> {
+    out.clear();
+    out.reserve(limit as usize);
     flate2::read::ZlibDecoder::new(bytes)
         .take(limit + 1)
-        .read_to_end(&mut out)
+        .read_to_end(out)
         .ok()?;
-    Some(out)
+    Some(())
 }
 
-/// Undo HDF5's shuffle: byte `b` of every element was moved to block `b`.
-fn unshuffle(bytes: &[u8], itemsize: usize) -> Vec<u8> {
-    let elements = bytes.len() / itemsize;
-    let mut out = bytes.to_vec();
+/// Undo HDF5's shuffle into `out`: byte `b` of every element was moved to
+/// block `b`. Whatever the permutation leaves untouched is the input itself,
+/// so `out` starts as a copy of it.
+fn unshuffle(bytes: &[u8], itemsize: usize, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(bytes);
     if itemsize > 1 {
+        let elements = bytes.len() / itemsize;
         for b in 0..itemsize {
             let block = &bytes[b * elements..(b + 1) * elements];
             for (e, &byte) in block.iter().enumerate() {
@@ -585,7 +601,6 @@ fn unshuffle(bytes: &[u8], itemsize: usize) -> Vec<u8> {
             }
         }
     }
-    out
 }
 
 /// Check and drop the trailing checksum HDF5's fletcher32 filter appends.
@@ -1281,11 +1296,14 @@ mod tests {
     fn filters_undo_what_libhdf5_does() {
         // Two words and an odd byte.
         assert_eq!(fletcher32(&[0x01, 0x02, 0x03, 0x04, 0x05]), 0x0e0e_0906);
-        let shuffled = [1, 3, 5, 2, 4, 6];
-        assert_eq!(unshuffle(&shuffled, 2), [1, 2, 3, 4, 5, 6]);
-        // A trailing partial element is left in place.
-        assert_eq!(unshuffle(&[1, 3, 2, 4, 9], 2), [1, 2, 3, 4, 9]);
-        assert!(inflate(b"not zlib", 10).is_none());
+        let mut out = Vec::new();
+        unshuffle(&[1, 3, 5, 2, 4, 6], 2, &mut out);
+        assert_eq!(out, [1, 2, 3, 4, 5, 6]);
+        // A trailing partial element is left in place, and the buffer is
+        // reused rather than grown.
+        unshuffle(&[1, 3, 2, 4, 9], 2, &mut out);
+        assert_eq!(out, [1, 2, 3, 4, 9]);
+        assert!(inflate(b"not zlib", 10, &mut out).is_none());
     }
 
     /// Write a scalar attribute of type `T` on `location`.

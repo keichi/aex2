@@ -65,8 +65,10 @@ $ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/loc
     -DHDF5_ENABLE_ZLIB_SUPPORT=ON -DHDF5_BUILD_TOOLS=OFF -DHDF5_BUILD_HL_LIB=OFF \
     -DHDF5_BUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF
 $ cmake --build build -j16 && sudo cmake --install build && sudo ldconfig
-$ cd ~/aex2 && uv pip install h5py
+$ cd ~/aex2 && uv pip install h5py 'zarr>=3'
 ```
+
+`zarr` は Zarr のフィクスチャを作るためと、zarr-python 自身との比較を測るために要る。
 
 v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `uv sync` する。
 
@@ -95,8 +97,17 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/mem-gzip.h5` | 同じ中身を 4 MiB チャンク・shuffle + gzip 1 で圧縮 (約 1 %) | `... mem-gzip.h5 1073741824 gzip counting` |
 | `/mnt/aexram/mem-gzip-noisy.h5` | 圧縮の効きにくい中身 (`i % 1000` + 0〜15 の乱数) を同じ設定で圧縮。`--pattern none` で読む | `... mem-gzip-noisy.h5 1073741824 gzip noisy` |
 | `/mnt/aexram/wave.npy` | 1 GiB、131072 × 2048 の float32。滑らかな場 + 下位ビットの雑音で、誤差保証圧縮の測定用。`--pattern none` で読む | `target/release/mknpy /mnt/aexram/wave.npy 268435456 --row-elements 2048 --field wave` |
+| `/mnt/aexram/mem.zarr` | `mem.npy` と同じ中身の Zarr v3。4 MiB チャンク 1024 個 = **ファイル 1024 個**、既定の zstd | `.venv/bin/python benchmarks/mdx2/mkzarr.py /mnt/aexram/mem.zarr 1073741824 plain counting` |
+| `/mnt/aexram/mem-shard.zarr` | 同じチャンクを 256 MiB の shard に束ねたもの = **ファイル 16 個** | `... mem-shard.zarr 1073741824 sharded counting` |
+| `/mnt/aexram/mem-noisy.zarr` | 圧縮の効きにくい中身を `plain` で。`--pattern none` で読む | `... mem-noisy.zarr 1073741824 plain noisy` |
+| `/mnt/aexram/mem-noisy-shard.zarr` | 同じ中身を `sharded` で | `... mem-noisy-shard.zarr 1073741824 sharded noisy` |
+| `/mnt/aexram/mem-noisy-big.zarr` | 同じ中身を **64 MiB チャンク**で。デコードキャッシュが接続をまたいで共有する場面を作る (既定の 1 GiB キャッシュで測る) | `... mem-noisy-big.zarr 1073741824 big noisy` |
+| `~/disk/disk{,-shard,-noisy,-noisy-shard}.zarr` | 上の 4 つを virtio ディスクに置いたもの。コールド読みの比較用 | `... ~/disk/disk.zarr 1073741824 plain counting` など |
 
-- `mknpy` の第 2 引数はバイト数ではなく**要素数**
+- `mknpy` と `mkzarr.py` の第 2 引数はバイト数ではなく**要素数**
+- Zarr のフィクスチャには `.venv` に `zarr>=3` が要る (`uv pip install 'zarr>=3'`)。
+  `plain` と `sharded` の対は**ファイル数だけが違う**ので、転送のホットパスに乗る
+  `open` の回数が効くかどうかがそのまま出る
 - `wave.npy` だけ 1 GiB なのは tmpfs の空き容量の都合である (HDF5 のフィクスチャで
   86 % 埋まっている)。`sz-sweep.sh` と `zfp-sweep.sh` は 1 点 1 GiB なので、これで足りる
 - 誤差保証圧縮を測るときは、サーバもクライアントもコーデックの feature 付きで
@@ -110,9 +121,12 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 - 揃っているかは `ssh aex2-eval1 'ls -l /mnt/aexram /mnt/aexram/m3 ~/disk'` で確かめる。
   `/mnt/aexram` が空なら再起動で消えている
 - **`/dev/shm` は使わない。** systemd がログアウト時に中身を消す
+- **`/mnt/aexram` は 20 GiB。** 2026-09-21 に Zarr のフィクスチャを足すとき 12 GiB では
+  足りず (94 % 埋まっていた)、`sudo mount -o remount,size=20G /mnt/aexram` で広げた。
+  remount は中身を保つ。VM は 31 GiB なので 20 GiB でもまだ余裕がある
 - `/mnt/aexram` は **fstab に無いので再起動で消える**。再起動したら張り直して上の
   フィクスチャを作り直す。残すなら `/etc/fstab` に
-  `tmpfs /mnt/aexram tmpfs size=12G,mode=1777 0 0` を足す
+  `tmpfs /mnt/aexram tmpfs size=20G,mode=1777 0 0` を足す
 
   ```console
   $ sudo mkdir -p /mnt/aexram && sudo mount -t tmpfs -o size=12G,mode=1777 tmpfs /mnt/aexram
