@@ -19,7 +19,12 @@ const CHUNK: [usize; 2] = [64, 300];
 /// values. `packed` holds the same numbers with its chunks compressed.
 fn write_grid(server: &TestServer, name: &str) -> Vec<f32> {
     let store = server.root().join(name);
-    node(&store, "", r#"{"zarr_format": 3, "node_type": "group"}"#);
+    node(
+        &store,
+        "",
+        r#"{"zarr_format": 3, "node_type": "group",
+            "attributes": {"Conventions": "CF-1.8"}}"#,
+    );
     node(
         &store.join("group"),
         "",
@@ -62,6 +67,7 @@ fn write_array(parent: &Path, name: &str, values: &[f32], packed: bool) {
                                  "configuration": {{"chunk_shape": {CHUNK:?}}}}},
                  "chunk_key_encoding": {{"name": "default"}},
                  "fill_value": 0.0,
+                 "attributes": {{"units": "K"}},
                  "codecs": [{{"name": "bytes",
                               "configuration": {{"endian": "little"}}}}{codecs}]}}"#
         ),
@@ -149,10 +155,25 @@ fn the_hierarchy_is_browsable() {
         panic!("grid must be a dataset");
     };
     assert_eq!(info.shape, [ROWS as u64, COLS as u64]);
+    assert_eq!(text_attr(&info.attrs, "units").as_deref(), Some("K"));
     assert_eq!(
         error_class(client.get_item(handle, "/group/missing")),
         ErrorClass::Request
     );
+
+    // A store's own attributes sit on its root, as netCDF's globals do.
+    let Item::Group(attrs) = client.get_item(handle, "/").expect("root") else {
+        panic!("the root must be a group");
+    };
+    assert_eq!(text_attr(&attrs, "Conventions").as_deref(), Some("CF-1.8"));
+}
+
+/// The text attribute called `name`, or `None`.
+fn text_attr(attrs: &[(String, aex_client::AttrValue)], name: &str) -> Option<String> {
+    attrs.iter().find(|(n, _)| n == name).map(|(_, v)| match v {
+        aex_client::AttrValue::Text(text) => text.clone(),
+        other => panic!("{name} is {other:?}, not text"),
+    })
 }
 
 #[test]

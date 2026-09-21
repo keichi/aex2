@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::backend::{normalize_path, ArrayDataset, ArrayFile, Item};
+use crate::backend::{normalize_path, ArrayDataset, ArrayFile, AttrValue, Item, MAX_ATTR_BYTES};
 use crate::backends::chunks::{fill_from, ChunkGrid, MAX_CHUNKS};
 use crate::backends::decode_cache::DecodeCache;
 use crate::dtype::DType;
@@ -207,6 +207,20 @@ impl ArrayFile for ZarrFile {
         }
         children.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(children)
+    }
+
+    fn attrs(&self, path: &str) -> Result<Vec<(String, AttrValue)>> {
+        let path = normalize_path(path);
+        let Some(node) = self.node(path)? else {
+            return Err(AexError::NotFound(path.to_string()));
+        };
+        let mut attrs: Vec<(String, AttrValue)> = node
+            .attributes()
+            .iter()
+            .filter_map(|(name, value)| Some((name.clone(), attr_value(value)?)))
+            .collect();
+        attrs.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(attrs)
     }
 }
 
@@ -663,6 +677,13 @@ enum Node {
 }
 
 impl Node {
+    fn attributes(&self) -> &Map<String, Value> {
+        match self {
+            Node::Group(meta) => &meta.attributes,
+            Node::Array(meta) => &meta.attributes,
+        }
+    }
+
     /// The parts that are the same for both kinds of node.
     fn check(&self, key: &str) -> Result<()> {
         let format = match self {
@@ -681,6 +702,8 @@ impl Node {
 #[derive(Debug, Deserialize)]
 struct GroupMeta {
     zarr_format: u32,
+    #[serde(default)]
+    attributes: Map<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -697,6 +720,8 @@ struct ArrayMeta {
     codecs: Vec<Named>,
     #[serde(default)]
     storage_transformers: Vec<Value>,
+    #[serde(default)]
+    attributes: Map<String, Value>,
 }
 
 /// The shape every codec, grid and key encoding is written in.
@@ -705,6 +730,84 @@ struct Named {
     name: String,
     #[serde(default)]
     configuration: Map<String, Value>,
+}
+
+/// One attribute as the wire carries it, or `None` if it has no wire form.
+///
+/// JSON says nothing about element types, so the only honest reading is the
+/// one numpy would give: integers stay integers, anything else numeric becomes
+/// a double. What cannot be carried at all is left out, the way an unservable
+/// child is left out of a listing.
+fn attr_value(value: &Value) -> Option<AttrValue> {
+    if let Value::String(text) = value {
+        return (text.len() as u64 <= MAX_ATTR_BYTES).then(|| AttrValue::Text(text.clone()));
+    }
+
+    let mut shape = Vec::new();
+    let mut leaves = Vec::new();
+    let mut leaf_depth = None;
+    if !flatten(value, 0, &mut shape, &mut leaves, &mut leaf_depth) {
+        return None;
+    }
+    // A leaf below the deepest axis means the array was ragged.
+    if leaf_depth.is_some_and(|depth| depth != shape.len()) {
+        return None;
+    }
+
+    let dtype = if leaves.iter().all(|v| v.is_boolean()) && !leaves.is_empty() {
+        DType::Bool
+    } else if leaves.iter().all(|v| v.as_i64().is_some()) && !leaves.is_empty() {
+        DType::Int64
+    } else if leaves.iter().all(|v| v.is_number()) {
+        // An empty array lands here, and numpy calls that one double too.
+        DType::Float64
+    } else {
+        return None;
+    };
+    if leaves.len() as u64 * dtype.itemsize() > MAX_ATTR_BYTES {
+        return None;
+    }
+
+    let mut data = Vec::with_capacity(leaves.len() * dtype.itemsize() as usize);
+    for leaf in leaves {
+        match dtype {
+            DType::Bool => data.push(u8::from(leaf.as_bool()?)),
+            DType::Int64 => data.extend(leaf.as_i64()?.to_le_bytes()),
+            _ => data.extend(leaf.as_f64()?.to_le_bytes()),
+        }
+    }
+    Some(AttrValue::Array { dtype, shape, data })
+}
+
+/// The shape and leaves of a rectangular JSON array, or `false` if it is not
+/// one. A number or a boolean on its own is a scalar: no axes, one leaf.
+fn flatten<'a>(
+    value: &'a Value,
+    depth: usize,
+    shape: &mut Vec<u64>,
+    leaves: &mut Vec<&'a Value>,
+    leaf_depth: &mut Option<usize>,
+) -> bool {
+    match value {
+        Value::Array(items) => {
+            if depth == shape.len() {
+                shape.push(items.len() as u64);
+            } else if shape[depth] != items.len() as u64 {
+                return false;
+            }
+            items
+                .iter()
+                .all(|item| flatten(item, depth + 1, shape, leaves, leaf_depth))
+        }
+        Value::Bool(_) | Value::Number(_) => {
+            if *leaf_depth.get_or_insert(depth) != depth {
+                return false;
+            }
+            leaves.push(value);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The AEX type of a Zarr core data type name.
@@ -1885,6 +1988,140 @@ mod tests {
         assert!(matches!(err, AexError::NotAGroup(_)), "{err}");
         let err = file.get_item("g1/absent").expect_err("absent");
         assert!(matches!(err, AexError::NotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn attributes_keep_their_shape_and_their_dtype() {
+        let cases: [(&str, AttrValue); 7] = [
+            (r#""K""#, AttrValue::Text("K".to_string())),
+            (
+                "true",
+                AttrValue::Array {
+                    dtype: DType::Bool,
+                    shape: vec![],
+                    data: vec![1],
+                },
+            ),
+            (
+                "-3",
+                AttrValue::Array {
+                    dtype: DType::Int64,
+                    shape: vec![],
+                    data: (-3i64).to_le_bytes().to_vec(),
+                },
+            ),
+            (
+                "1.5",
+                AttrValue::Array {
+                    dtype: DType::Float64,
+                    shape: vec![],
+                    data: 1.5f64.to_le_bytes().to_vec(),
+                },
+            ),
+            (
+                "[0, 1]",
+                AttrValue::Array {
+                    dtype: DType::Int64,
+                    shape: vec![2],
+                    data: [0i64.to_le_bytes(), 1i64.to_le_bytes()].concat(),
+                },
+            ),
+            // One double among integers makes the whole array double, as numpy
+            // would have it.
+            (
+                "[0, 1.5]",
+                AttrValue::Array {
+                    dtype: DType::Float64,
+                    shape: vec![2],
+                    data: [0.0f64.to_le_bytes(), 1.5f64.to_le_bytes()].concat(),
+                },
+            ),
+            (
+                "[[1, 2], [3, 4]]",
+                AttrValue::Array {
+                    dtype: DType::Int64,
+                    shape: vec![2, 2],
+                    data: (1..=4i64).flat_map(|n| n.to_le_bytes()).collect(),
+                },
+            ),
+        ];
+        for (json, expected) in cases {
+            let value: Value = serde_json::from_str(json).expect("json");
+            assert_eq!(attr_value(&value), Some(expected), "{json}");
+        }
+    }
+
+    #[test]
+    fn an_attribute_with_no_wire_form_is_left_out() {
+        let cases = [
+            // One attribute cannot carry several strings.
+            r#"["a", "b"]"#,
+            r#"{"nested": 1}"#,
+            "null",
+            // Ragged and mixed arrays have no shape to send.
+            "[[1, 2], [3]]",
+            "[1, [2]]",
+            "[1, \"a\"]",
+            "[true, 1]",
+        ];
+        for json in cases {
+            let value: Value = serde_json::from_str(json).expect("json");
+            assert_eq!(attr_value(&value), None, "{json}");
+        }
+
+        // Too big to leave room for its siblings in one listing.
+        let huge = Value::Array(vec![Value::from(0); (MAX_ATTR_BYTES / 8) as usize + 1]);
+        assert_eq!(attr_value(&huge), None);
+        let long = Value::String("x".repeat(MAX_ATTR_BYTES as usize + 1));
+        assert_eq!(attr_value(&long), None);
+    }
+
+    #[test]
+    fn attributes_travel_with_every_kind_of_node() {
+        let store = StoreBuilder::new();
+        store.node(
+            "",
+            r#"{"zarr_format": 3, "node_type": "group",
+                "attributes": {"Conventions": "CF-1.8"}}"#,
+        );
+        store.node(
+            "g1",
+            r#"{"zarr_format": 3, "node_type": "group",
+                "attributes": {"title": "a group"}}"#,
+        );
+        store.array(
+            "g1/ds1",
+            "float32",
+            &[2],
+            &[2],
+            r#"{"attributes": {"units": "K", "valid_range": [0.0, 1.0],
+                               "_FillValue": -3, "flag_meanings": ["a", "b"]}}"#,
+        );
+
+        let file = store.open().expect("open");
+        assert_eq!(
+            file.attrs("").expect("root"),
+            [(
+                "Conventions".to_string(),
+                AttrValue::Text("CF-1.8".to_string())
+            )]
+        );
+        assert_eq!(
+            file.attrs("/g1/").expect("group"),
+            [("title".to_string(), AttrValue::Text("a group".to_string()))]
+        );
+
+        // Sorted by name, and the array of strings is gone.
+        let attrs = file.attrs("g1/ds1").expect("array");
+        let names: Vec<&str> = attrs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["_FillValue", "units", "valid_range"]);
+
+        // A node with no attributes has none, and a missing one is an error.
+        assert!(file.attrs("g1").expect("group").len() == 1);
+        assert!(matches!(
+            file.attrs("absent").expect_err("absent"),
+            AexError::NotFound(_)
+        ));
     }
 
     #[test]

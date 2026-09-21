@@ -39,6 +39,13 @@ pub trait ArrayFile: Send + Sync {
     }
 }
 
+/// The most one attribute may carry.
+///
+/// A listing carries every child's attributes, so one attribute has to leave
+/// room for the rest inside the gRPC message limit. A bigger one is left out,
+/// the way one with no wire form is.
+pub const MAX_ATTR_BYTES: u64 = 64 << 10;
+
 /// The value of an attribute: text, or numbers as the wire carries them.
 ///
 /// Numbers keep their stored element type so that a `_FillValue` has the dtype

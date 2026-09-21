@@ -19,15 +19,22 @@ def zarr_path(data_dir):
     """A store shaped like the HDF5 fixture, so the two can be read alike."""
     path = data_dir / "test.zarr"
     root = zarr.create_group(path, zarr_format=3)
+    root.attrs["Conventions"] = "CF-1.8"
     g1 = root.create_group("g1")
+    g1.attrs["title"] = "a group"
     x, y = np.meshgrid(np.arange(200), np.arange(100))
     ds1 = g1.create_array("ds1", shape=(100, 200), dtype="float32", chunks=(32, 64))
+    ds1.attrs["units"] = "K"
+    ds1.attrs["valid_range"] = [0.0, 1.0]
+    # No wire form: one attribute cannot carry several strings.
+    ds1.attrs["flag_meanings"] = ["a", "b"]
     ds1[...] = (x + y * 200).astype(np.float32)
     g1.create_array("ds2", shape=(100, 200), dtype="float64", chunks=(32, 64))
     g3 = g1.create_group("g3")
     g3.create_array("ds3", shape=(100, 200), dtype="int8", chunks=(32, 64))
     # Never written, so every chunk is missing and reads as the fill value.
-    g3.create_array("ds4", shape=(100, 200), dtype="int16", chunks=(32, 64), fill_value=-3)
+    ds4 = g3.create_array("ds4", shape=(100, 200), dtype="int16", chunks=(32, 64), fill_value=-3)
+    ds4.attrs["_FillValue"] = -3
     g2 = root.create_group("g2")
     g2.create_array("ds5", shape=(100, 200), dtype="int32", chunks=(32, 64))
     g2.create_array("ds6", shape=(100, 200), dtype="int64", chunks=(32, 64))
@@ -106,6 +113,25 @@ CHAINS = {
     "gzip": [zarr.codecs.GzipCodec()],
     "zstd+crc32c": [zarr.codecs.ZstdCodec(), zarr.codecs.Crc32cCodec()],
 }
+
+
+def test_attributes_travel_with_the_items_that_carry_them(store):
+    assert store.attrs == {"Conventions": "CF-1.8"}
+    assert store["g1"].attrs == {"title": "a group"}
+
+    ds1 = store["g1/ds1"]
+    assert ds1.attrs["units"] == "K"
+    np.testing.assert_array_equal(ds1.attrs["valid_range"], [0.0, 1.0])
+    # An attribute with no wire form is left out rather than failing the item.
+    assert "flag_meanings" not in ds1.attrs
+
+    # A fill value keeps the dtype of the variable it belongs to.
+    fill = store["g1/g3/ds4"].attrs["_FillValue"]
+    assert fill == -3
+
+    # One listing carries every child's attributes.
+    assert store["g1"]["ds1"].attrs["units"] == "K"
+    assert {name: item.attrs.get("title") for name, item in store["g1"].items()}["g3"] is None
 
 
 @pytest.mark.parametrize("chain", list(CHAINS), ids=list(CHAINS))

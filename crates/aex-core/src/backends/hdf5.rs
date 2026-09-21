@@ -26,7 +26,7 @@ use hdf5::filters::Filter;
 use hdf5::types::{CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenAscii, VarLenUnicode};
 use hdf5::LocationType;
 
-use crate::backend::{normalize_path, ArrayDataset, ArrayFile, AttrValue, Item};
+use crate::backend::{normalize_path, ArrayDataset, ArrayFile, AttrValue, Item, MAX_ATTR_BYTES};
 use crate::backends::chunks::{fill_from, ChunkGrid, MAX_CHUNKS};
 use crate::backends::decode_cache::DecodeCache;
 use crate::dtype::DType;
@@ -169,12 +169,6 @@ impl ArrayFile for Hdf5File {
         }
     }
 }
-
-/// Bigger than this and one attribute could push a listing past the gRPC
-/// message limit, since a listing carries every child's attributes.
-// ponytail: a flat per-attribute cap rather than a budget for the whole reply.
-// Real netCDF attributes are tens of bytes.
-const MAX_ATTR_BYTES: u64 = 64 << 10;
 
 /// Every attribute of an object that AEX can represent.
 ///
