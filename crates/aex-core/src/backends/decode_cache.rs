@@ -18,6 +18,10 @@ pub type ChunkKey = (u64, u64);
 ///
 /// One lock for the whole cache: it is held only to look up or insert, never
 /// while decoding or copying out, so it is short next to either.
+///
+/// Chunks are held as `Arc<Vec<u8>>` rather than `Arc<[u8]>`: the latter
+/// cannot take a `Vec`'s buffer, so every chunk would be allocated and copied
+/// a second time on its way in.
 pub struct DecodeCache {
     capacity: u64,
     lru: Mutex<Lru>,
@@ -50,7 +54,7 @@ struct Lru {
     /// Least recently used first.
     // ponytail: linear scan; entries are MiB-sized so there are few. An index
     // map would pay off only with many small chunks.
-    entries: VecDeque<(ChunkKey, Arc<[u8]>)>,
+    entries: VecDeque<(ChunkKey, Arc<Vec<u8>>)>,
     bytes: u64,
 }
 
@@ -85,18 +89,18 @@ impl DecodeCache {
         &self,
         key: ChunkKey,
         decode: impl FnOnce() -> Result<Vec<u8>>,
-    ) -> Result<Arc<[u8]>> {
+    ) -> Result<Arc<Vec<u8>>> {
         if let Some(hit) = self.get(key) {
             self.counts.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hit);
         }
         self.counts.misses.fetch_add(1, Ordering::Relaxed);
-        let chunk: Arc<[u8]> = decode()?.into();
+        let chunk = Arc::new(decode()?);
         self.insert(key, chunk.clone());
         Ok(chunk)
     }
 
-    fn get(&self, key: ChunkKey) -> Option<Arc<[u8]>> {
+    fn get(&self, key: ChunkKey) -> Option<Arc<Vec<u8>>> {
         let mut lru = self.lru.lock().unwrap_or_else(|e| e.into_inner());
         let at = lru.entries.iter().position(|(k, _)| *k == key)?;
         let entry = lru.entries.remove(at)?;
@@ -105,7 +109,7 @@ impl DecodeCache {
         Some(chunk)
     }
 
-    fn insert(&self, key: ChunkKey, chunk: Arc<[u8]>) {
+    fn insert(&self, key: ChunkKey, chunk: Arc<Vec<u8>>) {
         let len = chunk.len() as u64;
         if self.capacity == 0 || len > self.capacity {
             return;
