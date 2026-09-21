@@ -76,6 +76,10 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
   上げると 1.7 〜 1.9 倍になる。dtype キャスト・間引き・値域相対の誤差、および
   float32 / float64 以外の dtype は EXACT で返し、`AexQualityWarning` を出す。
   既定ビルドと Python の wheel にはどちらのコーデックも入っていない
+- **表現できない型の属性は `.attrs` に現れない**。数値と文字列は載るが、compound、
+  enum、オブジェクト参照、opaque、文字列の配列、および 64 KiB を超えるものは
+  黙って落ちる。netCDF-4 の `DIMENSION_LIST` は参照なので、変数の次元名は
+  今のところ見えない
 - **多次元の整数インデックス配列は非対応**。1 次元にして送り、結果を reshape すること
 - **credit は固定値** (既定 16、`AEX_CREDIT`)。RTT と帯域から自動で決める処理は
   入れていない。**遅延のある回線では `streams × credit × chunk_bytes` が転送の
