@@ -7,7 +7,7 @@ README は利用者向けの手順だけを載せている。ここには実装�
 ## 状態
 
 **M6 (評価) まで実装済み。** Python と Rust の両方から
-`.npy`、HDF5 (netCDF-4 を含む)、Zarr v3 の任意の選択を取得できる。実データは protobuf を
+`.npy`、HDF5 (netCDF-4 を含む)、Zarr v3 (sharding を含む) の任意の選択を取得できる。実データは protobuf を
 一切通らず、カーネルから呼び出し側のバッファ (Python では `np.empty` した配列) へ
 直接読み込まれる。1 クライアントが複数のデータ接続を使い、VM 間の実ネットワークでは
 16 接続で 1 接続の 8 倍 (163 Gbit/s) 出る ([M4 の測定](benchmark-m4.md))。
@@ -166,6 +166,7 @@ tests/python/      v1 から移植した pytest と numpy との差分テスト
 | [遅延を足した場合](benchmark-delay.md) | VM 間 + netem | 遅延のある回線の上限は in-flight バイト数で決まる |
 | [gather が省く往復](benchmark-gather.md) | VM 間 + netem | 往復 100 ms で 64 個なら 6,460 ms が 102 ms (63.5 倍) |
 | [HDF5 バックエンド](benchmark-hdf5.md) | VM 間 | contiguous な HDF5 は `.npy` と同速。gzip は伸長が律速 |
+| [Zarr と sharding](benchmark-zarr.md) | VM 間 | ファイル数は tmpfs では効かず、コールドディスクで +2.7 〜 9.4 %。zarr-python の 3.4 〜 9.0 倍 |
 | [誤差保証圧縮 (SZ3)](benchmark-sz.md) | VM 間 + tc | 勝ち負けを決めるのは帯域。1 Gbit/s で 4.6 〜 13.8 倍 |
 | [SZ3 と ZFP の比較](benchmark-zfp.md) | VM 間 + tc | 圧縮率は SZ3、速度は ZFP。2.5 〜 7.4 Gbit/s で入れ替わる |
 | [Linux での転送性能](benchmark-linux.md) | Linux 機 | Linux ではソケットが律速。実ネットワークに近いのはこちら |
