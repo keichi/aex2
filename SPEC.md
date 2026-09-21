@@ -1446,6 +1446,28 @@ client.stats()
 
 `np.s_` を受け付けるため、`read_into` / `gather` / `get_async` は `__getitem__` と同じキー形式を取る。
 
+```python
+# 6. ビュー: 選択を転送せずに保持する
+view = arr.view[10:90]       # ArrayProxy。is_view が True
+np.sum(view, axis=0)         # ApplyFunction に選択を載せて、サーバが 10:90 だけ読む
+```
+
+第 5.7 節の `ApplyFunction.indices` を使うための綴りである。`np.sum(arr[10:90])` と
+書けないのは、`arr[10:90]` が先に評価されて転送が起きてしまい、`np.sum` が
+`__array_function__` で介入する頃には ndarray になっているため。numpy には添字を
+遅延させるフックがない。
+
+ビューの shape と dtype は**クライアント側で**決める。サーバと同じ
+`aex_core::selection::resolve` を `aex._aex.resolve` として呼ぶので、意味論が
+食い違うことはない (プロトコル版が完全一致でなければセッションが張れないため、
+別版のコードを積んだ組み合わせも成立しない)。`PrepareSelection` を使うと、
+取りに行かない計画のために 1 往復と、サーバ側のプラン枠か (`inline_limit_bytes`
+以下なら) 丸ごとの読み出しを消費することになる。
+
+ビューに対してできるのは集約と添字だけで、`view` / `at` / `gather` / `read_into` は
+`TypeError` にする。サーバは選択の中からさらに選択できないため、ビューへの添字は
+全体を転送してからクライアントで適用する。
+
 ### 10.4 未対応 numpy 関数のフォールバック
 
 v1 は未対応関数で**黙って全データをダウンロード**していた。`np.sqrt(arr)` が 1 GB の転送を無言で発生させる。v2 では警告する。

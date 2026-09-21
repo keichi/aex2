@@ -8,6 +8,7 @@ import pytest
 
 import aex
 from aex import _aex
+from aex.array_proxy import _to_wire
 
 SHAPE = (12, 7, 5)
 
@@ -77,6 +78,25 @@ def test_selection_matches_numpy(key, source, proxy):
     np.testing.assert_array_equal(actual, expected)
     assert actual.dtype == expected.dtype
     assert actual.shape == expected.shape
+
+
+@pytest.mark.parametrize("key", KEYS, ids=repr)
+def test_resolve_matches_numpy(key):
+    """Takes no client: a view resolves its shape without a server."""
+    expected = np.empty(SHAPE, np.int32)[key]
+    descr, shape = _aex.resolve(SHAPE, "<i4", _to_wire(key, SHAPE))
+    assert tuple(shape) == expected.shape
+    assert descr == expected.dtype.str
+
+
+@pytest.mark.parametrize(
+    "key",
+    [12, -13, (0, 7), [0, 12], (0, 0, 0, 0), ([0, 1], [0, 1, 2])],
+    ids=repr,
+)
+def test_resolve_refuses_what_numpy_refuses(key):
+    with pytest.raises(aex.AexValueError):
+        _aex.resolve(SHAPE, "<i4", _to_wire(key, SHAPE))
 
 
 @pytest.mark.parametrize(

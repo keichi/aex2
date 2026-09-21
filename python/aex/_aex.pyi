@@ -6,6 +6,8 @@ import numpy as np
 
 Item = tuple[str, list[int]] | None
 
+def resolve(shape: tuple[int, ...], dtype: str, key: tuple[Any, ...]) -> tuple[str, list[int]]: ...
+
 class Plan:
     @property
     def shape(self) -> tuple[int, ...]: ...

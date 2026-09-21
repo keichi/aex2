@@ -88,7 +88,8 @@ class ArrayProxy:
     and integer or boolean arrays, and gives back a read-only ndarray.
 
     ``arr.view[key]`` is a proxy for a selection that transfers nothing, so
-    that ``np.sum(arr.view[0:100])`` reads 100 rows on the server.
+    that ``np.sum(arr.view[0:100])`` reads 100 rows on the server. Such a proxy
+    reports ``is_view``, and only reductions and indexing work on it.
 
     These numpy functions run on the server, and only the result is sent:
     ``sum``, ``prod``, ``mean``, ``max``, ``min``, ``std``, ``var``, ``all``,
@@ -123,6 +124,15 @@ class ArrayProxy:
         return _Viewer(self)
 
     @property
+    def is_view(self) -> bool:
+        """Whether this is a selection of an array rather than the array."""
+        return self._key is not None
+
+    def _wire_key(self, whole: Key) -> Key:
+        """This proxy's selection, or `whole` if it stands for the array."""
+        return whole if self._key is None else self._key
+
+    @property
     def ndim(self) -> int:
         return len(self.shape)
 
@@ -141,7 +151,7 @@ class ArrayProxy:
         return self.shape[0]
 
     def __iter__(self) -> Iterator[npt.NDArray[Any]]:
-        if self._key is not None:
+        if self.is_view:
             yield from self[...]
             return
         for i in range(len(self)):
@@ -153,7 +163,7 @@ class ArrayProxy:
         A view is transferred whole and ``key`` applied to it here, since the
         server cannot select from a selection.
         """
-        if self._key is not None:
+        if self.is_view:
             _check_fallback(f"indexing {self!r}", self.nbytes)
             return np.asarray(self._fetch_all()[key])
         return self._read(key, None)[0]
@@ -162,7 +172,7 @@ class ArrayProxy:
         return self._fetch(_to_wire(key, self.shape), quality)
 
     def _fetch_all(self) -> npt.NDArray[Any]:
-        return self._fetch((Ellipsis,) if self._key is None else self._key, None)[0]
+        return self._fetch(self._wire_key((Ellipsis,)), None)[0]
 
     def _fetch(
         self, wire_key: Key, quality: dict[str, Any] | None
@@ -331,14 +341,14 @@ class ArrayProxy:
         if "ddof" in params:
             wire["ddof"] = int(ddof) if isinstance(ddof, (int, np.integer)) else float(ddof)
 
-        key = () if self._key is None else self._key
+        key = self._wire_key(())
         descr, shape, data = self._native.apply_function(self.handle, self.name, key, name, wire)
         out = np.frombuffer(data, dtype=descr).reshape(shape)
         _warn_as_numpy(name, out, self.size // cells if cells else 1, ddof)
         return out[()] if out.ndim == 0 else out.copy()
 
     def _require_base(self, what: str) -> None:
-        if self._key is not None:
+        if self.is_view:
             raise TypeError(f"{what} is not supported on a view; use the array it came from")
 
     def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any) -> Any:
@@ -346,7 +356,7 @@ class ArrayProxy:
         return getattr(ufunc, method)(*inputs, **kwargs)
 
     def __repr__(self) -> str:
-        kind = "ArrayProxy" if self._key is None else "ArrayProxy view"
+        kind = "ArrayProxy view" if self.is_view else "ArrayProxy"
         return f'<{kind} name "{self.name}", shape {self.shape}, type {self.dtype}>'
 
 
@@ -359,11 +369,11 @@ class _Viewer:
     def __getitem__(self, key: Any) -> ArrayProxy:
         array = self._array
         wire_key = _to_wire(key, array.shape)
-        # The server resolves the selection, so it says what shape it has.
-        plan = array._native.prepare(array.handle, array.name, wire_key)
-        return ArrayProxy(
-            array._client, array.handle, array.name, plan.dtype, tuple(plan.shape), wire_key
-        )
+        # Resolved with the function the server would have used. Asking the
+        # server would cost a round trip, and leave it holding a plan for a
+        # transfer that never comes.
+        dtype, shape = _aex.resolve(array.shape, array.dtype.str, wire_key)
+        return ArrayProxy(array._client, array.handle, array.name, dtype, tuple(shape), wire_key)
 
 
 def _warn_as_numpy(name: str, out: npt.NDArray[Any], count: int, ddof: Any) -> None:
@@ -425,9 +435,9 @@ def _to_wire(key: Any, shape: tuple[int, ...]) -> Key:
     """Turn a numpy key into what the server takes.
 
     Only spelling is changed here; normalising and checking against the shape
-    is the server's job. The exception is a boolean mask, which becomes one
-    index array per axis it covers and is checked against those axes, since
-    the server never sees it.
+    is `aex-core`'s job, on whichever side runs it. The exception is a boolean
+    mask, which becomes one index array per axis it covers and is checked
+    against those axes, since it never reaches the wire.
     """
     entries = key if isinstance(key, tuple) else (key,)
 

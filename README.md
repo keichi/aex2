@@ -87,6 +87,9 @@ with aex.Client("127.0.0.1:50051") as client:
     client.stats()                            # cumulative bytes, round trips, …
 ```
 
+A view reports `is_view`, and making one costs no round trip: its shape comes
+from the same resolver the server would have run.
+
 ### Rust
 
 ```rust
