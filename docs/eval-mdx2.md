@@ -101,6 +101,7 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/mem-shard.zarr` | 同じチャンクを 256 MiB の shard に束ねたもの = **ファイル 16 個** | `... mem-shard.zarr 1073741824 sharded counting` |
 | `/mnt/aexram/mem-noisy.zarr` | 圧縮の効きにくい中身を `plain` で。`--pattern none` で読む | `... mem-noisy.zarr 1073741824 plain noisy` |
 | `/mnt/aexram/mem-noisy-shard.zarr` | 同じ中身を `sharded` で | `... mem-noisy-shard.zarr 1073741824 sharded noisy` |
+| `/mnt/aexram/mem-noisy-big.zarr` | 同じ中身を **64 MiB チャンク**で。デコードキャッシュが接続をまたいで共有する場面を作る (既定の 1 GiB キャッシュで測る) | `... mem-noisy-big.zarr 1073741824 big noisy` |
 | `~/disk/disk{,-shard,-noisy,-noisy-shard}.zarr` | 上の 4 つを virtio ディスクに置いたもの。コールド読みの比較用 | `... ~/disk/disk.zarr 1073741824 plain counting` など |
 
 - `mknpy` と `mkzarr.py` の第 2 引数はバイト数ではなく**要素数**
