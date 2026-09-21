@@ -70,17 +70,29 @@ def open_array(args, store=None, backend=None):
 
 def work(args, k, procs, done):
     """Read process k's slice of the array and report what it cost."""
-    array, _session = open_array(args)
-    # The split is along the leading axis, which for a two-dimensional field is
-    # rows rather than elements. A quality view has no shape; it wraps one.
-    rows = min(args.elements, getattr(array, "array", array).shape[0])
-    step = rows // procs
-    cpu = time.process_time()
-    out = array[k * step : (k + 1) * step]
-    # The server drops a quality it cannot apply and sends exact data, so a run
-    # that posts a good number may not have compressed anything.
-    applied = getattr(array, "applied_quality", None)
-    done.put((out.nbytes, time.process_time() - cpu, applied))
+    session = None
+    try:
+        array, session = open_array(args)
+        # The split is along the leading axis, which for a two-dimensional field
+        # is rows rather than elements. A quality view wraps the array with the
+        # shape rather than having one.
+        rows = min(args.elements, getattr(array, "array", array).shape[0])
+        step = rows // procs
+        cpu = time.process_time()
+        out = array[k * step : (k + 1) * step]
+        # The server drops a quality it cannot apply and sends exact data, so a
+        # run that posts a good number may not have compressed anything.
+        applied = getattr(array, "applied_quality", None)
+        done.put((out.nbytes, time.process_time() - cpu, applied))
+    except BaseException as error:  # noqa: BLE001 - reported through the queue
+        # The parent blocks on the queue, so a child that dies quietly hangs
+        # the sweep rather than failing it.
+        done.put(f"{type(error).__name__}: {error}")
+    finally:
+        # A session the server still counts is a session the next run cannot
+        # open: it stops at 64 of them.
+        if session is not None:
+            session.close()
 
 
 def run(args, procs):
@@ -95,6 +107,9 @@ def run(args, procs):
     elapsed = time.perf_counter() - start
     for worker in workers:
         worker.join()
+    for result in results:
+        if isinstance(result, str):
+            sys.exit(f"a reader failed: {result}")
     if args.abs_error or args.codec:
         applied = results[0][2] or {}
         wanted = (args.codec or "sz").lower()
@@ -107,14 +122,17 @@ def run(args, procs):
 def check(args, spec):
     """Require the two readers to deliver the same bytes, or stop."""
     backend, _, other = spec.partition(":")
-    mine, _a = open_array(args)
-    theirs, _b = open_array(args, other, backend)
+    mine, mine_session = open_array(args)
+    theirs, their_session = open_array(args, other, backend)
     for where in CHECK_AT:
         # A quality view has no shape of its own; it wraps the array that has.
         at = int(getattr(mine, "array", mine).shape[0] * where)
         got, want = mine[at : at + CHECK_ELEMENTS], theirs[at : at + CHECK_ELEMENTS]
         if not np.array_equal(got, want):
             sys.exit(f"{args.store} and {other} differ at element {at}")
+    for session in (mine_session, their_session):
+        if session is not None:
+            session.close()
     print(f"   {args.store} and {other} agree at {len(CHECK_AT)} places")
 
 
