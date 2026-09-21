@@ -1,19 +1,33 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.8,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "aex"
 description = "Array Exchange v2: partial, on-demand transfer of array data over wide-area networks"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Keichi Takahashi", email = "hello@keichi.dev" }]
 requires-python = ">=3.11"
 dynamic = ["version"]
 dependencies = ["numpy>=1.24"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
 ]
+
+[project.urls]
+Homepage = "https://github.com/keichi/aex2"
+Documentation = "https://keichi.github.io/aex2/"
+Repository = "https://github.com/keichi/aex2"
+Issues = "https://github.com/keichi/aex2/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "mypy>=1.11", "ruff>=0.6", "h5py>=3.8"]
