@@ -5,6 +5,8 @@ dataset named ``array``, so the datasets are separate files here. The nested
 group tests live in test_hdf5.py.
 """
 
+from collections.abc import Mapping
+
 import numpy as np
 import pytest
 
@@ -183,14 +185,43 @@ def test_group_proxy_getitem_nonexistent(file_proxy):
 
 
 def test_group_proxy_iter(file_proxy):
-    items = list(file_proxy)
-    assert len(items) == 1
-    assert isinstance(items[0], ArrayProxy)
-    assert items[0].name == "/array"
+    assert list(file_proxy) == ["array"]
 
 
 def test_group_proxy_iter_multiple_times(file_proxy):
     assert len(list(file_proxy)) == len(list(file_proxy)) == 1
+
+
+def test_group_proxy_is_a_mapping(file_proxy):
+    assert isinstance(file_proxy, Mapping)
+
+
+def test_group_proxy_keys(file_proxy):
+    assert list(file_proxy.keys()) == ["array"]
+
+
+def test_group_proxy_values(file_proxy):
+    values = list(file_proxy.values())
+    assert len(values) == 1
+    assert isinstance(values[0], ArrayProxy)
+    assert values[0].name == "/array"
+
+
+def test_group_proxy_items(file_proxy):
+    (name, item) = next(iter(file_proxy.items()))
+    assert name == "array"
+    assert isinstance(item, ArrayProxy)
+
+
+def test_group_proxy_dict(file_proxy):
+    mapping = dict(file_proxy)
+    assert list(mapping) == ["array"]
+    assert isinstance(mapping["array"], ArrayProxy)
+
+
+def test_group_proxy_get(file_proxy):
+    assert isinstance(file_proxy.get("array"), ArrayProxy)
+    assert file_proxy.get("nonexistent") is None
 
 
 def test_group_proxy_len(file_proxy):
@@ -251,6 +282,13 @@ def test_file_proxy_close(client, ds_paths):
         proxy["array"]
 
 
+def test_file_proxy_context_manager(client, ds_paths):
+    with client.open(ds_paths["ds1"]) as proxy:
+        assert isinstance(proxy["array"], ArrayProxy)
+    with pytest.raises(AexError):
+        proxy["array"]
+
+
 def test_file_proxy_close_twice(file_proxy):
     file_proxy.close()
     with pytest.raises(AexError):
@@ -284,7 +322,8 @@ def test_workflow_open_navigate_read(client, ds_paths):
 
 
 def test_workflow_iteration_and_access(file_proxy):
-    for item in file_proxy:
+    for name in file_proxy:
+        item = file_proxy[name]
         if isinstance(item, ArrayProxy) and item.name == "/array":
             data = item[0]
             assert data.shape == (200,)

@@ -1,7 +1,7 @@
 """The client, and proxies for the files and groups it opens."""
 
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import TracebackType
 from typing import Any, Self, TypeVar
@@ -86,13 +86,14 @@ def _proxy(
     return ArrayProxy(client, handle, name, dtype, tuple(shape))
 
 
-class GroupProxy:
-    """A group in an open file.
+class GroupProxy(Mapping[str, "ArrayProxy | GroupProxy"]):
+    """A group in an open file, as a read-only mapping from name to item.
 
     ``group[name]`` is the item at that path: an ``ArrayProxy`` for a dataset,
-    a ``GroupProxy`` for a group. A leading ``/`` makes the path absolute.
-    Iterating yields the children as proxies, ``len`` counts them, and ``in``
-    tests for a path without raising.
+    a ``GroupProxy`` for a group. A leading ``/`` makes the path absolute, and
+    ``in`` tests for a path without raising. Iterating and ``keys()`` yield the
+    child names like ``h5py``; ``values()`` and ``items()`` give the proxies,
+    one request per child.
     """
 
     def __init__(self, client: Client, handle: int, name: str) -> None:
@@ -117,9 +118,9 @@ class GroupProxy:
         path = self._join_names(self.name, name)
         return _proxy(self._client, self.handle, path, self._native.get_item(self.handle, path))
 
-    def __iter__(self) -> Iterator["ArrayProxy | GroupProxy"]:
-        for name, item in self._native.list_children(self.handle, self.name):
-            yield _proxy(self._client, self.handle, self._join_names(self.name, name), item)
+    def __iter__(self) -> Iterator[str]:
+        for name, _ in self._native.list_children(self.handle, self.name):
+            yield name
 
     def __len__(self) -> int:
         return len(self._native.list_children(self.handle, self.name))
@@ -146,6 +147,17 @@ class FileProxy(GroupProxy):
     def close(self) -> None:
         """Release the file on the server. The proxies it produced stop working."""
         self._native.close_file(self.handle)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
 
     def __repr__(self) -> str:
         return f'<FileProxy handle "{self.handle}">'

@@ -1396,11 +1396,16 @@ with Client("localhost:50051") as client:
     np.asarray(arr)                      # __array__
     np.sum(arr, axis=0)                  # __array_function__ (サーバ実行)
 
-    for child in f:                      # GroupProxy の反復
-        print(child)
+    for name in f:                       # GroupProxy の反復 (子の名前)
+        print(name, f[name])
     "array" in f                         # __contains__
     f.close()
 ```
+
+`GroupProxy` は `collections.abc.Mapping` である。v1 の `__iter__` は子をプロキシで返していたが、
+`__getitem__` / `__len__` / `__contains__` が揃っていながら反復だけが値を返すのは h5py・zarr と
+逆で、`dict(f)` も `keys()` も使えなかった。名前を返すようにし、プロキシは `values()` /
+`items()` から取る。`FileProxy` は `with` で閉じられる。
 
 **v1 からの機能追加** (破壊的変更ではない):
 
@@ -1866,6 +1871,7 @@ SZ3 を値域の 0.1 % の誤差で掛けると 61.8 倍になる。
 | `aex.client.Client(url)` | `aex.Client(url)` | 互換 (`aex.client.Client` も残す) |
 | `client.open(path)` | 同じ | 互換 |
 | `FileProxy` / `GroupProxy` / `ArrayProxy` | 同じ | 互換 |
+| `for child in f` (プロキシ) | `for name in f` (名前)。プロキシは `f.values()` | **非互換**。`GroupProxy` を `Mapping` にするため |
 | `arr[key]` (int / slice / iterable) | 同じ + Ellipsis / newaxis / mask | 上位互換 |
 | `np.sum(arr)` 等 27 関数 | 主要 15 関数はサーバ実行、残りはフォールバック | 結果は互換。性能特性が変わる |
 | 未対応関数の無言フォールバック | 警告つき (ポリシー変更可) | `set_fallback_policy("allow")` で v1 と同一 |
