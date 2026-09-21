@@ -145,8 +145,6 @@ The Rust client reads the same variables through `ClientConfig::from_env()`.
 | `AEX_CHUNK_BYTES` | server suggestion (4 MiB) | Bytes one `FETCH` asks for |
 | `AEX_DATA_ENDPOINT` | what the server advertises | `host:port` to reach the data plane at, for a tunnel or a proxy |
 | `AEX_MAX_RETRIES` | 3 | Times a chunk may be fetched again before the transfer fails |
-| `AEX_TCP_NODELAY` | on | `TCP_NODELAY` on the data connections, i.e. Nagle off. Takes `1`/`true`/`yes`/`on` or their negatives |
-| `AEX_RCVBUF` | unset (kernel auto-tuning) | `SO_RCVBUF` for the data connections, in bytes. See the tuning notes below |
 | `AEX_CONNECT_TIMEOUT_MS` | 10000 | Control-plane connect timeout |
 | `AEX_MAX_MESSAGE_BYTES` | 4 MiB | Ceiling on one gRPC message. A fancy selection is what grows it |
 | `AEX_CLIENT_NAME` | program name and pid | Reported to the server for its logs |
@@ -170,10 +168,10 @@ they are not, turn the knobs in this order.
    (at 20 Gbit/s × 50 ms: 1,753 MiB/s with 128 MiB in flight, 2,806 with 256 MiB)
 3. **Leave the chunk size alone.** It is equivalent to credit, and enlarging it
    also enlarges the wait for the first frame and the unit of retransmission
-4. **Do not set `SO_RCVBUF` (`AEX_RCVBUF`).** Setting it explicitly disables the
-   kernel's auto-tuning and caps the window at that value. At a 50 ms round trip,
-   asking for 4 MiB drops 1,028 MiB/s to 327 MiB/s. To widen the window, raise
-   the ceiling in `net.ipv4.tcp_rmem` instead
+4. **Widen the receive window from the kernel, not the client.** The data
+   connections leave `SO_RCVBUF` to the kernel's auto-tuning, which an explicit
+   size would switch off: at a 50 ms round trip, asking for 4 MiB drops
+   1,028 MiB/s to 327 MiB/s. Raise the ceiling in `net.ipv4.tcp_rmem` instead
 
 ## Acknowledgments
 

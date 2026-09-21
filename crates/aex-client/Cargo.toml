@@ -10,7 +10,6 @@ repository.workspace = true
 aex-core.workspace = true
 aex-proto.workspace = true
 aex-wire.workspace = true
-socket2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tonic.workspace = true
