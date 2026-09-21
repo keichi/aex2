@@ -472,3 +472,20 @@ def test_numpy_cumprod(array_proxy):
 def test_numpy_function_with_proxies_in_a_list(array_proxy):
     result = np.concatenate([array_proxy, array_proxy])
     assert result.shape == (200, 200)
+
+
+# ============================================================
+# Errors
+# ============================================================
+
+
+def test_connection_errors_are_os_errors():
+    # Retry wrappers catch ConnectionError / OSError, not our base class.
+    assert issubclass(aex.AexConnectionError, ConnectionError)
+    assert issubclass(aex.AexTransferError, OSError)
+    assert str(aex.AexConnectionError("down", "TRANSIENT")) == "down"
+
+
+def test_is_retryable():
+    assert aex.AexTransferError("later", "TRANSIENT").is_retryable
+    assert not aex.AexTransferError("never").is_retryable
