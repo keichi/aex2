@@ -39,8 +39,9 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
   `FETCH` を先行投入する。切れた接続のチャンクだけを別接続で再取得する
 - `aex-py` — PyO3 による拡張モジュール `aex._aex`。ネットワーク待ちの間は GIL を解放し、
   出力配列を検証してから直接書き込む
-- `python/aex` — v1 と同じ API (`Client` / `FileProxy` / `GroupProxy` / `ArrayProxy`)。
-  v1 にない `arr[..., 0]`、`arr[:, None]`、boolean mask にも対応。性能用 API として
+- `python/aex` — ほぼ v1 と同じ API (`Client` / `FileProxy` / `GroupProxy` / `ArrayProxy`)。
+  v1 にない `arr[..., 0]`、`arr[:, None]`、boolean mask にも対応。`GroupProxy` は
+  h5py と同じ `Mapping` で、反復は子の名前を返す (v1 はプロキシを返した)。性能用 API として
   `read_into` / `gather` / `get_async` / `at()` (適応品質の枠) / `client.stats()`。
   `np.sum` などの集約 (SPEC §5.8) はサーバで計算し、`arr.view[0:100]` で転送せずに
   選択へ集約できる
