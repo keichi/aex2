@@ -634,6 +634,8 @@ mod tests {
             assert_eq!(dataset.dtype(), DType::Float32);
             assert_eq!(dataset.shape(), &[3, 4]);
             assert_eq!(dataset.ndim(), 2);
+            // A format without attributes takes the trait's default.
+            assert!(file.attrs(name).expect(name).is_empty());
         }
 
         for root in ["", "/"] {
