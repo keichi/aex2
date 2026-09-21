@@ -85,7 +85,8 @@ class ArrayProxy:
     """An array on the server. Indexing it transfers the selection.
 
     ``arr.view[key]`` is a proxy for a selection that transfers nothing, so
-    that ``np.sum(arr.view[0:100])`` reads 100 rows on the server.
+    that ``np.sum(arr.view[0:100])`` reads 100 rows on the server. Such a proxy
+    reports ``is_view``, and only reductions are supported on it.
     """
 
     def __init__(
@@ -113,6 +114,15 @@ class ArrayProxy:
         return _Viewer(self)
 
     @property
+    def is_view(self) -> bool:
+        """Whether this is a selection of an array rather than the array."""
+        return self._key is not None
+
+    def _wire_key(self, whole: Key) -> Key:
+        """This proxy's selection, or `whole` if it stands for the array."""
+        return whole if self._key is None else self._key
+
+    @property
     def ndim(self) -> int:
         return len(self.shape)
 
@@ -130,7 +140,7 @@ class ArrayProxy:
         return self.shape[0]
 
     def __iter__(self) -> Iterator[npt.NDArray[Any]]:
-        if self._key is not None:
+        if self.is_view:
             yield from self[...]
             return
         for i in range(len(self)):
@@ -142,7 +152,7 @@ class ArrayProxy:
         A view is transferred whole and ``key`` applied to it here, since the
         server cannot select from a selection.
         """
-        if self._key is not None:
+        if self.is_view:
             _check_fallback(f"indexing {self!r}", self.nbytes)
             return np.asarray(self._fetch_all()[key])
         return self._read(key, None)[0]
@@ -151,7 +161,7 @@ class ArrayProxy:
         return self._fetch(_to_wire(key, self.shape), quality)
 
     def _fetch_all(self) -> npt.NDArray[Any]:
-        return self._fetch((Ellipsis,) if self._key is None else self._key, None)[0]
+        return self._fetch(self._wire_key((Ellipsis,)), None)[0]
 
     def _fetch(
         self, wire_key: Key, quality: dict[str, Any] | None
@@ -307,14 +317,14 @@ class ArrayProxy:
         if "ddof" in params:
             wire["ddof"] = int(ddof) if isinstance(ddof, (int, np.integer)) else float(ddof)
 
-        key = () if self._key is None else self._key
+        key = self._wire_key(())
         descr, shape, data = self._native.apply_function(self.handle, self.name, key, name, wire)
         out = np.frombuffer(data, dtype=descr).reshape(shape)
         _warn_as_numpy(name, out, self.size // cells if cells else 1, ddof)
         return out[()] if out.ndim == 0 else out.copy()
 
     def _require_base(self, what: str) -> None:
-        if self._key is not None:
+        if self.is_view:
             raise TypeError(f"{what} is not supported on a view; use the array it came from")
 
     def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any) -> Any:
@@ -322,7 +332,7 @@ class ArrayProxy:
         return getattr(ufunc, method)(*inputs, **kwargs)
 
     def __repr__(self) -> str:
-        kind = "ArrayProxy" if self._key is None else "ArrayProxy view"
+        kind = "ArrayProxy view" if self.is_view else "ArrayProxy"
         return f'<{kind} name "{self.name}", shape {self.shape}, type {self.dtype}>'
 
 

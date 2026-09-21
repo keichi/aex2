@@ -218,6 +218,14 @@ def test_indexing_a_view_downloads_it(arrays):
     np.testing.assert_array_equal(np.cumsum(view), np.cumsum(data[1:4]))
 
 
+def test_is_view_tells_the_two_apart(arrays):
+    _, proxy = arrays["reduce-i4"]
+    assert not proxy.is_view
+    assert proxy.view[1:4].is_view
+    # An empty selection is still a view, so it cannot be a falsy key check.
+    assert proxy.view[2:2].is_view
+
+
 def test_a_view_forbids_what_needs_the_whole_array(arrays):
     _, proxy = arrays["reduce-i4"]
     view = proxy.view[1:4]
