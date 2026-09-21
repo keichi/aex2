@@ -11,6 +11,11 @@
 //! The codecs a chunk went through are listed in the order they were applied,
 //! so decoding runs the bytes-to-bytes ones backwards.
 //!
+//! A sharded array puts many chunks in one file with an index of where each
+//! one sits. That is the same problem twice over — a shard is a chunk of the
+//! array, an inner chunk is a chunk of the shard — so the walk is the same
+//! one, called inside itself.
+//!
 //! Every path read here — a node's metadata as much as a chunk — goes through
 //! [`StoreRoot::under`], which resolves symlinks and refuses anything that
 //! lands outside the store. The server decides which directory may be served;
@@ -23,20 +28,23 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::FileExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::backend::{normalize_path, ArrayDataset, ArrayFile, Item};
-use crate::backends::chunks::{fill_from, ChunkGrid};
+use crate::backends::chunks::{fill_from, ChunkGrid, MAX_CHUNKS};
 use crate::backends::decode_cache::DecodeCache;
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
-use crate::selection::SelectionLayout;
+use crate::quality::QualitySpec;
+use crate::selection::{Index, SelectionLayout};
 
 /// The metadata document of every node, group or array alike.
 const METADATA: &str = "zarr.json";
@@ -210,15 +218,62 @@ pub struct ZarrArray {
     prefix: String,
     dtype: DType,
     shape: Vec<u64>,
-    grid: ChunkGrid,
     key: KeyEncoding,
-    /// The bytes-to-bytes codecs, in the order they were applied when writing.
-    codecs: Vec<ChunkCodec>,
+    store: Store,
     /// One element's worth of bytes, as stored.
     fill: Vec<u8>,
     cache: Arc<DecodeCache>,
     /// Tells this array's chunks apart from others' in the shared cache.
     cache_key: u64,
+}
+
+/// How an array's chunks are laid out in files.
+#[derive(Debug)]
+enum Store {
+    /// One file per chunk, named after its coordinates.
+    Chunked {
+        grid: ChunkGrid,
+        /// In the order they were applied when writing.
+        codecs: Vec<ChunkCodec>,
+    },
+    Sharded(Box<Sharded>),
+}
+
+/// Many chunks to a file, with an index saying where each one is.
+#[derive(Debug)]
+struct Sharded {
+    /// The array, in chunks of the shard shape.
+    shards: ChunkGrid,
+    /// One shard, in chunks of the inner chunk shape. Shards are all the same
+    /// size, edge ones included, so one grid describes every shard.
+    inner: ChunkGrid,
+    /// The inner chunks' codecs, in the order they were applied.
+    codecs: Vec<ChunkCodec>,
+    /// Bytes the index occupies: sixteen per inner chunk, plus its checksum.
+    index_bytes: u64,
+    index_at_start: bool,
+    index_crc32c: bool,
+    /// By `shard * inner.chunks() + inner number`; built on first use.
+    index: OnceLock<Vec<ShardEntry>>,
+}
+
+/// Where one inner chunk lies in its shard file.
+#[derive(Debug, Clone, Copy)]
+struct ShardEntry {
+    offset: u64,
+    nbytes: u64,
+}
+
+impl ShardEntry {
+    /// What the index holds for a chunk that was never written.
+    const MISSING: ShardEntry = ShardEntry {
+        offset: u64::MAX,
+        nbytes: u64::MAX,
+    };
+
+    fn is_missing(&self) -> bool {
+        self.offset == u64::MAX && self.nbytes == u64::MAX
+    }
 }
 
 /// A codec that turns a chunk's bytes into other bytes.
@@ -260,8 +315,6 @@ impl ZarrArray {
                 "{prefix} uses a storage transformer"
             )));
         }
-        let codecs = parse_codecs(prefix, &meta.codecs)?;
-
         if meta.chunk_grid.name != "regular" {
             return Err(AexError::UnsupportedZarr(format!(
                 "{prefix} has a {:?} chunk grid; only regular grids are served",
@@ -285,14 +338,23 @@ impl ZarrArray {
                 ))
             })?;
 
+        // A sharded array names its shards with the outer grid, and the codec
+        // says how a shard is divided further.
+        let store = match sharding_of(&meta.codecs) {
+            Some(named) => Store::Sharded(Box::new(Sharded::new(prefix, grid, dtype, named)?)),
+            None => Store::Chunked {
+                grid,
+                codecs: parse_codecs(prefix, &meta.codecs)?,
+            },
+        };
+
         Ok(ZarrArray {
             root,
             prefix: prefix.to_string(),
             dtype,
             shape: meta.shape,
-            grid,
             key: key_encoding(prefix, &meta.chunk_key_encoding)?,
-            codecs,
+            store,
             fill: fill_bytes(dtype, &meta.fill_value)
                 .map_err(|e| AexError::MalformedZarr(format!("{prefix}: {e}")))?,
             cache,
@@ -300,9 +362,9 @@ impl ZarrArray {
         })
     }
 
-    /// The store-relative name of chunk `n`.
-    fn chunk_key(&self, n: u64, coords: &mut Vec<u64>) -> String {
-        self.grid.coords_of(n, coords);
+    /// The store-relative name of the file holding `n` of `grid`.
+    fn key_of(&self, grid: &ChunkGrid, n: u64, coords: &mut Vec<u64>) -> String {
+        grid.coords_of(n, coords);
         let mut key = String::with_capacity(self.prefix.len() + 4 * coords.len() + 2);
         if !self.prefix.is_empty() {
             key.push_str(&self.prefix);
@@ -330,51 +392,231 @@ impl ZarrArray {
 
     /// Read `[at, at + dst.len())` of the array's C-order bytes.
     fn read_at(&self, at: u64, dst: &mut [u8]) -> Result<()> {
-        let mut coords = Vec::new();
-        self.grid.walk(at, dst, |chunk, start, out| {
-            let key = self.chunk_key(chunk as u64, &mut coords);
-            let decoded = self
-                .cache
-                .get_or_decode((self.cache_key, chunk as u64), || self.decode(&key))?;
-            let start = start as usize;
-            out.copy_from_slice(&decoded[start..start + out.len()]);
-            Ok(())
+        match &self.store {
+            Store::Chunked { grid, codecs } => {
+                let mut coords = Vec::new();
+                grid.walk(at, dst, |chunk, start, out| {
+                    let key = self.key_of(grid, chunk as u64, &mut coords);
+                    let decoded =
+                        self.cache
+                            .get_or_decode((self.cache_key, chunk as u64), || {
+                                let Some(path) = self.root.under(&key)? else {
+                                    return Ok(self.fill_chunk(grid.chunk_bytes()));
+                                };
+                                let bytes = std::fs::read(&path)?;
+                                undo(&key, codecs, bytes, grid.chunk_bytes())
+                            })?;
+                    let start = start as usize;
+                    out.copy_from_slice(&decoded[start..start + out.len()]);
+                    Ok(())
+                })
+            }
+            Store::Sharded(sharded) => {
+                let index = sharded.index(self)?;
+                let per_shard = sharded.inner.chunks();
+                sharded.shards.walk(at, dst, |shard, in_shard, out| {
+                    // The outer walk hands back an offset into an array of the
+                    // shard shape, which is what the inner grid walks.
+                    let key = self.key_of(&sharded.shards, shard as u64, &mut Vec::new());
+                    sharded.inner.walk(in_shard, out, |chunk, start, out| {
+                        let n = shard as u64 * per_shard + chunk as u64;
+                        let decoded = self.cache.get_or_decode((self.cache_key, n), || {
+                            let entry = index[n as usize];
+                            if entry.is_missing() {
+                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes()));
+                            }
+                            let Some(path) = self.root.under(&key)? else {
+                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes()));
+                            };
+                            let mut bytes = vec![0u8; entry.nbytes as usize];
+                            File::open(&path)?.read_exact_at(&mut bytes, entry.offset)?;
+                            undo(&key, &sharded.codecs, bytes, sharded.inner.chunk_bytes())
+                        })?;
+                        let start = start as usize;
+                        out.copy_from_slice(&decoded[start..start + out.len()]);
+                        Ok(())
+                    })
+                })
+            }
+        }
+    }
+
+    /// A whole chunk of the fill value, for one that was never written.
+    // ponytail: the fill chunk is cached like any other, so a sparse array can
+    // evict real chunks. Keep one shared all-fill chunk if that shows up.
+    fn fill_chunk(&self, chunk_bytes: u64) -> Vec<u8> {
+        let mut chunk = vec![0u8; chunk_bytes as usize];
+        fill_from(&self.fill, 0, &mut chunk);
+        chunk
+    }
+}
+
+/// Undo a chunk's codecs, which are listed in the order they were applied.
+fn undo(key: &str, codecs: &[ChunkCodec], mut bytes: Vec<u8>, chunk_bytes: u64) -> Result<Vec<u8>> {
+    let malformed = |what: String| AexError::MalformedZarr(format!("chunk {key}: {what}"));
+    for codec in codecs.iter().rev() {
+        bytes = match codec {
+            ChunkCodec::Gzip => ungzip(&bytes, chunk_bytes).ok_or_else(|| {
+                malformed("the gzip stream does not expand to a chunk".to_string())
+            })?,
+            ChunkCodec::Zstd => zstd::bulk::decompress(&bytes, chunk_bytes as usize)
+                .map_err(|e| malformed(format!("zstd: {e}")))?,
+            ChunkCodec::Crc32c => {
+                strip_crc32c(bytes).ok_or_else(|| malformed("CRC-32C mismatch".to_string()))?
+            }
+        };
+    }
+    if bytes.len() as u64 != chunk_bytes {
+        return Err(malformed(format!(
+            "holds {} bytes instead of {chunk_bytes}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+impl Sharded {
+    fn new(prefix: &str, shards: ChunkGrid, dtype: DType, named: &Named) -> Result<Self> {
+        let unsupported = |what: String| AexError::UnsupportedZarr(format!("{prefix}: {what}"));
+        let config = &named.configuration;
+        let chunk_shape: Vec<u64> =
+            serde_json::from_value(config.get("chunk_shape").cloned().unwrap_or(Value::Null))
+                .map_err(|e| {
+                    AexError::MalformedZarr(format!("{prefix}: shard chunk_shape: {e}"))
+                })?;
+        let inner = ChunkGrid::new(shards.chunk_shape(), &chunk_shape, dtype.itemsize())
+            .ok_or_else(|| {
+                AexError::MalformedZarr(format!(
+                    "{prefix}: inner chunks of {chunk_shape:?} do not fit a shard of {:?}",
+                    shards.chunk_shape()
+                ))
+            })?;
+
+        // A shard is divided evenly: one index entry per inner chunk, and no
+        // padding between the last chunk of an axis and the shard's edge.
+        if shards
+            .chunk_shape()
+            .iter()
+            .zip(&chunk_shape)
+            .any(|(shard, chunk)| shard % chunk != 0)
+        {
+            return Err(AexError::MalformedZarr(format!(
+                "{prefix}: inner chunks of {chunk_shape:?} do not divide a shard of {:?}",
+                shards.chunk_shape()
+            )));
+        }
+
+        let codecs: Vec<Named> =
+            serde_json::from_value(config.get("codecs").cloned().unwrap_or(Value::Null))
+                .map_err(|e| AexError::MalformedZarr(format!("{prefix}: shard codecs: {e}")))?;
+        // A sharding codec inside a shard lands here and is refused: the flat
+        // cache key would stop telling two levels of inner chunk apart.
+        let codecs = parse_codecs(prefix, &codecs)?;
+
+        // The index has to sit at a known place, so only codecs that keep its
+        // size are allowed there.
+        let index_codecs: Vec<Named> =
+            serde_json::from_value(config.get("index_codecs").cloned().unwrap_or(Value::Null))
+                .map_err(|e| AexError::MalformedZarr(format!("{prefix}: index_codecs: {e}")))?;
+        let mut index_crc32c = false;
+        for codec in &index_codecs {
+            match codec.name.as_str() {
+                "bytes" => {}
+                "crc32c" => index_crc32c = true,
+                other => {
+                    return Err(unsupported(format!(
+                        "the shard index uses the {other:?} codec, which would move it"
+                    )))
+                }
+            }
+        }
+        let index_at_start = match config.get("index_location") {
+            None => false,
+            Some(Value::String(at)) if at == "end" => false,
+            Some(Value::String(at)) if at == "start" => true,
+            Some(other) => {
+                return Err(AexError::MalformedZarr(format!(
+                    "{prefix}: index_location {other}"
+                )))
+            }
+        };
+
+        let entries = shards
+            .chunks()
+            .checked_mul(inner.chunks())
+            .ok_or_else(|| AexError::MalformedZarr(format!("{prefix}: too many inner chunks")))?;
+        if entries > MAX_CHUNKS {
+            return Err(unsupported(format!(
+                "{entries} inner chunks; at most {MAX_CHUNKS} are served"
+            )));
+        }
+        let index_bytes = inner.chunks() * 16 + if index_crc32c { 4 } else { 0 };
+
+        Ok(Sharded {
+            shards,
+            inner,
+            codecs,
+            index_bytes,
+            index_at_start,
+            index_crc32c,
+            index: OnceLock::new(),
         })
     }
 
-    /// Read one chunk file and undo its codecs.
-    fn decode(&self, key: &str) -> Result<Vec<u8>> {
-        let chunk_bytes = self.grid.chunk_bytes() as usize;
-        // Zarr leaves an unwritten chunk out of the store entirely.
-        // ponytail: the fill chunk is cached like any other, so a sparse array
-        // can evict real chunks. Keep a shared all-fill chunk if that shows up.
-        let Some(path) = self.root.under(key)? else {
-            let mut chunk = vec![0u8; chunk_bytes];
-            fill_from(&self.fill, 0, &mut chunk);
-            return Ok(chunk);
-        };
-        let mut bytes = std::fs::read(&path)?;
-        let malformed = |what: String| AexError::MalformedZarr(format!("chunk {key}: {what}"));
-        // The codecs are listed in the order they were applied.
-        for codec in self.codecs.iter().rev() {
-            bytes = match codec {
-                ChunkCodec::Gzip => ungzip(&bytes, self.grid.chunk_bytes()).ok_or_else(|| {
-                    malformed("the gzip stream does not expand to a chunk".to_string())
-                })?,
-                ChunkCodec::Zstd => zstd::bulk::decompress(&bytes, chunk_bytes)
-                    .map_err(|e| malformed(format!("zstd: {e}")))?,
-                ChunkCodec::Crc32c => {
-                    strip_crc32c(bytes).ok_or_else(|| malformed("CRC-32C mismatch".to_string()))?
-                }
+    /// Where every inner chunk lies, reading each shard's index the first time.
+    fn index(&self, array: &ZarrArray) -> Result<&[ShardEntry]> {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let per_shard = self.inner.chunks() as usize;
+        let mut index = vec![ShardEntry::MISSING; self.shards.chunks() as usize * per_shard];
+        let mut coords = Vec::new();
+        for shard in 0..self.shards.chunks() {
+            let key = array.key_of(&self.shards, shard, &mut coords);
+            let malformed = |what: String| AexError::MalformedZarr(format!("shard {key}: {what}"));
+            // A shard nobody wrote leaves all of its chunks missing.
+            let Some(path) = array.root.under(&key)? else {
+                continue;
             };
+            let file = File::open(&path)?;
+            let len = file.metadata()?.len();
+            if len < self.index_bytes {
+                return Err(malformed(format!("{len} bytes cannot hold an index")));
+            }
+            let at = if self.index_at_start {
+                0
+            } else {
+                len - self.index_bytes
+            };
+            let mut raw = vec![0u8; self.index_bytes as usize];
+            file.read_exact_at(&mut raw, at)?;
+            if self.index_crc32c {
+                raw = strip_crc32c(raw)
+                    .ok_or_else(|| malformed("index CRC-32C mismatch".to_string()))?;
+            }
+            for i in 0..per_shard {
+                let pair = &raw[i * 16..(i + 1) * 16];
+                let entry = ShardEntry {
+                    offset: u64::from_le_bytes(pair[..8].try_into().expect("eight bytes")),
+                    nbytes: u64::from_le_bytes(pair[8..].try_into().expect("eight bytes")),
+                };
+                if entry.is_missing() {
+                    continue;
+                }
+                if entry
+                    .offset
+                    .checked_add(entry.nbytes)
+                    .is_none_or(|end| end > len)
+                {
+                    return Err(malformed(format!(
+                        "an inner chunk of {} bytes at {} does not fit {len} bytes",
+                        entry.nbytes, entry.offset
+                    )));
+                }
+                index[shard as usize * per_shard + i] = entry;
+            }
         }
-        if bytes.len() != chunk_bytes {
-            return Err(AexError::MalformedZarr(format!(
-                "chunk {key} holds {} bytes instead of {chunk_bytes}",
-                bytes.len()
-            )));
-        }
-        Ok(bytes)
+        Ok(self.index.get_or_init(|| index))
     }
 }
 
@@ -387,14 +629,28 @@ impl ArrayDataset for ZarrArray {
         &self.shape
     }
 
+    /// Builds the shard indexes here, on the control plane, so the data plane
+    /// never waits on metadata and a broken index fails the request that met
+    /// it rather than a transfer already under way.
+    fn layout(&self, indices: &[Index], quality: &QualitySpec) -> Result<SelectionLayout> {
+        if let Store::Sharded(sharded) = &self.store {
+            sharded.index(self)?;
+        }
+        SelectionLayout::resolve(&self.shape, self.dtype, indices, quality)
+    }
+
     fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()> {
         layout.read_with(offset, dst, |at, buf| self.read_at(at, buf))
     }
 
     fn decoded_chunk_bytes(&self) -> Option<u64> {
         // Every chunk is cached whole, compressed or not, so the server should
-        // size the cache for one per stream either way.
-        Some(self.grid.chunk_bytes())
+        // size the cache for one per stream either way. A shard is deliberately
+        // large and is never cached whole, so it is the inner chunk that counts.
+        Some(match &self.store {
+            Store::Chunked { grid, .. } => grid.chunk_bytes(),
+            Store::Sharded(sharded) => sharded.inner.chunk_bytes(),
+        })
     }
 }
 
@@ -502,6 +758,17 @@ fn key_encoding(prefix: &str, named: &Option<Named>) -> Result<KeyEncoding> {
         prefix: with_prefix,
         separator,
     })
+}
+
+/// The sharding codec of a chain, if that is what the chain is.
+///
+/// It has to be the whole chain: anything wrapping it would have to be undone
+/// before the index could be found.
+fn sharding_of(codecs: &[Named]) -> Option<&Named> {
+    match codecs {
+        [only] if only.name == "sharding_indexed" => Some(only),
+        _ => None,
+    }
 }
 
 /// The bytes-to-bytes codecs of a chain, refusing one this build cannot undo.
@@ -1061,6 +1328,10 @@ mod tests {
             let chunk: Vec<u64> = shape.iter().map(|_| 1).collect();
             let grid = ChunkGrid::new(shape, &chunk, 4).expect("grid");
             let last = grid.chunks() - 1;
+            let store = Store::Chunked {
+                grid,
+                codecs: Vec::new(),
+            };
             let array = ZarrArray {
                 root: Arc::new(StoreRoot {
                     path: PathBuf::from("/"),
@@ -1068,18 +1339,20 @@ mod tests {
                 prefix: prefix.to_string(),
                 dtype: DType::Int32,
                 shape: shape.to_vec(),
-                grid,
                 key: key_encoding(
                     "a",
                     &Some(serde_json::from_str(encoding).expect("encoding")),
                 )
                 .expect("encoding"),
-                codecs: Vec::new(),
+                store,
                 fill: vec![0; 4],
                 cache: Arc::new(DecodeCache::new(0)),
                 cache_key: 0,
             };
-            assert_eq!(array.chunk_key(last, &mut Vec::new()), expected);
+            let Store::Chunked { grid, .. } = &array.store else {
+                unreachable!("built as a chunked store");
+            };
+            assert_eq!(array.key_of(grid, last, &mut Vec::new()), expected);
         }
     }
 
@@ -1117,7 +1390,7 @@ mod tests {
     fn unservable_arrays_are_rejected() {
         // A store AEX cannot serve is the requester's problem; a store that
         // disagrees with itself will not serve however often it is asked.
-        let cases: [(&str, ErrorClass, &str); 12] = [
+        let cases: [(&str, ErrorClass, &str); 14] = [
             ("version 2", ErrorClass::Request, r#"{"zarr_format": 2}"#),
             ("version 4", ErrorClass::Request, r#"{"zarr_format": 4}"#),
             (
@@ -1164,9 +1437,28 @@ mod tests {
                 r#"{"codecs": [{"name": "bytes"}, {"name": "blosc"}]}"#,
             ),
             (
-                "a sharded array",
+                "a shard inside a shard",
                 ErrorClass::Request,
-                r#"{"codecs": [{"name": "sharding_indexed"}]}"#,
+                r#"{"codecs": [{"name": "sharding_indexed", "configuration": {
+                        "chunk_shape": [2, 2],
+                        "codecs": [{"name": "sharding_indexed"}],
+                        "index_codecs": [{"name": "bytes"}]}}]}"#,
+            ),
+            (
+                "a shard index that moves",
+                ErrorClass::Request,
+                r#"{"codecs": [{"name": "sharding_indexed", "configuration": {
+                        "chunk_shape": [2, 2],
+                        "codecs": [{"name": "bytes"}],
+                        "index_codecs": [{"name": "bytes"}, {"name": "gzip"}]}}]}"#,
+            ),
+            (
+                "inner chunks that do not fit a shard",
+                ErrorClass::Permanent,
+                r#"{"codecs": [{"name": "sharding_indexed", "configuration": {
+                        "chunk_shape": [3, 3],
+                        "codecs": [{"name": "bytes"}],
+                        "index_codecs": [{"name": "bytes"}]}}]}"#,
             ),
             (
                 "a storage transformer",
@@ -1339,6 +1631,168 @@ mod tests {
         assert!(matches!(err, AexError::MalformedZarr(_)), "{err}");
     }
 
+    /// The metadata of a sharded array of `shape`, shards of `shard`, inner
+    /// chunks of `inner`.
+    fn shard_meta(shape: &[u64], shard: &[u64], inner: &[u64], at_start: bool) -> String {
+        let location = if at_start { "start" } else { "end" };
+        format!(
+            r#"{{"chunk_grid": {{"name": "regular",
+                                 "configuration": {{"chunk_shape": {shard:?}}}}},
+                 "shape": {shape:?},
+                 "codecs": [{{"name": "sharding_indexed", "configuration": {{
+                     "chunk_shape": {inner:?},
+                     "codecs": [{{"name": "bytes", "configuration": {{"endian": "little"}}}}],
+                     "index_codecs": [{{"name": "bytes",
+                                        "configuration": {{"endian": "little"}}}},
+                                      {{"name": "crc32c"}}],
+                     "index_location": "{location}"}}}}]}}"#
+        )
+    }
+
+    /// One shard file holding `chunks` in order; `None` is an unwritten chunk.
+    fn shard_file(chunks: &[Option<Vec<u8>>], at_start: bool) -> Vec<u8> {
+        let mut index = Vec::new();
+        let mut body = Vec::new();
+        // With the index at the start, the chunks begin after it.
+        let base = if at_start {
+            chunks.len() as u64 * 16 + 4
+        } else {
+            0
+        };
+        for chunk in chunks {
+            match chunk {
+                Some(bytes) => {
+                    index.extend((base + body.len() as u64).to_le_bytes());
+                    index.extend((bytes.len() as u64).to_le_bytes());
+                    body.extend(bytes);
+                }
+                None => {
+                    index.extend(u64::MAX.to_le_bytes());
+                    index.extend(u64::MAX.to_le_bytes());
+                }
+            }
+        }
+        index.extend(crc32c::crc32c(&index).to_le_bytes());
+        if at_start {
+            index.extend(body);
+            index
+        } else {
+            body.extend(index);
+            body
+        }
+    }
+
+    #[test]
+    fn sharded_arrays_read_back_from_either_index_location() {
+        for at_start in [false, true] {
+            let store = StoreBuilder::new();
+            // Two shards along each axis, four inner chunks in each shard, and
+            // a shape the shards do not cover evenly.
+            let (shape, shard, inner) = ([5u64, 7], [4u64, 4], [2u64, 2]);
+            store.array(
+                "a",
+                "int32",
+                &shape,
+                &shard,
+                &shard_meta(&shape, &shard, &inner, at_start),
+            );
+
+            let values: Vec<i32> = (0..35).collect();
+            let flat: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            // Lay the array out by hand: shard grid 2x2, inner grid 2x2.
+            for (sr, sc) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                let mut chunks = Vec::new();
+                for (ir, ic) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    let mut chunk = Vec::new();
+                    let mut written = false;
+                    for r in 0..2 {
+                        for c in 0..2 {
+                            let row = sr * 4 + ir * 2 + r;
+                            let col = sc * 4 + ic * 2 + c;
+                            let v = if row < 5 && col < 7 {
+                                written = true;
+                                values[row * 7 + col]
+                            } else {
+                                0
+                            };
+                            chunk.extend(v.to_le_bytes());
+                        }
+                    }
+                    // A chunk wholly outside the array was never written.
+                    chunks.push(written.then_some(chunk));
+                }
+                store.write(&format!("a/c/{sr}/{sc}"), &shard_file(&chunks, at_start));
+            }
+
+            let file = store.open().expect("open");
+            let array = array_at(&file, "a");
+            assert_eq!(read_all(array.as_ref(), &[]), flat, "at_start={at_start}");
+            check_ranges(array.as_ref(), &flat);
+            // The inner chunk is what lands in the cache, not the shard.
+            assert_eq!(array.decoded_chunk_bytes(), Some(2 * 2 * 4));
+        }
+    }
+
+    #[test]
+    fn an_unwritten_shard_reads_as_the_fill_value() {
+        let store = StoreBuilder::new();
+        let (shape, shard, inner) = ([4u64], [2u64], [2u64]);
+        let mut meta = shard_meta(&shape, &shard, &inner, false);
+        meta.insert_str(1, r#""fill_value": -7, "#);
+        store.array("a", "int32", &shape, &shard, &meta);
+        // Only the first shard exists; the second is absent entirely.
+        store.write("a/c/0", &shard_file(&[Some(bytes_of(&[1i32, 2]))], false));
+
+        let file = store.open().expect("open");
+        let array = array_at(&file, "a");
+        let expected = bytes_of(&[1i32, 2, -7, -7]);
+        assert_eq!(read_all(array.as_ref(), &[]), expected);
+        check_ranges(array.as_ref(), &expected);
+    }
+
+    #[test]
+    fn a_broken_shard_is_reported_before_the_transfer() {
+        let whole = shard_file(&[Some(bytes_of(&[1i32, 2]))], false);
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("too short to hold an index", vec![0u8; 8]),
+            ("a damaged index checksum", {
+                let mut bytes = whole.clone();
+                let at = bytes.len() - 1;
+                bytes[at] ^= 0xff;
+                bytes
+            }),
+            ("an inner chunk off the end", {
+                let mut bytes = whole.clone();
+                // The index sits at the end; overwrite its first length.
+                let at = bytes.len() - 4 - 8;
+                bytes[at..at + 8].copy_from_slice(&u64::MAX.wrapping_sub(1).to_le_bytes());
+                let index = bytes.len() - 4 - 16;
+                let sum = crc32c::crc32c(&bytes[index..bytes.len() - 4]);
+                let end = bytes.len() - 4;
+                bytes[end..].copy_from_slice(&sum.to_le_bytes());
+                bytes
+            }),
+        ];
+        for (what, shard) in cases {
+            let store = StoreBuilder::new();
+            let (shape, shard_shape, inner) = ([2u64], [2u64], [2u64]);
+            store.array(
+                "a",
+                "int32",
+                &shape,
+                &shard_shape,
+                &shard_meta(&shape, &shard_shape, &inner, false),
+            );
+            store.write("a/c/0", &shard);
+
+            let file = store.open().expect("open");
+            let array = array_at(&file, "a");
+            // The index is built by layout(), on the control plane.
+            let err = array.layout(&[], &QualitySpec::default()).expect_err(what);
+            assert!(matches!(err, AexError::MalformedZarr(_)), "{what}: {err}");
+        }
+    }
+
     #[test]
     fn a_store_cannot_be_escaped() {
         let store = StoreBuilder::new();
@@ -1457,18 +1911,49 @@ mod tests {
         store.array("a", "int32", &shape, &chunk, "");
         let expected = write_chunks(&store, "a", &shape, &chunk, &values);
 
+        // The same numbers again, as one shard per 32x32 block of 8x8 chunks.
+        let (shard, inner) = ([32u64, 32], [8u64, 8]);
+        store.array(
+            "s",
+            "int32",
+            &shape,
+            &shard,
+            &shard_meta(&shape, &shard, &inner, false),
+        );
+        for sr in 0..2u64 {
+            for sc in 0..2u64 {
+                let mut chunks = Vec::new();
+                for ir in 0..4u64 {
+                    for ic in 0..4u64 {
+                        let mut chunk = Vec::new();
+                        for r in 0..8 {
+                            for c in 0..8 {
+                                let row = sr * 32 + ir * 8 + r;
+                                let col = sc * 32 + ic * 8 + c;
+                                chunk.extend(values[(row * 64 + col) as usize].to_le_bytes());
+                            }
+                        }
+                        chunks.push(Some(chunk));
+                    }
+                }
+                store.write(&format!("s/c/{sr}/{sc}"), &shard_file(&chunks, false));
+            }
+        }
+
         // Room for three chunks and eight readers, so they evict each other.
         let file =
             ZarrFile::open(store.path(), Arc::new(DecodeCache::new(3 * 8 * 8 * 4))).expect("open");
-        let array = array_at(&file, "a");
-        std::thread::scope(|scope| {
-            for _ in 0..8 {
-                scope.spawn(|| {
-                    for _ in 0..4 {
-                        assert_eq!(read_all(array.as_ref(), &[]), expected);
-                    }
-                });
-            }
-        });
+        for name in ["a", "s"] {
+            let array = array_at(&file, name);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        for _ in 0..4 {
+                            assert_eq!(read_all(array.as_ref(), &[]), expected, "{name}");
+                        }
+                    });
+                }
+            });
+        }
     }
 }

@@ -97,9 +97,9 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 - 対象 OS は Linux (最適化対象) と macOS。`pread` を使うため Unix 系に限る
 - 対応形式は `.npy`、HDF5 (netCDF-4 を含む)、Zarr v3。Zarr v2 と netCDF-3 は
   将来課題 (SPEC §14.1)
-- Zarr のコーデックは `bytes` / 恒等 `transpose` / gzip / zstd / crc32c のみ。
-  blosc と sharding は未対応で、open 時に理由を付けて拒否する。ストアはローカル
-  ディレクトリのみで、S3/HTTP ストアは扱わない
+- Zarr のコーデックは `bytes` / 恒等 `transpose` / gzip / zstd / crc32c と
+  `sharding_indexed`。blosc と入れ子の shard は未対応で、open 時に理由を付けて
+  拒否する。ストアはローカルディレクトリのみで、S3/HTTP ストアは扱わない
 - HDF5 の圧縮フィルタは deflate / shuffle / fletcher32 のみ。compact・virtual・
   外部ファイル格納のデータセットと external link は非対応 (SPEC §7.5)
 - 読み出し専用

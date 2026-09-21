@@ -27,16 +27,12 @@ use hdf5::types::{CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenAscii,
 use hdf5::LocationType;
 
 use crate::backend::{normalize_path, ArrayDataset, ArrayFile, AttrValue, Item};
-use crate::backends::chunks::{fill_from, ChunkGrid};
+use crate::backends::chunks::{fill_from, ChunkGrid, MAX_CHUNKS};
 use crate::backends::decode_cache::DecodeCache;
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
 use crate::quality::QualitySpec;
 use crate::selection::{Index, SelectionLayout};
-
-/// More chunks than this and the index alone would take gigabytes.
-// ponytail: the index is a dense table. A sparse one would lift this.
-const MAX_CHUNKS: u64 = 1 << 26;
 
 /// An HDF5 file opened for reading.
 pub struct Hdf5File {

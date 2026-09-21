@@ -126,6 +126,41 @@ def test_every_codec_chain_matches_zarr_python(chain, client, data_dir):
     np.testing.assert_array_equal(proxy[1:4, ::2], values[1:4, ::2])
 
 
+@pytest.mark.parametrize("location", ["end", "start"])
+def test_a_sharded_array_matches_zarr_python(location, client, data_dir):
+    """zarr-python is the oracle for the shard index, which is the whole point."""
+    path = data_dir / f"sharded-{location}.zarr"
+    values = np.arange(35, dtype=np.int32).reshape(5, 7)
+    # The serializer alone says how a shard is divided; `shards=` as well
+    # would nest a second sharding codec inside the first.
+    array = zarr.create_array(
+        str(path),
+        shape=(5, 7),
+        dtype="int32",
+        chunks=(4, 4),
+        compressors=None,
+        serializer=zarr.codecs.ShardingCodec(chunk_shape=(2, 2), index_location=location),
+    )
+    array[...] = values
+
+    proxy = client.open(str(path))[""]
+    np.testing.assert_array_equal(proxy[...], zarr.open_array(str(path))[...])
+    # A selection that crosses both shard and inner-chunk boundaries.
+    np.testing.assert_array_equal(proxy[1:5, ::3], values[1:5, ::3])
+
+
+def test_a_partly_written_shard_matches_zarr_python(client, data_dir):
+    path = data_dir / "sparse-shard.zarr"
+    array = zarr.create_array(
+        str(path), shape=(8, 8), dtype="int32", shards=(4, 4), chunks=(2, 2), fill_value=-3
+    )
+    # One shard written, the rest never touched.
+    array[0:4, 0:4] = np.arange(16, dtype=np.int32).reshape(4, 4)
+
+    proxy = client.open(str(path))[""]
+    np.testing.assert_array_equal(proxy[...], zarr.open_array(str(path))[...])
+
+
 def test_a_store_that_is_not_one_is_refused(client, data_dir):
     empty = data_dir / "empty.zarr"
     empty.mkdir(exist_ok=True)

@@ -12,6 +12,10 @@
 
 use crate::error::Result;
 
+/// A dense chunk index of this many entries already costs a gigabyte.
+// ponytail: the index is a dense table. A sparse one would lift this.
+pub(crate) const MAX_CHUNKS: u64 = 1 << 26;
+
 /// Chunks of one shape laid over an array of another.
 #[derive(Debug)]
 pub(crate) struct ChunkGrid {
