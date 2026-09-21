@@ -8,8 +8,8 @@
 use std::sync::{Arc, RwLock};
 
 use aex_client::{
-    ClientConfig, ClientError, DType, Encoding, ErrorClass, FileHandle, FunctionArg, Index, Item,
-    QualitySpec, Selection,
+    resolve_selection, AexError, ClientConfig, ClientError, DType, Encoding, ErrorClass,
+    FileHandle, FunctionArg, Index, Item, QualitySpec, Selection,
 };
 use half::f16;
 use numpy::{
@@ -39,6 +39,12 @@ fn to_py(err: ClientError) -> PyErr {
         _ => ("AexError", ErrorClass::Permanent),
     };
     aex_error(kind, class, err.to_string())
+}
+
+/// Raise a core error as the `aex.errors` exception for its class.
+fn core_error(err: AexError) -> PyErr {
+    let class = err.class();
+    aex_error(exception_for(class), class, err.to_string())
 }
 
 fn exception_for(class: ErrorClass) -> &'static str {
@@ -578,9 +584,28 @@ impl Batch<'_, '_> {
     }
 }
 
+/// Resolve `key` against an array of `shape` and `dtype`. Returns
+/// `(dtype, shape)` of what the selection would yield.
+///
+/// The server resolves a selection with this same function, so nothing here
+/// has to agree with it by hand; a client and a server that disagreed could
+/// not share a session anyway, since the protocol version has to match.
+#[pyfunction]
+fn resolve(
+    shape: Vec<u64>,
+    dtype: &str,
+    key: &Bound<'_, PyTuple>,
+) -> PyResult<(&'static str, Vec<u64>)> {
+    let dtype = DType::from_descr(dtype).map_err(core_error)?;
+    let indices = indices_from_py(key)?;
+    let resolved = resolve_selection(&shape, &indices).map_err(core_error)?;
+    Ok((dtype.descr(), resolved.out_shape))
+}
+
 #[pymodule]
 fn _aex(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<Plan>()?;
+    m.add_function(wrap_pyfunction!(resolve, m)?)?;
     Ok(())
 }

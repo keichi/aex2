@@ -345,11 +345,11 @@ class _Viewer:
     def __getitem__(self, key: Any) -> ArrayProxy:
         array = self._array
         wire_key = _to_wire(key, array.shape)
-        # The server resolves the selection, so it says what shape it has.
-        plan = array._native.prepare(array.handle, array.name, wire_key)
-        return ArrayProxy(
-            array._client, array.handle, array.name, plan.dtype, tuple(plan.shape), wire_key
-        )
+        # Resolved with the function the server would have used. Asking the
+        # server would cost a round trip, and leave it holding a plan for a
+        # transfer that never comes.
+        dtype, shape = _aex.resolve(array.shape, array.dtype.str, wire_key)
+        return ArrayProxy(array._client, array.handle, array.name, dtype, tuple(shape), wire_key)
 
 
 def _warn_as_numpy(name: str, out: npt.NDArray[Any], count: int, ddof: Any) -> None:
@@ -395,9 +395,9 @@ def _to_wire(key: Any, shape: tuple[int, ...]) -> Key:
     """Turn a numpy key into what the server takes.
 
     Only spelling is changed here; normalising and checking against the shape
-    is the server's job. The exception is a boolean mask, which becomes one
-    index array per axis it covers and is checked against those axes, since
-    the server never sees it.
+    is `aex-core`'s job, on whichever side runs it. The exception is a boolean
+    mask, which becomes one index array per axis it covers and is checked
+    against those axes, since it never reaches the wire.
     """
     entries = key if isinstance(key, tuple) else (key,)
 
