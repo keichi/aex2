@@ -19,7 +19,7 @@
 # low bits. The counting stores compress unboundedly under an error bound and
 # would say nothing about real data.
 #
-# Usage: [RTTS="0 100"] [RATES="1gbit"] zarr-lossy-sweep.sh [reps]
+# Usage: [RTTS="0 100"] [RATES="1gbit"] [STORE=... ELEMENTS=...] zarr-lossy-sweep.sh [reps]
 #   Both sides must be built with the sz feature, and the fixture must exist:
 #   mkzarr.py /mnt/aexram/wave.zarr 268435456 plain wave
 
@@ -38,10 +38,10 @@ COUNTERS=${COUNTERS:-1}
 HTTP=http://$SERVER_IP:8080
 AEX=http://$SERVER_IP:50391
 PY=".venv/bin/python -u benchmarks/mdx2/zarr-procs.py"
-ELEMENTS=$((1 << 28))    # 1 GiB, as the SZ3 measurement used
+ELEMENTS=${ELEMENTS:-$((1 << 28))}    # 1 GiB, as the SZ3 measurement used
 # Exact, exact-but-smaller, and three bounds. The field runs to about 300, so
 # 1.0 is coarse and 1e-3 is not.
-QUALITIES=("" "--codec gzip" "--abs-error 0.001" "--abs-error 0.01" "--abs-error 1.0")
+IFS="|" read -r -a QUALITIES <<< "${QUALITIES:-|--codec gzip|--abs-error 0.001|--abs-error 0.01|--abs-error 1.0}"
 
 restore() {
     clear_rtt

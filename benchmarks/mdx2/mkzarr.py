@@ -15,11 +15,17 @@ chunks in far fewer files, which is the comparison the layout exists for.
 than one fetch, so the pieces of it go to different connections and the
 cache is what stops them decoding it again each.
 
-Usage: python mkzarr.py OUTPUT ELEMENTS {plain,sharded,big} {counting,noisy,wave}
+An optional fifth argument quantizes the values to that many significant
+digits before storing them. The store is then an ordinary lossless one that
+happens to hold reduced-precision floats, which is what a user does who
+accepts loss in storage rather than in transfer.
+
+Usage: python mkzarr.py OUTPUT ELEMENTS {plain,sharded,big} {counting,noisy,wave} [DIGITS]
 """
 
 import sys
 
+import numcodecs
 import numpy as np
 import zarr
 
@@ -42,6 +48,8 @@ def wave(i):
 
 def main() -> None:
     path, elements, layout, content = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+    digits = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+    quantize = numcodecs.Quantize(digits, "float32") if digits else None
     shape = {"chunks": (CHUNK,)}
     if layout == "sharded":
         shape = {"chunks": (CHUNK,), "shards": (SHARD,)}
@@ -66,6 +74,8 @@ def main() -> None:
             values = wave(i)
         else:
             values = (i % 1000 + rng.integers(0, 16, i.size)).astype(np.float32)
+        if quantize:
+            values = quantize.encode(values)
         if content == "wave":
             array[start // ROW : (start + i.size) // ROW] = values.reshape(-1, ROW)
         else:
