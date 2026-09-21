@@ -14,6 +14,12 @@ use crate::error::Result;
 /// Identifies one storage chunk: which dataset, and which chunk of it.
 pub type ChunkKey = (u64, u64);
 
+/// Buffers kept back for the next decode.
+// ponytail: a fixed bound the pool never approaches -- a miss takes one and an
+// eviction hands one back, so it sits near one per connection. Tie it to the
+// stream limit if a configuration ever gets near it.
+const MAX_SPARES: usize = 32;
+
 /// A byte-bounded LRU of decoded chunks.
 ///
 /// One lock for the whole cache: it is held only to look up or insert, never
@@ -22,6 +28,11 @@ pub type ChunkKey = (u64, u64);
 /// Chunks are held as `Arc<Vec<u8>>` rather than `Arc<[u8]>`: the latter
 /// cannot take a `Vec`'s buffer, so every chunk would be allocated and copied
 /// a second time on its way in.
+///
+/// An evicted chunk's buffer is kept and lent to the next decode. A chunk is
+/// four megabytes, which is over the threshold where the allocator asks the
+/// kernel, so letting them go means paying for the mapping and for zeroing
+/// its pages again on the way back.
 pub struct DecodeCache {
     capacity: u64,
     lru: Mutex<Lru>,
@@ -56,6 +67,8 @@ struct Lru {
     // map would pay off only with many small chunks.
     entries: VecDeque<(ChunkKey, Arc<Vec<u8>>)>,
     bytes: u64,
+    /// Buffers of evicted chunks, waiting to be lent out again.
+    spare: Vec<Vec<u8>>,
 }
 
 impl DecodeCache {
@@ -83,21 +96,33 @@ impl DecodeCache {
     }
 
     /// The decoded chunk at `key`, decoding it with `decode` on a miss.
+    ///
+    /// `decode` is handed a buffer to write the chunk into, which is an
+    /// evicted chunk's if one is waiting. It is free to return a different
+    /// one; the lent buffer is then simply dropped.
     // ponytail: two threads missing the same chunk at once both decode it.
-    // Wait on an in-flight decode instead if measurements show it matters.
+    // Measured: with a chunk the size of one fetch it never happens, with a
+    // chunk sixteen times larger it is most of the decoding. Wait on an
+    // in-flight decode when that case is worth serving.
     pub fn get_or_decode(
         &self,
         key: ChunkKey,
-        decode: impl FnOnce() -> Result<Vec<u8>>,
+        decode: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
     ) -> Result<Arc<Vec<u8>>> {
         if let Some(hit) = self.get(key) {
             self.counts.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hit);
         }
         self.counts.misses.fetch_add(1, Ordering::Relaxed);
-        let chunk = Arc::new(decode()?);
+        let chunk = Arc::new(decode(self.take_spare())?);
         self.insert(key, chunk.clone());
         Ok(chunk)
+    }
+
+    /// A buffer for the next decode: an evicted chunk's, or a new one.
+    fn take_spare(&self) -> Vec<u8> {
+        let mut lru = self.lru.lock().unwrap_or_else(|e| e.into_inner());
+        lru.spare.pop().unwrap_or_default()
     }
 
     fn get(&self, key: ChunkKey) -> Option<Arc<Vec<u8>>> {
@@ -125,6 +150,13 @@ impl DecodeCache {
         while lru.bytes > self.capacity {
             let (_, evicted) = lru.entries.pop_front().expect("bytes > 0 means entries");
             lru.bytes -= evicted.len() as u64;
+            // Only when nobody is still reading it. If someone is, their own
+            // handle keeps it alive and it is freed when they are done.
+            if lru.spare.len() < MAX_SPARES {
+                if let Some(buffer) = Arc::into_inner(evicted) {
+                    lru.spare.push(buffer);
+                }
+            }
         }
     }
 
@@ -150,10 +182,12 @@ mod tests {
     use super::*;
     use crate::error::AexError;
 
-    fn decode_to(len: usize, calls: &Cell<u32>) -> impl FnOnce() -> Result<Vec<u8>> + '_ {
-        move || {
+    fn decode_to(len: usize, calls: &Cell<u32>) -> impl FnOnce(Vec<u8>) -> Result<Vec<u8>> + '_ {
+        move |mut chunk| {
             calls.set(calls.get() + 1);
-            Ok(vec![0; len])
+            chunk.clear();
+            chunk.resize(len, 0);
+            Ok(chunk)
         }
     }
 
@@ -205,13 +239,63 @@ mod tests {
         // the same key looks to the cache: the second insert finds it there.
         let inner = &cache;
         cache
-            .get_or_decode((1, 7), || {
+            .get_or_decode((1, 7), |chunk| {
                 inner.get_or_decode((1, 7), decode_to(10, &calls))?;
-                Ok(vec![0; 10])
+                Ok(chunk)
             })
             .unwrap();
         assert_eq!(cache.stats().races, 1);
         assert_eq!(cache.stats().misses, 2, "both decodes happened");
+    }
+
+    #[test]
+    fn an_evicted_chunk_lends_its_buffer_to_the_next_decode() {
+        // Room for two chunks, so the third evicts the first. A buffer is
+        // taken before the insert that frees one, so the fourth is the decode
+        // that gets it.
+        let cache = DecodeCache::new(20);
+        let calls = Cell::new(0);
+        for chunk in 0..3 {
+            cache
+                .get_or_decode((0, chunk), decode_to(10, &calls))
+                .unwrap();
+        }
+
+        let lent = Cell::new(0usize);
+        cache
+            .get_or_decode((0, 3), |mut chunk| {
+                lent.set(chunk.capacity());
+                chunk.clear();
+                chunk.resize(10, 0);
+                Ok(chunk)
+            })
+            .unwrap();
+        assert_eq!(lent.get(), 10, "the buffer came back with its capacity");
+    }
+
+    #[test]
+    fn a_buffer_still_being_read_is_not_lent_out() {
+        let cache = DecodeCache::new(20);
+        let calls = Cell::new(0);
+        // Hold chunk 0 the way a reader in the middle of a copy does, then
+        // push it out of the cache.
+        let held = cache.get_or_decode((0, 0), decode_to(10, &calls)).unwrap();
+        for chunk in 1..3 {
+            cache
+                .get_or_decode((0, chunk), decode_to(10, &calls))
+                .unwrap();
+        }
+
+        let lent = Cell::new(usize::MAX);
+        cache
+            .get_or_decode((0, 3), |mut chunk| {
+                lent.set(chunk.capacity());
+                chunk.resize(10, 0);
+                Ok(chunk)
+            })
+            .unwrap();
+        assert_eq!(lent.get(), 0, "a fresh buffer, since chunk 0 is still held");
+        assert_eq!(*held, vec![0u8; 10], "and the reader's chunk is intact");
     }
 
     #[test]
@@ -250,7 +334,7 @@ mod tests {
     fn a_failed_decode_is_not_cached() {
         let cache = DecodeCache::new(100);
         let err = cache
-            .get_or_decode((0, 0), || Err(AexError::MalformedHdf5("bad".into())))
+            .get_or_decode((0, 0), |_| Err(AexError::MalformedHdf5("bad".into())))
             .unwrap_err();
         assert!(matches!(err, AexError::MalformedHdf5(_)));
         assert!(cache.keys().is_empty());
