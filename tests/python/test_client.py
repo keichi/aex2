@@ -474,6 +474,13 @@ def test_numpy_function_with_proxies_in_a_list(array_proxy):
     assert result.shape == (200, 200)
 
 
+def test_a_proxy_used_twice_is_downloaded_once(client, ds_paths):
+    arr = client.open(ds_paths["ds1"])["array"]
+    before = client.stats()["bytes"]
+    np.concatenate([arr, arr])
+    assert client.stats()["bytes"] - before == arr.nbytes
+
+
 # ============================================================
 # Errors
 # ============================================================
