@@ -531,6 +531,20 @@ impl ControlService {
                  chunks will be decoded repeatedly"
             );
         }
+
+        // Misses are decodes. Against the chunks a transfer delivers, they say
+        // whether the cache held a chunk long enough to be read out or evicted
+        // it under a reader still walking it. Cumulative, so a measurement
+        // takes the difference across the transfer it cares about.
+        let stats = self.decode_cache.stats();
+        tracing::debug!(
+            hits = stats.hits,
+            misses = stats.misses,
+            races = stats.races,
+            chunk_bytes,
+            streams,
+            "decode cache"
+        );
     }
 }
 

@@ -6,6 +6,7 @@
 //! matter how the transfer was split.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
@@ -20,6 +21,28 @@ pub type ChunkKey = (u64, u64);
 pub struct DecodeCache {
     capacity: u64,
     lru: Mutex<Lru>,
+    counts: Counts,
+}
+
+/// What the cache did, since the server started.
+///
+/// Misses are decodes, so comparing them with the chunks a transfer delivered
+/// says whether the cache is holding a chunk long enough to be read out, or
+/// evicting it under the reader that is still walking it.
+#[derive(Debug, Default)]
+pub struct Counts {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    /// Chunks two threads decoded at once. Both decodes happened; one is lost.
+    races: AtomicU64,
+}
+
+/// A reading of [`Counts`], for logging or for a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub races: u64,
 }
 
 #[derive(Default)]
@@ -37,11 +60,22 @@ impl DecodeCache {
         DecodeCache {
             capacity,
             lru: Mutex::default(),
+            counts: Counts::default(),
         }
     }
 
     pub fn capacity(&self) -> u64 {
         self.capacity
+    }
+
+    /// What the cache has done so far. Counters never reset, so a measurement
+    /// takes the difference across the transfer it cares about.
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.counts.hits.load(Ordering::Relaxed),
+            misses: self.counts.misses.load(Ordering::Relaxed),
+            races: self.counts.races.load(Ordering::Relaxed),
+        }
     }
 
     /// The decoded chunk at `key`, decoding it with `decode` on a miss.
@@ -53,8 +87,10 @@ impl DecodeCache {
         decode: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<Arc<[u8]>> {
         if let Some(hit) = self.get(key) {
+            self.counts.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hit);
         }
+        self.counts.misses.fetch_add(1, Ordering::Relaxed);
         let chunk: Arc<[u8]> = decode()?.into();
         self.insert(key, chunk.clone());
         Ok(chunk)
@@ -77,6 +113,7 @@ impl DecodeCache {
         let mut lru = self.lru.lock().unwrap_or_else(|e| e.into_inner());
         // Another thread decoded it too.
         if lru.entries.iter().any(|(k, _)| *k == key) {
+            self.counts.races.fetch_add(1, Ordering::Relaxed);
             return;
         }
         lru.entries.push_back((key, chunk));
@@ -128,6 +165,49 @@ mod tests {
         // Another dataset's chunk 7 is another chunk.
         cache.get_or_decode((2, 7), decode_to(10, &calls)).unwrap();
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn the_counters_say_how_often_a_decode_was_saved() {
+        let cache = DecodeCache::new(100);
+        let calls = Cell::new(0);
+        for _ in 0..4 {
+            cache.get_or_decode((1, 7), decode_to(10, &calls)).unwrap();
+        }
+        assert_eq!(
+            cache.stats(),
+            CacheStats {
+                hits: 3,
+                misses: 1,
+                races: 0
+            }
+        );
+
+        // A chunk that does not fit is decoded every time and never held, so
+        // every look is a miss rather than a silent hit.
+        let big = DecodeCache::new(4);
+        for _ in 0..3 {
+            big.get_or_decode((1, 7), decode_to(10, &calls)).unwrap();
+        }
+        assert_eq!(big.stats().hits, 0);
+        assert_eq!(big.stats().misses, 3);
+    }
+
+    #[test]
+    fn a_chunk_two_threads_decoded_at_once_is_counted() {
+        let cache = DecodeCache::new(100);
+        let calls = Cell::new(0);
+        // Decoding from inside the decode closure is how two threads racing on
+        // the same key looks to the cache: the second insert finds it there.
+        let inner = &cache;
+        cache
+            .get_or_decode((1, 7), || {
+                inner.get_or_decode((1, 7), decode_to(10, &calls))?;
+                Ok(vec![0; 10])
+            })
+            .unwrap();
+        assert_eq!(cache.stats().races, 1);
+        assert_eq!(cache.stats().misses, 2, "both decodes happened");
     }
 
     #[test]

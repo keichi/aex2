@@ -9,7 +9,11 @@ it; ``noisy`` compresses about as poorly as real data and is read with
 one open per chunk on the transfer's hot path. ``sharded`` holds the same
 chunks in far fewer files, which is the comparison the layout exists for.
 
-Usage: python mkzarr.py OUTPUT ELEMENTS {plain,sharded} {counting,noisy}
+``big`` is the case the decode cache was designed for: a chunk far larger
+than one fetch, so the pieces of it go to different connections and the
+cache is what stops them decoding it again each.
+
+Usage: python mkzarr.py OUTPUT ELEMENTS {plain,sharded,big} {counting,noisy}
 """
 
 import sys
@@ -20,6 +24,7 @@ import zarr
 BATCH = 1 << 24
 CHUNK = 1 << 20  # 4 MiB of float32, the server's default fetch size.
 SHARD = CHUNK * 64  # 256 MiB a file, so one store is a handful of them.
+BIG = CHUNK * 16  # 64 MiB, sixteen fetches to a chunk.
 
 
 def main() -> None:
@@ -27,6 +32,8 @@ def main() -> None:
     shape = {"chunks": (CHUNK,)}
     if layout == "sharded":
         shape = {"chunks": (CHUNK,), "shards": (SHARD,)}
+    elif layout == "big":
+        shape = {"chunks": (BIG,)}
     rng = np.random.default_rng(0)
     # The array is a child named ``array``, not the store itself: that is the
     # name aexbench asks for, as it does for the HDF5 fixtures.
