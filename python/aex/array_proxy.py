@@ -19,6 +19,24 @@ if TYPE_CHECKING:
 
 __all__ = ["ArrayProxy", "QualityView", "set_fallback_policy", "set_fallback_threshold"]
 
+
+def _attrs_from_wire(raw: dict[str, Any]) -> dict[str, Any]:
+    """Decode what the extension returns: text as is, numbers as numpy.
+
+    A scalar attribute comes back as a numpy scalar rather than a 0-d array,
+    so ``_FillValue`` compares and casts the way h5py's does.
+    """
+    out: dict[str, Any] = {}
+    for name, value in raw.items():
+        if isinstance(value, str):
+            out[name] = value
+        else:
+            descr, shape, data = value
+            array = np.frombuffer(data, dtype=descr).reshape(shape)
+            out[name] = array[()] if array.ndim == 0 else array
+    return out
+
+
 FallbackPolicy = Literal["warn", "allow", "error"]
 
 _fallback_policy: FallbackPolicy = "warn"
@@ -107,6 +125,7 @@ class ArrayProxy:
         dtype: str,
         shape: tuple[int, ...],
         key: Key | None = None,
+        attrs: dict[str, Any] | None = None,
     ) -> None:
         self._client = client
         self._native = client._native
@@ -116,6 +135,15 @@ class ArrayProxy:
         self.shape = shape
         # The selection of the array this is a view of, in wire form.
         self._key = key
+        # Fetched on first use when whoever built this proxy had none.
+        self._attrs = attrs
+
+    @property
+    def attrs(self) -> dict[str, Any]:
+        """The array's HDF5/netCDF attributes. Empty for a format without any."""
+        if self._attrs is None:
+            self._attrs = _attrs_from_wire(self._native.get_item(self.handle, self.name)[1])
+        return self._attrs
 
     @property
     def view(self) -> "_Viewer":
@@ -373,7 +401,16 @@ class _Viewer:
         # server would cost a round trip, and leave it holding a plan for a
         # transfer that never comes.
         dtype, shape = _aex.resolve(array.shape, array.dtype.str, wire_key)
-        return ArrayProxy(array._client, array.handle, array.name, dtype, tuple(shape), wire_key)
+        # A view is the same dataset, so its attributes are the same ones.
+        return ArrayProxy(
+            array._client,
+            array.handle,
+            array.name,
+            dtype,
+            tuple(shape),
+            wire_key,
+            array._attrs,
+        )
 
 
 def _warn_as_numpy(name: str, out: npt.NDArray[Any], count: int, ddof: Any) -> None:

@@ -18,12 +18,21 @@ SHAPE = (12, 7, 5)
 def h5_path(data_dir):
     path = data_dir / "test.h5"
     with h5py.File(path, "w") as f:
+        f.attrs["Conventions"] = "CF-1.8"
         g1 = f.create_group("g1")
+        g1.attrs["title"] = "a group"
         ds1 = g1.create_dataset("ds1", (100, 200), dtype=np.float32)
+        ds1.attrs["units"] = "K"
+        # How netCDF-4 writes text: fixed-length ASCII.
+        ds1.attrs.create("long_name", "temperature", dtype="S12")
+        ds1.attrs["valid_range"] = np.array([0.0, 1.0])
+        # No wire form: one attribute cannot carry several strings.
+        ds1.attrs["flag_meanings"] = ["a", "b"]
         g1.create_dataset("ds2", (100, 200), dtype=np.float64)
         g3 = g1.create_group("g3")
         g3.create_dataset("ds3", (100, 200), dtype=np.int8)
-        g3.create_dataset("ds4", (100, 200), dtype=np.int16, fillvalue=-3)
+        ds4 = g3.create_dataset("ds4", (100, 200), dtype=np.int16, fillvalue=-3)
+        ds4.attrs["_FillValue"] = np.int16(-3)
         g2 = f.create_group("g2")
         g2.create_dataset("ds5", (100, 200), dtype=np.int32)
         g2.create_dataset("ds6", (100, 200), dtype=np.int64)
@@ -175,3 +184,49 @@ def test_a_netcdf4_file_is_served(client, data_dir):
     with h5py.File(path, "w") as f:
         f.create_dataset("t", data=array)
     np.testing.assert_array_equal(client.open(str(path))["t"][1:3], array[1:3])
+
+
+def test_attributes_arrive_with_the_items(h5):
+    ds1 = h5["g1/ds1"]
+    assert ds1.attrs["units"] == "K"
+    # The padding of the fixed-length type does not come with it.
+    assert ds1.attrs["long_name"] == "temperature"
+    valid_range = ds1.attrs["valid_range"]
+    assert isinstance(valid_range, np.ndarray)
+    assert valid_range.dtype == np.float64
+    assert valid_range.tolist() == [0.0, 1.0]
+    # Sorted by name, and the one with no wire form is left out.
+    assert list(ds1.attrs) == ["long_name", "units", "valid_range"]
+
+    assert h5["g1"].attrs["title"] == "a group"
+    # The root group carries the netCDF global attributes; FileProxy has not
+    # called GetItem, so this is the lazy path.
+    assert h5.attrs["Conventions"] == "CF-1.8"
+
+
+def test_a_fill_value_keeps_the_dtype_of_its_dataset(h5):
+    fill = h5["g1/g3/ds4"].attrs["_FillValue"]
+    assert isinstance(fill, np.int16)
+    assert fill == -3
+
+
+def test_attributes_come_prefilled_and_views_inherit_them(h5):
+    # The request that built the proxy already carried them, so reading
+    # .attrs is not a further one.
+    ds1 = h5["g1/ds1"]
+    assert ds1._attrs is not None
+
+    # The one listing behind items() carries every child's attributes too, so
+    # reading them all is still one request for the whole group.
+    units = {name: item.attrs.get("units") for name, item in h5["g1"].items()}
+    assert units == {"ds1": "K", "ds2": None, "g3": None}
+    assert all(item._attrs is not None for item in h5["g1"].values())
+
+    # A view is the same dataset, so it inherits the attributes rather than
+    # asking for them again.
+    assert ds1.view[0:2].attrs is ds1.attrs
+
+
+def test_npy_items_have_no_attributes(array_proxy, file_proxy):
+    assert array_proxy.attrs == {}
+    assert file_proxy.attrs == {}
