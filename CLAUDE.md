@@ -16,6 +16,11 @@ a raw-TCP data plane. The design lives in `SPEC.md`; milestones are in its §13.
 Commit one feature at a time. A commit should be a single self-contained change
 that builds and passes its tests on its own; do not bundle unrelated work.
 
+Write in English everything that lands on GitHub: commit messages, PR titles
+and descriptions, and issue and review comments. The language follows the
+destination, not the conversation that produced it — which is also why
+`SPEC.md` and `docs/` stay Japanese however the work was discussed.
+
 ## Checks
 
 ```console
