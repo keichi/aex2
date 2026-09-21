@@ -25,6 +25,7 @@ set -euo pipefail
 
 REPS=${1:-3}
 . "$(dirname "$0")/netem.sh"
+. "$(dirname "$0")/measure.sh"
 
 read -r -a RTTS <<< "${RTTS:-0 5 25 100}"
 read -r -a STORES <<< "${STORES:-mem-noisy.zarr mem.zarr}"
@@ -43,31 +44,6 @@ restore() {
     set_buffers default
 }
 trap restore EXIT
-
-# Bytes the server put on the wire, and CPU seconds it spent producing them.
-# Both readers are served by this machine, so one pair of counters covers both:
-# aex-server decompressing, or nginx reading files.
-counters() {
-    ssh "$SERVER" bash -s <<'EOF'
-grep enp3s0 /proc/net/dev | tr ':' ' ' | awk '{printf "%s ", $10}'
-for p in $(pgrep -x aex-server) $(pgrep -x nginx); do cat "/proc/$p/stat"; done |
-    awk '{s += $14 + $15} END {print s}'
-EOF
-}
-
-# One measurement, with the server-side cost around it when asked for.
-run() {
-    local label=$1 before after
-    shift
-    [ -n "${COUNTERS:-}" ] && before=$(counters)
-    ssh "$CLIENT" "bash -lc 'cd aex2 && $*'"
-    if [ -n "${COUNTERS:-}" ]; then
-        after=$(counters)
-        echo "$before $after" |
-            awk -v l="$label" '{printf "%s  wire %6.0f MiB  server cpu %5.2f s\n",
-                l, ($3 - $1) / 1048576, ($4 - $2) / 100}'
-    fi
-}
 
 set_buffers tuned
 for _ in $(seq "$REPS"); do

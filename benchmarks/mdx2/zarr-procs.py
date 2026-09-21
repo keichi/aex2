@@ -71,7 +71,10 @@ def open_array(args, store=None, backend=None):
 def work(args, k, procs, done):
     """Read process k's slice of the array and report what it cost."""
     array, _session = open_array(args)
-    step = args.elements // procs
+    # The split is along the leading axis, which for a two-dimensional field is
+    # rows rather than elements. A quality view has no shape; it wraps one.
+    rows = min(args.elements, getattr(array, "array", array).shape[0])
+    step = rows // procs
     cpu = time.process_time()
     out = array[k * step : (k + 1) * step]
     # The server drops a quality it cannot apply and sends exact data, so a run
