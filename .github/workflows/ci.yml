@@ -85,3 +85,44 @@ jobs:
       # The fixtures build and start aex-server themselves.
       - name: pytest
         run: pytest
+
+  wheels:
+    name: wheel (${{ matrix.os }})
+    # The jobs above only ever pip install -e. Building in the manylinux
+    # container is the only way to find out before a release that the wheel is
+    # unportable.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      # One abi3 wheel covers every Python from 3.11 on, so no Python matrix.
+      - uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist
+          manylinux: auto
+          # The container's own protobuf-compiler is 3.5, too old for proto3
+          # optional fields.
+          before-script-linux: |
+            dnf install -y unzip || yum install -y unzip
+            curl -sSLo /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip
+            unzip -q /tmp/protoc.zip -d /usr/local
+      # Nothing built in the container is installable on the runner's Python,
+      # so import the wheel where it can be installed.
+      - name: import the wheel
+        if: runner.os == 'macOS'
+        run: |
+          pip install dist/*.whl
+          python -c "import aex; print(aex.__file__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: dist/*.whl
