@@ -1866,9 +1866,14 @@ SZ3 を値域の 0.1 % の誤差で掛けると 61.8 倍になる。
 
 **完了**。`Item::Group` を trait object にせずに済んだ ── 属性はアイテムではなく
 パスに付くので、`ArrayFile` に既定実装つきのメソッドを 1 本足すだけで、他の
-バックエンドは無変更のままになった。これで xarray バックエンドの土台が揃うが、
-h5netcdf は変数の次元名を dimension scale (`DIMENSION_LIST`、オブジェクト参照)
-から組むので、それは別途必要になる。
+バックエンドは無変更のままになった。libnetcdf 4.9.3 が書いたファイルで、
+グローバル属性・グループ属性・変数の属性がすべて h5py と一致することを確認した。
+
+**次元名はまだ出ていないが、参照を復号しなくても出せる**。libnetcdf は次元ごとに
+必ずデータセットを作り (座標変数が無い次元も `CLASS=DIMENSION_SCALE` と
+`_Netcdf4Dimid` を持つ)、変数側は `_Netcdf4Coordinates` に次元 id を順番どおり
+持つ。`DIMENSION_LIST` (オブジェクト参照) を読む必要はなく、id から同じ
+`_Netcdf4Dimid` を持つデータセットを引いてその名前を取ればよい。
 
 ---
 
@@ -1890,7 +1895,8 @@ h5netcdf は変数の次元名を dimension scale (`DIMENSION_LIST`、オブジ�
 | ~~間引き (SUBSAMPLE)~~ | 実装しない。`arr[::2]` が同じバイト列を既に頼めるので、増えるのは「ストライドを決めるのがどちらか」だけ。実データでは同じ誤差で SZ3 に圧縮率で桁違いに負ける | — | — |
 | ~~ZFP~~ | SZ3 の後に実装済み (第 5.5.1 節)。枠の見積りどおり `Codec` の値 1 つ・feature 1 つ・モジュール 1 つ・`match` の腕 2 つで載った | — | — |
 | ZFP・SZ3 以外の誤差上限付きアルゴリズム | 2 つあれば比較はできる。libpressio の Rust バインディングは未公開のままで、今も使えない | `Codec` の値 1 つと `codec::compress` / `decompress_into` の腕 1 つ | この 2 つで物足りないと分かった時点 |
-| ワイヤ形を持たない属性型 (compound / enum / 参照 / 文字列の配列) と属性の書き込み | 読み出しの read-only で用途は足りる。参照は netCDF-4 の内部表現 (`DIMENSION_LIST`) で、意味を持たせるには次元名の対応が要る | `Attribute.value` の oneof に腕を 1 つ足せばよい | xarray バックエンドで次元名が要る時点 |
+| ワイヤ形を持たない属性型 (compound / enum / 参照 / 文字列の配列) と属性の書き込み | 読み出しの read-only で用途は足りる。落ちる参照は netCDF-4 の `DIMENSION_LIST` だが、次元名は `_Netcdf4Coordinates` と `_Netcdf4Dimid` から参照なしで組めるので、これが止めているものは無い | `Attribute.value` の oneof に腕を 1 つ足せばよい | 実データで compound の属性に当たった時点 |
+| 変数の次元名 (`Dataset.dims`) | 属性だけでは xarray は変数の軸を名前で呼べない。クライアント側で組み立てるか、サーバが `Dataset` に載せるかを決めていない | `Dataset` にフィールドを 1 つ、または既に届いている属性からクライアントで導出 | xarray バックエンドに着手する時点 |
 | TLS | 「信頼できる環境」前提。暗号化すると受信側のゼロコピーが成立しなくなる | HELLO の `flags` にネゴシエーションビットを予約 | 公開運用を検討する時点 |
 | 書き込み (`DoPut` 相当) | read-only で研究目的は達成できる | フレーム種別の未使用値 (0x04、0x07 以降)。`FETCH` と対になる `PUSH` を追加可能 | 要望が出た時点 |
 | ~~密な選択に対する一括 pread + 集約~~ | M4 の測定で律速と判明し実装済み (隙間 4 KiB 以下の断片を最大 1 MiB の窓で一括読み)。[docs/benchmark-m4.md](docs/benchmark-m4.md) | — | — |

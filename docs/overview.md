@@ -78,8 +78,11 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
   既定ビルドと Python の wheel にはどちらのコーデックも入っていない
 - **表現できない型の属性は `.attrs` に現れない**。数値と文字列は載るが、compound、
   enum、オブジェクト参照、opaque、文字列の配列、および 64 KiB を超えるものは
-  黙って落ちる。netCDF-4 の `DIMENSION_LIST` は参照なので、変数の次元名は
-  今のところ見えない
+  黙って落ちる。netCDF-4 が書く `CLASS` / `NAME` / `_Netcdf4Dimid` などの内部属性は
+  h5py と同じく見えたままで、隠すのは上の層の仕事とした
+- **変数の次元名は出していない**。`.attrs` に `_Netcdf4Coordinates` (次元 id) は
+  届くので、次元データセットの `_Netcdf4Dimid` と突き合わせれば名前は組めるが、
+  その対応づけはまだ実装していない
 - **多次元の整数インデックス配列は非対応**。1 次元にして送り、結果を reshape すること
 - **credit は固定値** (既定 16、`AEX_CREDIT`)。RTT と帯域から自動で決める処理は
   入れていない。**遅延のある回線では `streams × credit × chunk_bytes` が転送の
