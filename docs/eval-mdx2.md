@@ -120,10 +120,14 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/mem-shard.zarr` | 同じチャンクを 256 MiB の shard に束ねたもの = **ファイル 16 個** | `... mem-shard.zarr 1073741824 sharded counting` |
 | `/mnt/aexram/mem-noisy.zarr` | 圧縮の効きにくい中身を `plain` で。`--pattern none` で読む | `... mem-noisy.zarr 1073741824 plain noisy` |
 | `/mnt/aexram/mem-noisy-shard.zarr` | 同じ中身を `sharded` で | `... mem-noisy-shard.zarr 1073741824 sharded noisy` |
+| `/mnt/aexram/wave.zarr` | `wave.npy` と同じ場を Zarr で。131072 × 2048、4 MiB チャンク。誤差保証圧縮を測れる唯一の Zarr フィクスチャ | `... wave.zarr 268435456 plain wave` |
+| `/mnt/aexram/wave-q2.zarr` | 同じ場を `numcodecs.Quantize(2)` に通して格納 (最大誤差 3.9e-3)。**保存の時点で精度を落とした相手**として測るため | `... wave-q2.zarr 268435456 plain wave 2` |
 | `/mnt/aexram/mem-noisy-big.zarr` | 同じ中身を **64 MiB チャンク**で。デコードキャッシュが接続をまたいで共有する場面を作る (既定の 1 GiB キャッシュで測る) | `... mem-noisy-big.zarr 1073741824 big noisy` |
 | `~/disk/disk{,-shard,-noisy,-noisy-shard}.zarr` | 上の 4 つを virtio ディスクに置いたもの。コールド読みの比較用 | `... ~/disk/disk.zarr 1073741824 plain counting` など |
 
 - `mknpy` と `mkzarr.py` の第 2 引数はバイト数ではなく**要素数**
+- `wave` のストアだけ 2 次元である (`.npy` と同じ 2048 要素の行)。誤差保証圧縮の
+  予測器は近傍を使うので、1 本の長い行では同じ仕事にならない
 - Zarr のフィクスチャには `.venv` に `zarr>=3` が要る (`uv pip install 'zarr>=3'`)。
   `plain` と `sharded` の対は**ファイル数だけが違う**ので、転送のホットパスに乗る
   `open` の回数が効くかどうかがそのまま出る
