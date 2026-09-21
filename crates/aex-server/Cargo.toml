@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 [features]
 # Error-bounded lossy compression. See aex-core for the build requirements.
 sz = ["aex-core/sz"]
+zfp = ["aex-core/zfp"]
 hdf5 = ["aex-core/hdf5"]
 
 [dev-dependencies]

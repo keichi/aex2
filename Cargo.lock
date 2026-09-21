@@ -41,6 +41,7 @@ dependencies = [
  "sz3",
  "tempfile",
  "thiserror",
+ "zfp-sys",
 ]
 
 [[package]]
@@ -95,6 +96,7 @@ dependencies = [
  "aex-proto",
  "aex-server",
  "aex-wire",
+ "half",
  "hdf5-metno",
  "npyz",
  "tempfile",
@@ -264,6 +266,8 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
+ "log",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -2116,6 +2120,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "zfp-sys"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a2806d813181dea8b5b6fe98b5682379e6579550abe4a830dfa35d4130bc820"
+dependencies = [
+ "bindgen",
+ "cmake",
 ]
 
 [[package]]

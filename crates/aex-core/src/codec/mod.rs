@@ -16,11 +16,53 @@ use crate::dtype::DType;
 use crate::error::{AexError, Result};
 use crate::quality::Codec;
 
+mod gzip;
 #[cfg(feature = "sz")]
 mod sz;
+#[cfg(feature = "zfp")]
+mod zfp;
 
 /// Bytes of block header before the codec's own stream.
 const BLOCK_HEADER_LEN: usize = 24;
+
+// Every codec here takes and returns typed arrays while the logical stream is
+// bytes, so each block goes through a scratch buffer of elements. The copy is
+// a few percent of what a compressor itself costs, and it means nothing here
+// depends on a byte buffer happening to be aligned for floats.
+#[cfg(any(feature = "sz", feature = "zfp"))]
+thread_local! {
+    static F32: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static F64: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Read a block's bytes as elements.
+///
+/// The logical stream is little-endian and so is every target this builds for,
+/// so the elements are already laid out the way they are wanted.
+#[cfg(any(feature = "sz", feature = "zfp"))]
+fn load<T: Copy + Default>(src: &[u8], scratch: &mut Vec<T>) {
+    let count = src.len() / std::mem::size_of::<T>();
+    scratch.clear();
+    scratch.resize(count, T::default());
+    // SAFETY: both sides span exactly count * size_of::<T>() bytes, and a
+    // float has no invalid bit pattern.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr(),
+            scratch.as_mut_ptr().cast::<u8>(),
+            count * std::mem::size_of::<T>(),
+        );
+    }
+}
+
+#[cfg(any(feature = "sz", feature = "zfp"))]
+fn store<T: Copy>(scratch: &[T], dst: &mut [u8]) {
+    debug_assert_eq!(std::mem::size_of_val(scratch), dst.len());
+    // SAFETY: as in `load`, and the lengths are equal by the caller's check.
+    unsafe {
+        std::ptr::copy_nonoverlapping(scratch.as_ptr().cast::<u8>(), dst.as_mut_ptr(), dst.len());
+    }
+}
 
 /// The most axes a block is described with.
 ///
@@ -135,7 +177,8 @@ impl BlockSpec {
             )));
         }
         let eps = f64::from_le_bytes(src[4..12].try_into().expect("8 bytes"));
-        if !eps.is_finite() || eps <= 0.0 {
+        // 0 is the bound of a lossless codec, which was given none.
+        if !eps.is_finite() || eps < 0.0 {
             return Err(bad(format!("{eps} is not an error bound")));
         }
         let mut dims = [0u32; MAX_BLOCK_DIMS];
@@ -207,8 +250,11 @@ pub fn compress(codec: Codec, spec: &BlockSpec, src: &[u8], dst: &mut Vec<u8>) -
     dst.clear();
     spec.encode(dst);
     let written: Result<()> = match codec {
+        Codec::Gzip => gzip::compress(spec, src, dst),
         #[cfg(feature = "sz")]
         Codec::Sz => sz::compress(spec, src, dst),
+        #[cfg(feature = "zfp")]
+        Codec::Zfp => zfp::compress(spec, src, dst),
         other => Err(AexError::BadBlock(format!(
             "{other:?} is not a codec this build can produce"
         ))),
@@ -237,8 +283,11 @@ pub fn decompress_into(codec: Codec, src: &[u8], dst: &mut [u8]) -> Result<()> {
         )));
     }
     match codec {
+        Codec::Gzip => gzip::decompress_into(&spec, &src[BLOCK_HEADER_LEN..], dst),
         #[cfg(feature = "sz")]
         Codec::Sz => sz::decompress_into(&spec, &src[BLOCK_HEADER_LEN..], dst),
+        #[cfg(feature = "zfp")]
+        Codec::Zfp => zfp::decompress_into(&spec, &src[BLOCK_HEADER_LEN..], dst),
         other => Err(AexError::BadBlock(format!(
             "{other:?} is not a codec this build can expand"
         ))),
@@ -252,6 +301,44 @@ mod tests {
 
     fn spec(out_shape: &[u64], dtype: DType, offset: u64, len: u64) -> BlockSpec {
         BlockSpec::for_range(out_shape, dtype, 1e-3, offset, len).expect("a well-formed range")
+    }
+
+    /// Compress and expand one block, and report the worst error seen and the
+    /// bytes it took. Shared with the codec modules' own tests, so that every
+    /// codec is held to the same questions.
+    pub(super) fn roundtrip_f32(
+        codec: Codec,
+        out_shape: &[u64],
+        eps: f64,
+        values: &[f32],
+    ) -> (f64, usize) {
+        let src: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let spec =
+            BlockSpec::for_range(out_shape, DType::Float32, eps, 0, src.len() as u64).unwrap();
+        let mut packed = Vec::new();
+        if !compress(codec, &spec, &src, &mut packed).unwrap() {
+            return (0.0, src.len());
+        }
+        let mut out = vec![0u8; src.len()];
+        decompress_into(codec, &packed, &mut out).unwrap();
+        let worst = out
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .zip(values)
+            .filter(|(_, want)| want.is_finite())
+            .map(|(got, want)| (got as f64 - *want as f64).abs())
+            .fold(0.0f64, f64::max);
+        (worst, packed.len())
+    }
+
+    /// A field a compressor can actually predict: smooth along both axes.
+    pub(super) fn smooth(rows: usize, cols: usize) -> Vec<f32> {
+        (0..rows * cols)
+            .map(|i| {
+                let (r, c) = (i / cols, i % cols);
+                (c as f32 / 32.0).sin() * 100.0 + r as f32 * 0.25
+            })
+            .collect()
     }
 
     #[test]
@@ -366,9 +453,16 @@ mod tests {
             BlockSpec::decode(&nan).is_err(),
             "an error bound that is not one"
         );
+        let mut negative = good.clone();
+        negative[4..12].copy_from_slice(&(-1f64).to_le_bytes());
+        assert!(
+            BlockSpec::decode(&negative).is_err(),
+            "an error bound below zero"
+        );
+        // Zero is not one of these: it is what a lossless codec's block says.
         let mut zero = good.clone();
         zero[4..12].copy_from_slice(&0f64.to_le_bytes());
-        assert!(BlockSpec::decode(&zero).is_err(), "a zero error bound");
+        assert_eq!(BlockSpec::decode(&zero).unwrap().eps, 0.0);
     }
 
     proptest! {

@@ -17,6 +17,7 @@ autotests = false
 [features]
 hdf5 = ["dep:hdf5", "aex-server/hdf5"]
 sz = ["aex-server/sz", "aex-client/sz"]
+zfp = ["aex-server/zfp", "aex-client/zfp"]
 
 [dependencies]
 # Writes the fixtures for the HDF5 tests.
@@ -24,6 +25,8 @@ hdf5 = { workspace = true, optional = true }
 
 [dev-dependencies]
 aex-client.workspace = true
+# Checks what a float32 becomes when the server narrows it.
+half = "2"
 aex-core.workspace = true
 aex-proto.workspace = true
 aex-server.workspace = true
@@ -65,4 +68,3 @@ path = "reduce.rs"
 [[test]]
 name = "quality"
 path = "quality.rs"
-required-features = ["sz"]

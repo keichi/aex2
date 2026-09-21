@@ -110,7 +110,6 @@ pub fn quality_to_proto(quality: &QualitySpec) -> crate::QualitySpec {
     crate::QualitySpec {
         encoding: quality.encoding.as_i32(),
         cast_dtype: quality.cast_dtype.map(DType::as_i32),
-        subsample_step: quality.subsample_step.clone(),
         abs_error_bound: quality.abs_error_bound,
         rel_error_bound: quality.rel_error_bound,
     }
@@ -130,9 +129,11 @@ pub fn quality_from_proto(quality: Option<&crate::QualitySpec>) -> QualitySpec {
     QualitySpec {
         encoding,
         cast_dtype: quality.cast_dtype.and_then(|d| DType::from_i32(d).ok()),
-        subsample_step: quality.subsample_step.clone(),
         abs_error_bound: quality.abs_error_bound,
         rel_error_bound: quality.rel_error_bound,
+        // Not a field of the proto message: the codec has one of its own, next
+        // to the quality rather than inside it.
+        codec: None,
     }
 }
 
@@ -234,9 +235,11 @@ mod tests {
         let quality = QualitySpec {
             encoding: Encoding::DtypeCast,
             cast_dtype: Some(DType::Float32),
-            subsample_step: vec![2, 1],
             abs_error_bound: Some(0.5),
             rel_error_bound: None,
+            // The codec does not ride inside the message, so a roundtrip
+            // through it cannot bring one back.
+            codec: None,
         };
         assert_eq!(
             quality_from_proto(Some(&quality_to_proto(&quality))),

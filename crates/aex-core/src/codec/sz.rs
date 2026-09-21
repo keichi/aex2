@@ -3,23 +3,12 @@
 //! That crate vendors SZ3 and builds it with cmake and a C++ compiler, which is
 //! why this is behind a feature and not simply always here.
 //!
-//! SZ3 takes and returns typed arrays while the logical stream is bytes, so
-//! every block goes through a scratch buffer. The copy is a few percent of what
-//! the compressor itself costs, and it means nothing here depends on a byte
-//! buffer happening to be aligned for floats.
+//! SZ3 takes and returns typed arrays, so every block goes through the element
+//! scratch its parent module keeps.
 
-use std::cell::RefCell;
-use std::mem::size_of;
-
-use super::BlockSpec;
+use super::{load, store, BlockSpec, F32, F64};
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
-
-thread_local! {
-    /// Element-typed scratch, so a transfer in progress never allocates.
-    static F32: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-    static F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
-}
 
 pub(super) fn compress(spec: &BlockSpec, src: &[u8], dst: &mut Vec<u8>) -> Result<()> {
     match spec.dtype {
@@ -77,33 +66,6 @@ fn expand_as<T: sz3::SZ3Compressible + Copy + Default>(
     Ok(())
 }
 
-/// Read the block's bytes as elements.
-///
-/// The logical stream is little-endian and so is every target this builds for,
-/// so the elements are already laid out the way they are wanted.
-fn load<T: Copy + Default>(src: &[u8], scratch: &mut Vec<T>) {
-    let count = src.len() / size_of::<T>();
-    scratch.clear();
-    scratch.resize(count, T::default());
-    // SAFETY: both sides span exactly count * size_of::<T>() bytes, and a
-    // float has no invalid bit pattern.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            src.as_ptr(),
-            scratch.as_mut_ptr().cast::<u8>(),
-            count * size_of::<T>(),
-        );
-    }
-}
-
-fn store<T: Copy>(scratch: &[T], dst: &mut [u8]) {
-    debug_assert_eq!(std::mem::size_of_val(scratch), dst.len());
-    // SAFETY: as in `load`, and the lengths are equal by the caller's check.
-    unsafe {
-        std::ptr::copy_nonoverlapping(scratch.as_ptr().cast::<u8>(), dst.as_mut_ptr(), dst.len());
-    }
-}
-
 fn unsupported(dtype: DType) -> AexError {
     AexError::BadBlock(format!("SZ3 compresses floats, not {dtype}"))
 }
@@ -114,46 +76,20 @@ fn refused(e: sz3::SZ3Error) -> AexError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{roundtrip_f32, smooth};
     use super::super::{compress, decompress_into, BlockSpec};
     use crate::dtype::DType;
     use crate::quality::Codec;
 
-    /// Compress and expand one block, and report the worst error seen.
-    fn roundtrip_f32(out_shape: &[u64], eps: f64, values: &[f32]) -> (f64, usize) {
-        let src: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let spec =
-            BlockSpec::for_range(out_shape, DType::Float32, eps, 0, src.len() as u64).unwrap();
-        let mut packed = Vec::new();
-        let shrank = compress(Codec::Sz, &spec, &src, &mut packed).unwrap();
-        if !shrank {
-            return (0.0, src.len());
-        }
-        let mut out = vec![0u8; src.len()];
-        decompress_into(Codec::Sz, &packed, &mut out).unwrap();
-        let worst = out
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-            .zip(values)
-            .filter(|(_, want)| want.is_finite())
-            .map(|(got, want)| (got as f64 - *want as f64).abs())
-            .fold(0.0f64, f64::max);
-        (worst, packed.len())
-    }
-
-    fn smooth(rows: usize, cols: usize) -> Vec<f32> {
-        (0..rows * cols)
-            .map(|i| {
-                let (r, c) = (i / cols, i % cols);
-                (c as f32 / 32.0).sin() * 100.0 + r as f32 * 0.25
-            })
-            .collect()
+    fn roundtrip(out_shape: &[u64], eps: f64, values: &[f32]) -> (f64, usize) {
+        roundtrip_f32(Codec::Sz, out_shape, eps, values)
     }
 
     #[test]
     fn every_element_comes_back_within_the_bound() {
         let values = smooth(128, 1024);
         for eps in [1e-6, 1e-3, 1e-1, 1.0] {
-            let (worst, _) = roundtrip_f32(&[128, 1024], eps, &values);
+            let (worst, _) = roundtrip(&[128, 1024], eps, &values);
             assert!(worst <= eps, "worst {worst:e} over a bound of {eps:e}");
         }
     }
@@ -185,8 +121,8 @@ mod tests {
         // The same bytes, described as the slab they are and as one long row.
         let values = smooth(128, 1024);
         let eps = 1e-2;
-        let (_, slab) = roundtrip_f32(&[128, 1024], eps, &values);
-        let (_, flat) = roundtrip_f32(&[128 * 1024], eps, &values);
+        let (_, slab) = roundtrip(&[128, 1024], eps, &values);
+        let (_, flat) = roundtrip(&[128 * 1024], eps, &values);
         assert!(
             slab * 2 < flat,
             "a slab took {slab} bytes and a flat run {flat}; the shape should be worth far more"
@@ -200,7 +136,7 @@ mod tests {
         values[200] = f32::INFINITY;
         values[300] = f32::NEG_INFINITY;
         let eps = 1e-3;
-        let (worst, _) = roundtrip_f32(&[64, 64], eps, &values);
+        let (worst, _) = roundtrip(&[64, 64], eps, &values);
         assert!(worst <= eps, "worst {worst:e} over a bound of {eps:e}");
     }
 
@@ -217,7 +153,7 @@ mod tests {
 
     #[test]
     fn a_block_of_one_value_repeated_still_roundtrips() {
-        let (worst, _) = roundtrip_f32(&[64, 64], 1e-3, &vec![7.0f32; 4096]);
+        let (worst, _) = roundtrip(&[64, 64], 1e-3, &vec![7.0f32; 4096]);
         assert_eq!(worst, 0.0);
     }
 

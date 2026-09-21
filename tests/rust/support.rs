@@ -263,6 +263,7 @@ pub struct Proxy {
     pub addr: SocketAddr,
     accepted: Arc<AtomicUsize>,
     cuts: Arc<AtomicUsize>,
+    failed: Arc<AtomicUsize>,
 }
 
 impl Proxy {
@@ -271,7 +272,8 @@ impl Proxy {
         let addr = listener.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
         let cuts = Arc::new(AtomicUsize::new(0));
-        let (a, c) = (accepted.clone(), cuts.clone());
+        let failed = Arc::new(AtomicUsize::new(0));
+        let (a, c, f) = (accepted.clone(), cuts.clone(), failed.clone());
         std::thread::spawn(move || {
             for client in listener.incoming() {
                 let Ok(client) = client else { return };
@@ -283,8 +285,8 @@ impl Proxy {
                 // injected frame never lands inside a forwarded one.
                 let down = Arc::new(Mutex::new(client.try_clone().unwrap()));
                 let (up_from, up_to) = (client, server.try_clone().unwrap());
-                let d = down.clone();
-                std::thread::spawn(move || pump_up(up_from, up_to, &d, fault));
+                let (d, f) = (down.clone(), f.clone());
+                std::thread::spawn(move || pump_up(up_from, up_to, &d, fault, &f));
                 let cuts = c.clone();
                 std::thread::spawn(move || pump_down(server, &down, fault, &cuts));
             }
@@ -293,6 +295,7 @@ impl Proxy {
             addr,
             accepted,
             cuts,
+            failed,
         }
     }
 
@@ -310,9 +313,20 @@ impl Proxy {
     pub fn cuts(&self) -> usize {
         self.cuts.load(Ordering::Relaxed)
     }
+
+    /// Fetches answered with an injected error so far.
+    pub fn failed_fetches(&self) -> usize {
+        self.failed.load(Ordering::Relaxed)
+    }
 }
 
-fn pump_up(mut client: TcpStream, mut server: TcpStream, down: &Mutex<TcpStream>, fault: Fault) {
+fn pump_up(
+    mut client: TcpStream,
+    mut server: TcpStream,
+    down: &Mutex<TcpStream>,
+    fault: Fault,
+    failed: &AtomicUsize,
+) {
     if let Fault::FailFirstFetch = fault {
         let mut hello = [0u8; aex_wire::HELLO_LEN];
         let mut header = [0u8; aex_wire::HEADER_LEN];
@@ -338,6 +352,7 @@ fn pump_up(mut client: TcpStream, mut server: TcpStream, down: &Mutex<TcpStream>
         if aex_wire::write_frame(&mut *down, &error, &payload).is_err() {
             return;
         }
+        failed.fetch_add(1, Ordering::Relaxed);
     }
     if let Fault::Delay(delay) = fault {
         let mut buf = vec![0u8; 64 * 1024];

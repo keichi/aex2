@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2172" height="468" viewBox="0 80 2172 468" role="img" aria-labelledby="title desc">
+  <title id="title">AEX2 logo</title>
+  <desc id="desc">Selected array elements flow through parallel streams into a gathered result beside the AEX2 wordmark.</desc>
+  <!-- Transfer streams, drawn behind the source cells. -->
+  <g fill="none" stroke="#0964e8" stroke-width="22" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M113 194 C260 194 350 320 600 320"/>
+    <path d="M273 274 C405 274 470 320 600 320"/>
+    <path d="M113 354 C280 354 410 320 600 320"/>
+    <path d="M273 434 C430 434 500 320 600 320"/>
+  </g>
+  <path d="M570 308 H650 V275 L732 320 L650 365 V332 H570 Z" fill="#0964e8"/>
+
+  <!-- Sparse source array. -->
+  <g>
+    <g fill="#102a43">
+      <rect x="160" y="160" width="68" height="68" rx="14"/>
+      <rect x="240" y="160" width="68" height="68" rx="14"/>
+      <rect x="320" y="160" width="68" height="68" rx="14"/>
+      <rect x="80" y="240" width="68" height="68" rx="14"/>
+      <rect x="160" y="320" width="68" height="68" rx="14"/>
+      <rect x="240" y="320" width="68" height="68" rx="14"/>
+      <rect x="320" y="320" width="68" height="68" rx="14"/>
+      <rect x="80" y="400" width="68" height="68" rx="14"/>
+      <rect x="160" y="400" width="68" height="68" rx="14"/>
+    </g>
+    <g fill="#43aef0">
+      <rect x="80" y="160" width="68" height="68" rx="14"/>
+      <rect x="240" y="240" width="68" height="68" rx="14"/>
+      <rect x="80" y="320" width="68" height="68" rx="14"/>
+      <rect x="240" y="400" width="68" height="68" rx="14"/>
+    </g>
+  </g>
+
+  <!-- Gathered output. -->
+  <g fill="#43aef0">
+    <rect x="740" y="288" width="64" height="64" rx="13"/>
+    <rect x="820" y="288" width="64" height="64" rx="13"/>
+    <rect x="900" y="288" width="64" height="64" rx="13"/>
+    <rect x="980" y="288" width="64" height="64" rx="13"/>
+  </g>
+
+  <!-- AEX2 wordmark. Glyphs are outlined from Noto Sans JP SemiBold. -->
+  <g transform="translate(1060 57) scale(.43 .33)">
+    <g fill="#102a43">
+      <g transform="translate(0 1160) scale(1 -1)">
+        <path d="M-2 0 239 739H393L633 0H494L382 393Q364 452 348 514Q332 576 315 636H311Q296 575 279 513.5Q262 452 245 393L132 0ZM140 200V303H489V200Z"/>
+      </g>
+      <g transform="translate(632 1160) scale(1 -1)">
+        <path d="M94 0V739H539V628H226V440H491V329H226V111H550V0Z"/>
+      </g>
+      <g transform="translate(1240 1160) scale(1 -1)">
+        <path d="M15 0 225 381 28 739H174L256 576Q270 550 282.5 523Q295 496 312 462H316Q330 496 342 523Q354 550 366 576L444 739H583L387 375L597 0H451L361 174Q347 202 332.5 231.5Q318 261 301 295H297Q282 261 268.5 231.5Q255 202 242 174L155 0Z"/>
+      </g>
+    </g>
+    <g fill="#0964e8" transform="translate(1851 1160) scale(1 -1)">
+      <path d="M43 0V76Q148 170 220.5 248.5Q293 327 330.5 394.5Q368 462 368 521Q368 559 354.5 587.5Q341 616 315 632Q289 648 250 648Q208 648 173.5 625Q139 602 110 569L37 641Q86 694 139.5 723Q193 752 267 752Q336 752 387 724Q438 696 466.5 646Q495 596 495 528Q495 459 460.5 388Q426 317 367.5 245.5Q309 174 236 103Q265 106 298 108.5Q331 111 357 111H529V0Z"/>
+    </g>
+  </g>
+</svg>

@@ -50,8 +50,9 @@ def test_nested_groups_are_walked(h5):
 
 def test_groups_list_their_members(h5):
     # The string dataset is left out: it cannot be served.
-    assert [item.name for item in h5] == ["/g1", "/g2", "/selection"]
-    assert [item.name for item in h5["g1"]] == ["/g1/ds1", "/g1/ds2", "/g1/g3"]
+    assert list(h5) == ["g1", "g2", "selection"]
+    assert [item.name for item in h5.values()] == ["/g1", "/g2", "/selection"]
+    assert [item.name for item in h5["g1"].values()] == ["/g1/ds1", "/g1/ds2", "/g1/g3"]
     assert len(h5["g1/g3"]) == 2
     assert "g3/ds3" in h5["g1"]
     assert "g3/nonexistent" not in h5["g1"]

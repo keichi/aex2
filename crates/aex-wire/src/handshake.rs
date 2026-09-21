@@ -22,7 +22,7 @@ use crate::error::{Result, WireError};
 pub const MAGIC: [u8; 8] = *b"AEXDATA\x01";
 
 /// The data plane protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Size of a `HELLO`.
 pub const HELLO_LEN: usize = 48;
@@ -157,7 +157,7 @@ mod tests {
 
         assert_eq!(bytes.len(), HELLO_LEN);
         assert_eq!(&bytes[0..8], b"AEXDATA\x01");
-        assert_eq!(&bytes[8..10], &1u16.to_le_bytes());
+        assert_eq!(&bytes[8..10], &PROTOCOL_VERSION.to_le_bytes());
         // The two reserved bytes stay zero so that a later version can use them.
         assert_eq!(&bytes[10..12], &[0, 0]);
         assert_eq!(&bytes[12..16], &[0, 0, 0, 0]);
@@ -175,7 +175,7 @@ mod tests {
         assert_eq!(bytes.len(), READY_LEN);
         assert_eq!(&bytes[0..8], &MAGIC);
         assert_eq!(&bytes[8..10], &0u16.to_le_bytes());
-        assert_eq!(&bytes[10..12], &1u16.to_le_bytes());
+        assert_eq!(&bytes[10..12], &PROTOCOL_VERSION.to_le_bytes());
         assert_eq!(Ready::decode(&bytes).unwrap(), ready);
         assert!(ready.is_accepted());
 

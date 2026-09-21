@@ -84,9 +84,19 @@ _LOCAL = object()
 class ArrayProxy:
     """An array on the server. Indexing it transfers the selection.
 
+    ``arr[key]`` takes what numpy takes, integers, slices, ``...``, ``None``
+    and integer or boolean arrays, and gives back a read-only ndarray.
+
     ``arr.view[key]`` is a proxy for a selection that transfers nothing, so
     that ``np.sum(arr.view[0:100])`` reads 100 rows on the server. Such a proxy
-    reports ``is_view``, and only reductions are supported on it.
+    reports ``is_view``, and only reductions and indexing work on it.
+
+    These numpy functions run on the server, and only the result is sent:
+    ``sum``, ``prod``, ``mean``, ``max``, ``min``, ``std``, ``var``, ``all``,
+    ``any``, ``argmax``, ``argmin``, and the ``nan`` forms of sum, mean, max
+    and min. Only ``axis``, ``keepdims`` and ``ddof`` go with them, and only
+    results under 64 KiB. Anything else downloads the array and computes it
+    here; ``set_fallback_policy`` says how loudly.
     """
 
     def __init__(
@@ -132,6 +142,7 @@ class ArrayProxy:
 
     @property
     def nbytes(self) -> int:
+        """What the whole array would take, were all of it transferred."""
         return self.size * self.dtype.itemsize
 
     def __len__(self) -> int:
@@ -177,35 +188,48 @@ class ArrayProxy:
         self,
         *,
         dtype: npt.DTypeLike | None = None,
-        step: tuple[int, ...] | None = None,
         abs_error: float | None = None,
         rel_error: float | None = None,
+        codec: str | None = None,
     ) -> "QualityView":
         """A view that asks the server for a cheaper encoding of the data.
 
-        Give one of: ``dtype`` to narrow the elements, ``step`` to take every
-        n-th element per axis, or ``abs_error`` / ``rel_error`` for lossy
-        compression. A server that cannot do it sends the exact data and the
-        view warns; ``applied_quality`` says what was done.
+        Give at most one of: ``dtype`` to narrow the elements, or ``abs_error``
+        / ``rel_error`` for lossy compression. A server that cannot do it sends
+        the exact data and the view warns; ``applied_quality`` says what was
+        done. To take every n-th element, slice with a step instead: that is an
+        ordinary selection and needs no quality at all.
 
         Only ``abs_error`` is implemented, on float32 and float64, and only by
-        a server and an extension module built with the ``sz`` feature. A bound
-        relative to the value range would have to mean the range of the whole
-        selection, and a compressed block only ever sees its own.
+        a server and an extension module built with the ``sz`` or ``zfp``
+        feature. A bound relative to the value range would have to mean the
+        range of the whole selection, and a compressed block only ever sees its
+        own.
+
+        ``codec`` names how the bytes travel. ``"sz"`` and ``"zfp"`` carry an
+        error bound, and left out the server uses whichever it was built with.
+        ``"gzip"`` goes with no quality at all: the data is exact and only the
+        wire is smaller. It is there as a baseline, and an error bound beats it
+        by more than an order of magnitude on real data.
+        ``applied_quality["codec"]`` says what was actually used.
         """
         self._require_base("at")
         quality: dict[str, Any] = {}
         if dtype is not None:
             quality["dtype"] = np.dtype(dtype).newbyteorder("<").str
-        if step is not None:
-            quality["step"] = tuple(operator.index(n) for n in step)
         if abs_error is not None:
             quality["abs_error"] = float(abs_error)
         if rel_error is not None:
             quality["rel_error"] = float(rel_error)
         kinds = {"error" if k.endswith("_error") else k for k in quality}
-        if len(kinds) != 1:
-            raise ValueError("give exactly one of dtype, step, or abs_error / rel_error")
+        if len(kinds) > 1:
+            raise ValueError("give at most one of dtype or abs_error / rel_error")
+        # The codec is how a quality travels, not which quality it is, so it
+        # does not count towards the check above. On its own it means GZIP.
+        if codec is not None:
+            quality["codec"] = str(codec)
+        if not quality:
+            raise ValueError("give a dtype, an error bound, or a codec")
         return QualityView(self, quality)
 
     def read_into(self, out: npt.NDArray[Any], key: Any = Ellipsis) -> None:
@@ -366,7 +390,11 @@ def _warn_as_numpy(name: str, out: npt.NDArray[Any], count: int, ddof: Any) -> N
 
 
 class QualityView:
-    """An array read at a requested quality. Made by ``ArrayProxy.at``."""
+    """An array read at a requested quality. Made by ``ArrayProxy.at``.
+
+    ``applied_quality`` is None until the first read, then names the
+    encoding the server chose and the codec that carried it.
+    """
 
     def __init__(self, array: ArrayProxy, quality: dict[str, Any]) -> None:
         self.array = array
@@ -378,7 +406,7 @@ class QualityView:
         """Transfer a selection at this view's quality. The result is read-only."""
         out, plan = self.array._read(key, self.quality)
         applied = plan.applied_quality
-        if applied["encoding"] == "exact" and self.applied_quality is None:
+        if self.applied_quality is None and self._was_refused(applied):
             warnings.warn(
                 f"the server cannot apply {self.quality}; the data is exact",
                 AexQualityWarning,
@@ -386,6 +414,18 @@ class QualityView:
             )
         self.applied_quality = applied
         return out
+
+    def _was_refused(self, applied: dict[str, Any]) -> bool:
+        """Whether the server gave back something other than what was asked.
+
+        A codec on its own asks for nothing but a smaller wire, so for that one
+        the codec is the whole answer; anything else is a quality, and falling
+        back to exact is how the server says no.
+        """
+        asked_a_quality = any(k != "codec" for k in self.quality)
+        if asked_a_quality:
+            return bool(applied["encoding"] == "exact")
+        return bool(applied.get("codec") != self.quality.get("codec"))
 
     def __repr__(self) -> str:
         return f"<QualityView of {self.array!r}, quality {self.quality}>"

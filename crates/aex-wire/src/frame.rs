@@ -301,12 +301,18 @@ mod tests {
         FrameType::Pong,
     ];
 
+    const ALL_ENCODINGS: [Encoding; 3] =
+        [Encoding::Exact, Encoding::DtypeCast, Encoding::ErrorBound];
+
+    const ALL_CODECS: [Codec; 3] = [Codec::Raw, Codec::Sz, Codec::Zfp];
+
     #[test]
     fn a_header_is_thirty_two_bytes_with_the_documented_layout() {
         let header = FrameHeader {
-            frame_type: FrameType::Data,
-            codec: Codec::Zstd,
-            encoding: Encoding::Subsample,
+            // Three different values, so a swapped pair of tag bytes shows up.
+            frame_type: FrameType::Error,
+            codec: Codec::Zfp,
+            encoding: Encoding::DtypeCast,
             flags: 0,
             request_id: 0x0a0b0c0d,
             offset: 0x1122334455667788,
@@ -316,9 +322,9 @@ mod tests {
         let bytes = header.encode();
         assert_eq!(bytes.len(), HEADER_LEN);
 
-        assert_eq!(bytes[0], 0x02);
+        assert_eq!(bytes[0], 0x03);
         assert_eq!(bytes[1], 0x02);
-        assert_eq!(bytes[2], 0x02);
+        assert_eq!(bytes[2], 0x01);
         assert_eq!(bytes[3], 0x00);
         // Little-endian, so the low byte comes first.
         assert_eq!(&bytes[4..8], &[0x0d, 0x0c, 0x0b, 0x0a]);
@@ -481,8 +487,8 @@ mod tests {
         #[test]
         fn any_header_survives_a_roundtrip(
             type_index in 0usize..ALL_TYPES.len(),
-            codec_index in 0u8..4,
-            encoding_index in 0u8..4,
+            codec_index in 0usize..ALL_CODECS.len(),
+            encoding_index in 0usize..ALL_ENCODINGS.len(),
             flags in any::<u8>(),
             request_id in any::<u32>(),
             offset in any::<u64>(),
@@ -491,8 +497,8 @@ mod tests {
         ) {
             let header = FrameHeader {
                 frame_type: ALL_TYPES[type_index],
-                codec: Codec::from_u8(codec_index).expect("a defined codec"),
-                encoding: Encoding::from_u8(encoding_index).expect("a defined encoding"),
+                codec: ALL_CODECS[codec_index],
+                encoding: ALL_ENCODINGS[encoding_index],
                 flags,
                 request_id,
                 offset,

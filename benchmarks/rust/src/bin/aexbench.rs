@@ -8,8 +8,27 @@ use std::time::Instant;
 
 use aex_bench::{cpu_seconds, report, Run};
 use aex_client::{Client, ClientConfig, Index, Selection};
-use aex_core::{Encoding, QualitySpec};
+use aex_core::{Codec, Encoding, QualitySpec};
 use clap::{Parser, ValueEnum};
+
+/// Which error-bounded codec to ask for.
+///
+/// Its own enum rather than `aex_core::Codec`, so the flag offers the codecs
+/// that can carry a bound and not the lossless values as well.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CodecArg {
+    Sz,
+    Zfp,
+}
+
+impl From<CodecArg> for Codec {
+    fn from(arg: CodecArg) -> Codec {
+        match arg {
+            CodecArg::Sz => Codec::Sz,
+            CodecArg::Zfp => Codec::Zfp,
+        }
+    }
+}
 
 /// What the bytes of the fixture are.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -63,6 +82,9 @@ struct Cli {
     /// for exact data.
     #[arg(long, default_value_t = 0.0)]
     abs_error: f64,
+    /// Which codec carries the bound. Ignored when `--abs-error` is 0.
+    #[arg(long, value_enum, default_value_t = CodecArg::Sz)]
+    codec: CodecArg,
     #[arg(long, default_value_t = 5)]
     reps: usize,
     #[arg(long)]
@@ -100,6 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         QualitySpec {
             encoding: Encoding::ErrorBound,
             abs_error_bound: Some(cli.abs_error),
+            codec: Some(cli.codec.into()),
             ..QualitySpec::default()
         }
     } else {
@@ -133,6 +156,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             plan.applied_quality.encoding, quality.encoding,
             "the server did not apply the quality asked for"
+        );
+        // Without this a server built without the codec asked for would send
+        // the other one's bytes under this run's label, and a sweep comparing
+        // the two would quietly be comparing one with itself.
+        assert_eq!(
+            plan.applied_quality.codec(),
+            quality.codec(),
+            "the server did not use the codec asked for"
         );
         assert_eq!(
             plan.total_bytes, cli.bytes,
@@ -201,8 +232,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Printed only when something was compressed, so every existing sweep
         // produces exactly the output it did before.
         println!(
-            "  abs_error={} compressed {ratio:.2}x ({} -> {wire_bytes} bytes on the wire)",
-            cli.abs_error, cli.bytes
+            "  codec={:?} abs_error={} compressed {ratio:.2}x ({} -> {wire_bytes} bytes on the wire)",
+            cli.codec, cli.abs_error, cli.bytes
         );
     }
     client.disconnect()?;

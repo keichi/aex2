@@ -8,7 +8,7 @@
 use std::sync::{Arc, RwLock};
 
 use aex_client::{
-    resolve_selection, AexError, ClientConfig, ClientError, DType, Encoding, ErrorClass,
+    resolve_selection, AexError, ClientConfig, ClientError, Codec, DType, Encoding, ErrorClass,
     FileHandle, FunctionArg, Index, Item, QualitySpec, Selection,
 };
 use half::f16;
@@ -480,8 +480,9 @@ fn selections<'a>(
         .collect()
 }
 
-/// A quality request as `aex.array_proxy` spells it: a dict holding one of
-/// `dtype`, `step`, or `abs_error` / `rel_error`. `None` is lossless.
+/// A quality request as `aex.array_proxy` spells it: a dict holding at most
+/// one of `dtype` or `abs_error` / `rel_error`, and an optional `codec`.
+/// `None` is lossless and uncompressed.
 fn quality_from_py(quality: Option<&Bound<'_, PyDict>>) -> PyResult<QualitySpec> {
     let mut spec = QualitySpec::exact();
     let Some(quality) = quality else {
@@ -493,9 +494,6 @@ fn quality_from_py(quality: Option<&Bound<'_, PyDict>>) -> PyResult<QualitySpec>
             DType::from_descr(&dtype.extract::<String>()?)
                 .map_err(|e| value_error(e.to_string()))?,
         );
-    } else if let Some(step) = quality.get_item("step")? {
-        spec.encoding = Encoding::Subsample;
-        spec.subsample_step = step.extract()?;
     } else {
         spec.abs_error_bound = quality
             .get_item("abs_error")?
@@ -509,7 +507,36 @@ fn quality_from_py(quality: Option<&Bound<'_, PyDict>>) -> PyResult<QualitySpec>
             spec.encoding = Encoding::ErrorBound;
         }
     }
+    // Outside the branch: a lossless codec goes with no quality at all, which
+    // is how GZIP is asked for.
+    spec.codec = quality
+        .get_item("codec")?
+        .map(|v| codec_from_name(&v.extract::<String>()?))
+        .transpose()?;
     Ok(spec)
+}
+
+/// The codecs a caller may name. A name this build has no codec for is still
+/// accepted: the server decides whether it can honour it, and says so in the
+/// plan.
+fn codec_from_name(name: &str) -> PyResult<Codec> {
+    match name {
+        "gzip" => Ok(Codec::Gzip),
+        "sz" => Ok(Codec::Sz),
+        "zfp" => Ok(Codec::Zfp),
+        other => Err(value_error(format!(
+            "codec must be 'gzip', 'sz' or 'zfp', not {other:?}"
+        ))),
+    }
+}
+
+fn codec_name(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Raw => "raw",
+        Codec::Gzip => "gzip",
+        Codec::Sz => "sz",
+        Codec::Zfp => "zfp",
+    }
 }
 
 /// The inverse of `quality_from_py`, with the encoding named.
@@ -518,19 +545,19 @@ fn quality_to_py<'py>(py: Python<'py>, spec: &QualitySpec) -> PyResult<Bound<'py
     let encoding = match spec.encoding {
         Encoding::Exact => "exact",
         Encoding::DtypeCast => "dtype_cast",
-        Encoding::Subsample => "subsample",
         Encoding::ErrorBound => "error_bound",
     };
     dict.set_item("encoding", encoding)?;
     match spec.encoding {
         Encoding::Exact => {}
         Encoding::DtypeCast => dict.set_item("dtype", spec.cast_dtype.map(DType::descr))?,
-        Encoding::Subsample => dict.set_item("step", PyTuple::new(py, &spec.subsample_step)?)?,
         Encoding::ErrorBound => {
             dict.set_item("abs_error", spec.abs_error_bound)?;
             dict.set_item("rel_error", spec.rel_error_bound)?;
         }
     }
+    // Always, because an exact transfer can be compressed too.
+    dict.set_item("codec", codec_name(spec.codec()))?;
     Ok(dict)
 }
 
