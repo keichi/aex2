@@ -58,6 +58,10 @@ path = "hdf5.rs"
 required-features = ["hdf5"]
 
 [[test]]
+name = "zarr"
+path = "zarr.rs"
+
+[[test]]
 name = "gather"
 path = "gather.rs"
 

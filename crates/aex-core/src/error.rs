@@ -80,6 +80,16 @@ pub enum AexError {
     #[error("malformed HDF5 file: {0}")]
     MalformedHdf5(String),
 
+    /// A readable Zarr store holding something AEX cannot serve: another
+    /// format version, a codec it does not decode, a dtype with no wire form.
+    #[error("unsupported Zarr store: {0}")]
+    UnsupportedZarr(String),
+
+    /// A store that disagrees with its own metadata, or a name in it that
+    /// leaves the store.
+    #[error("malformed Zarr store: {0}")]
+    MalformedZarr(String),
+
     /// A selection numpy would reject too: an index off the end, more indices
     /// than the array has axes, a zero step.
     #[error("invalid selection: {0}")]
@@ -131,13 +141,16 @@ impl AexError {
             AexError::UnsupportedDType(_)
             | AexError::UnsupportedNpy(_)
             | AexError::UnsupportedHdf5(_)
+            | AexError::UnsupportedZarr(_)
             | AexError::BadSelection(_)
             | AexError::UnsupportedSelection(_)
             | AexError::BadFunction(_)
             | AexError::NotFound(_)
             | AexError::NotAGroup(_)
             | AexError::OutOfRange { .. } => ErrorClass::Request,
-            AexError::MalformedNpy(_) | AexError::MalformedHdf5(_) => ErrorClass::Permanent,
+            AexError::MalformedNpy(_) | AexError::MalformedHdf5(_) | AexError::MalformedZarr(_) => {
+                ErrorClass::Permanent
+            }
             // Both sides agreed a codec and then failed to speak it.
             AexError::BadBlock(_) => ErrorClass::Protocol,
             AexError::Io(e) => match e.kind() {

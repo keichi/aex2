@@ -7,7 +7,7 @@ README は利用者向けの手順だけを載せている。ここには実装�
 ## 状態
 
 **M6 (評価) まで実装済み。** Python と Rust の両方から
-`.npy` と HDF5 (netCDF-4 を含む) の任意の選択を取得できる。実データは protobuf を
+`.npy`、HDF5 (netCDF-4 を含む)、Zarr v3 の任意の選択を取得できる。実データは protobuf を
 一切通らず、カーネルから呼び出し側のバッファ (Python では `np.empty` した配列) へ
 直接読み込まれる。1 クライアントが複数のデータ接続を使い、VM 間の実ネットワークでは
 16 接続で 1 接続の 8 倍 (163 Gbit/s) 出る ([M4 の測定](benchmark-m4.md))。
@@ -23,7 +23,8 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 
 - `aex-core` — `DType`、`ErrorClass` / `AexError`、選択の解決 (`Index` の正規化と
   `SelectionLayout`)、numpy と同じ意味論の集約 (`reduce`)、`ArrayFile` /
-  `ArrayDataset` トレイト、`.npy` バックエンド、HDF5 バックエンド (`hdf5` feature)
+  `ArrayDataset` トレイト、`.npy` / Zarr v3 バックエンド、HDF5 バックエンド
+  (`hdf5` feature)、チャンク格子の走査 (`backends/chunks.rs`、HDF5 と Zarr で共用)
 - `aex-wire` — データプレーンのワイヤ形式。ハンドシェイク、32 バイト固定ヘッダの
   フレーム、複数接続が 1 個の出力バッファへ書き込むための `ScatterBuffer`。
   サーバとクライアントが**同一コードから**エンコード/デコードする
@@ -94,7 +95,10 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 ## 前提と制約
 
 - 対象 OS は Linux (最適化対象) と macOS。`pread` を使うため Unix 系に限る
-- 対応形式は `.npy` と HDF5 (netCDF-4 を含む)。netCDF-3 と Zarr は将来課題 (SPEC §14.1)
+- 対応形式は `.npy`、HDF5 (netCDF-4 を含む)、Zarr v3。Zarr v2 と netCDF-3 は
+  将来課題 (SPEC §14.1)
+- Zarr は `bytes` コーデックのみ。zstd・gzip・sharding は未対応で、open 時に理由を
+  付けて拒否する。ストアはローカルディレクトリのみで、S3/HTTP ストアは扱わない
 - HDF5 の圧縮フィルタは deflate / shuffle / fletcher32 のみ。compact・virtual・
   外部ファイル格納のデータセットと external link は非対応 (SPEC §7.5)
 - 読み出し専用
@@ -136,7 +140,7 @@ Python から読むと、前身の v1 が 456 MiB/s のところ 10,647 MiB/s (2
 ```
 protos/aex.proto   コントロールプレーンの定義
 crates/aex-core/   共通型・選択の解決・バックエンド (tokio / tonic に依存しない)
-                   `.npy`、HDF5、転送経路の測定用の合成バックエンド
+                   `.npy`、HDF5、Zarr、転送経路の測定用の合成バックエンド
 crates/aex-wire/   データプレーンのワイヤ形式 (サーバとクライアントで共用)
 crates/aex-proto/  aex.proto から生成されるコードと型変換
 crates/aex-server/ サーバ (両プレーン)

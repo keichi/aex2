@@ -18,12 +18,12 @@ pub mod reduce;
 pub mod selection;
 
 pub use backend::{ArrayDataset, ArrayFile, AttrValue, Item};
-#[cfg(feature = "hdf5")]
 pub use backends::decode_cache::DecodeCache;
 #[cfg(feature = "hdf5")]
 pub use backends::hdf5::{Hdf5Dataset, Hdf5File};
 pub use backends::npy::{NpyDataset, NpyFile};
 pub use backends::null::{NullDataset, NullFile};
+pub use backends::zarr::{ZarrArray, ZarrFile};
 pub use dtype::{DType, ALL_DTYPES};
 pub use error::{AexError, ErrorClass, Result};
 pub use quality::{Codec, Encoding, QualitySpec};
