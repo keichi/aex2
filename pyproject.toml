@@ -30,7 +30,7 @@ Repository = "https://github.com/keichi/aex2"
 Issues = "https://github.com/keichi/aex2/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "mypy>=1.11", "ruff>=0.6", "h5py>=3.8"]
+dev = ["pytest>=8", "mypy>=1.11", "ruff>=0.6", "h5py>=3.8", "zarr>=3"]
 docs = ["pdoc>=15"]
 
 [tool.maturin]

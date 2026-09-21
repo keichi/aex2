@@ -26,16 +26,13 @@ use hdf5::filters::Filter;
 use hdf5::types::{CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenAscii, VarLenUnicode};
 use hdf5::LocationType;
 
-use crate::backend::{normalize_path, ArrayDataset, ArrayFile, AttrValue, Item};
+use crate::backend::{normalize_path, ArrayDataset, ArrayFile, AttrValue, Item, MAX_ATTR_BYTES};
+use crate::backends::chunks::{fill_from, ChunkGrid, MAX_CHUNKS};
 use crate::backends::decode_cache::DecodeCache;
 use crate::dtype::DType;
 use crate::error::{AexError, Result};
 use crate::quality::QualitySpec;
 use crate::selection::{Index, SelectionLayout};
-
-/// More chunks than this and the index alone would take gigabytes.
-// ponytail: the index is a dense table. A sparse one would lift this.
-const MAX_CHUNKS: u64 = 1 << 26;
 
 /// An HDF5 file opened for reading.
 pub struct Hdf5File {
@@ -172,12 +169,6 @@ impl ArrayFile for Hdf5File {
         }
     }
 }
-
-/// Bigger than this and one attribute could push a listing past the gRPC
-/// message limit, since a listing carries every child's attributes.
-// ponytail: a flat per-attribute cap rather than a budget for the whole reply.
-// Real netCDF attributes are tens of bytes.
-const MAX_ATTR_BYTES: u64 = 64 << 10;
 
 /// Every attribute of an object that AEX can represent.
 ///
@@ -399,7 +390,9 @@ impl ArrayDataset for Hdf5Dataset {
 
     fn decoded_chunk_bytes(&self) -> Option<u64> {
         match &self.storage {
-            Storage::Chunked(chunked) if !chunked.filters.is_empty() => Some(chunked.chunk_bytes),
+            Storage::Chunked(chunked) if !chunked.filters.is_empty() => {
+                Some(chunked.grid.chunk_bytes())
+            }
             _ => None,
         }
     }
@@ -428,16 +421,7 @@ impl ChunkEntry {
 struct Chunked {
     /// Where the index comes from.
     dataset: hdf5::Dataset,
-    shape: Vec<u64>,
-    itemsize: u64,
-    chunk_shape: Vec<u64>,
-    /// Chunks along each axis.
-    grid: Vec<u64>,
-    /// Bytes of a whole chunk, decoded. Edge chunks are stored whole too.
-    chunk_bytes: u64,
-    /// Every axis after this one is covered by one chunk with no padding, so
-    /// a run of elements carries on across them within a chunk.
-    run_axis: usize,
+    grid: ChunkGrid,
     /// In the order they were applied when writing.
     filters: Vec<Filter>,
     /// By chunk number in C order; built on first use.
@@ -463,40 +447,16 @@ impl Chunked {
                 "{name}: chunks of {chunk_shape:?} do not fit an array of {shape:?}"
             ))
         };
-        if chunk_shape.len() != shape.len() || chunk_shape.contains(&0) {
-            return Err(malformed());
-        }
-        let grid: Vec<u64> = shape
-            .iter()
-            .zip(&chunk_shape)
-            .map(|(n, c)| n.div_ceil(*c))
-            .collect();
-        let chunks = grid
-            .iter()
-            .try_fold(1u64, |acc, &n| acc.checked_mul(n))
-            .ok_or_else(malformed)?;
+        let grid = ChunkGrid::new(shape, &chunk_shape, dtype.itemsize()).ok_or_else(malformed)?;
+        let chunks = grid.chunks();
         if chunks > MAX_CHUNKS {
             return Err(AexError::UnsupportedHdf5(format!(
                 "{name} has {chunks} chunks; at most {MAX_CHUNKS} are served"
             )));
         }
-        let chunk_bytes = chunk_shape
-            .iter()
-            .try_fold(dtype.itemsize(), |acc, &n| acc.checked_mul(n))
-            .filter(|&n| usize::try_from(n).is_ok())
-            .ok_or_else(malformed)?;
-        let mut run_axis = shape.len() - 1;
-        while run_axis > 0 && chunk_shape[run_axis] == shape[run_axis] {
-            run_axis -= 1;
-        }
         Ok(Chunked {
             dataset,
-            shape: shape.to_vec(),
-            itemsize: dtype.itemsize(),
-            chunk_shape,
             grid,
-            chunk_bytes,
-            run_axis,
             filters,
             index: OnceLock::new(),
             cache,
@@ -511,17 +471,16 @@ impl Chunked {
         }
         let name = self.dataset.name();
         let file_len = raw.metadata()?.len();
-        let chunks = self.grid.iter().product::<u64>() as usize;
-        let mut index = vec![ChunkEntry::MISSING; chunks];
+        let mut index = vec![ChunkEntry::MISSING; self.grid.chunks() as usize];
         let mut bad = None;
         self.dataset.chunks_visit(|chunk| {
             let coords = chunk
                 .offset
                 .iter()
-                .zip(&self.chunk_shape)
+                .zip(self.grid.chunk_shape())
                 .map(|(o, c)| o / c);
             // A chunk left behind by shrinking the dataset is not part of it.
-            let Some(number) = linear(coords, &self.grid) else {
+            let Some(number) = self.grid.chunk_of(coords) else {
                 return 0;
             };
             let entry = ChunkEntry {
@@ -529,7 +488,7 @@ impl Chunked {
                 size: chunk.size,
                 filter_mask: chunk.filter_mask,
             };
-            let unfiltered = self.filters.is_empty() && entry.size != self.chunk_bytes;
+            let unfiltered = self.filters.is_empty() && entry.size != self.grid.chunk_bytes();
             if unfiltered
                 || entry
                     .addr
@@ -553,44 +512,12 @@ impl Chunked {
     }
 
     /// Read `[at, at + dst.len())` of the dataset's C-order bytes.
-    fn read(&self, dataset: &Hdf5Dataset, mut at: u64, mut dst: &mut [u8]) -> Result<()> {
+    fn read(&self, dataset: &Hdf5Dataset, at: u64, dst: &mut [u8]) -> Result<()> {
         let index = self.index(&dataset.raw)?;
-        let ndim = self.shape.len();
-        let mut pos = vec![0u64; ndim];
-        while !dst.is_empty() {
-            let element = at / self.itemsize;
-            let skip = at % self.itemsize;
-            let mut rest = element;
-            for axis in (0..ndim).rev() {
-                pos[axis] = rest % self.shape[axis];
-                rest /= self.shape[axis];
-            }
-
-            let chunk = linear(
-                pos.iter().zip(&self.chunk_shape).map(|(p, c)| p / c),
-                &self.grid,
-            )
-            .expect("an in-range element is in some chunk");
-            let within = linear_unchecked(
-                pos.iter().zip(&self.chunk_shape).map(|(p, c)| p % c),
-                &self.chunk_shape,
-            );
-
-            // Elements from here to the end of this chunk along the run axis,
-            // less those of the trailing axes already behind us.
-            let j = self.run_axis;
-            let trailing: u64 = self.shape[j + 1..].iter().product();
-            let behind = linear_unchecked(pos[j + 1..].iter().copied(), &self.shape[j + 1..]);
-            let along =
-                (self.chunk_shape[j] - pos[j] % self.chunk_shape[j]).min(self.shape[j] - pos[j]);
-            let run = along * trailing - behind;
-
-            let start = within * self.itemsize + skip;
-            let len = (run * self.itemsize - skip).min(dst.len() as u64) as usize;
-            let (out, tail) = dst.split_at_mut(len);
+        self.grid.walk(at, dst, |chunk, start, out| {
             let entry = index[chunk];
             if entry.addr == ChunkEntry::MISSING.addr {
-                fill_from(&dataset.fill, skip, out);
+                fill_from(&dataset.fill, start % self.grid.itemsize(), out);
             } else if self.filters.is_empty() {
                 dataset.raw.read_exact_at(out, entry.addr + start)?;
             } else {
@@ -599,12 +526,11 @@ impl Chunked {
                     .get_or_decode((self.cache_key, chunk as u64), || {
                         self.decode(&dataset.raw, entry)
                     })?;
-                out.copy_from_slice(&decoded[start as usize..start as usize + len]);
+                let start = start as usize;
+                out.copy_from_slice(&decoded[start..start + out.len()]);
             }
-            at += len as u64;
-            dst = tail;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Read one chunk and undo its filters.
@@ -620,38 +546,21 @@ impl Chunked {
             bytes = match filter {
                 Filter::Fletcher32 => strip_fletcher32(bytes)
                     .ok_or_else(|| malformed("fletcher32 checksum mismatch"))?,
-                Filter::Deflate(_) => inflate(&bytes, self.chunk_bytes)
+                Filter::Deflate(_) => inflate(&bytes, self.grid.chunk_bytes())
                     .ok_or_else(|| malformed("deflate stream is corrupt"))?,
-                Filter::Shuffle => unshuffle(&bytes, self.itemsize as usize),
+                Filter::Shuffle => unshuffle(&bytes, self.grid.itemsize() as usize),
                 other => unreachable!("{other:?} was rejected when the dataset was opened"),
             };
         }
-        if bytes.len() as u64 != self.chunk_bytes {
+        if bytes.len() as u64 != self.grid.chunk_bytes() {
             return Err(malformed(&format!(
                 "decodes to {} bytes instead of {}",
                 bytes.len(),
-                self.chunk_bytes
+                self.grid.chunk_bytes()
             )));
         }
         Ok(bytes)
     }
-}
-
-/// The C-order number of `coords` in a grid of `dims`, if it lies inside.
-fn linear(coords: impl Iterator<Item = u64>, dims: &[u64]) -> Option<usize> {
-    let mut n = 0u64;
-    for (c, d) in coords.zip(dims) {
-        if c >= *d {
-            return None;
-        }
-        n = n * d + c;
-    }
-    Some(n as usize)
-}
-
-/// [`linear`] for coordinates known to be inside.
-fn linear_unchecked(coords: impl Iterator<Item = u64>, dims: &[u64]) -> u64 {
-    coords.zip(dims).fold(0, |n, (c, d)| n * d + c)
 }
 
 /// Undo zlib, refusing to produce more than `limit` bytes.
@@ -709,16 +618,6 @@ fn fletcher32(data: &[u8]) -> u32 {
     a = (a & 0xffff) + (a >> 16);
     b = (b & 0xffff) + (b >> 16);
     (b << 16) | a
-}
-
-/// Fill `dst` with the bytes at `[at, at + dst.len())` of an array made of
-/// nothing but `pattern`.
-fn fill_from(pattern: &[u8], at: u64, dst: &mut [u8]) {
-    let n = pattern.len();
-    let start = (at % n as u64) as usize;
-    for (i, b) in dst.iter_mut().enumerate() {
-        *b = pattern[(start + i) % n];
-    }
 }
 
 /// The AEX type of an HDF5 datatype, or why there is none.

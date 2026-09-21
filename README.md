@@ -55,8 +55,9 @@ $ aex-server --control-addr 127.0.0.1:50051 --data-addr 127.0.0.1:50052 \
 ```
 
 The format is chosen by file extension (`.npy`, `.h5` / `.hdf5` / `.he5`,
-`.nc`). A file whose extension is not recognized can be opened by naming the
-format (`npy`, `hdf5`, `netcdf4`, …) with the Rust client's `open_as`.
+`.nc`, and `.zarr` for a Zarr store, which is a directory). A path whose
+extension is not recognized can be opened by naming the format (`npy`, `hdf5`,
+`netcdf4`, `zarr`, …) with the Rust client's `open_as`.
 
 A configuration file works too, and anything left out keeps its default.
 `aex-server --help` lists the command-line options.

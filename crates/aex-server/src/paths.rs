@@ -53,6 +53,32 @@ impl PathPolicy {
     /// `ocean/sst.npy` without knowing where the server keeps its data. An
     /// absolute path is taken as given and then checked.
     pub fn resolve(&self, requested: &str) -> Result<PathBuf> {
+        let resolved = self.locate(requested)?;
+        if !resolved.is_file() {
+            return Err(ServerError::BadRequest(format!(
+                "{requested} is not a regular file"
+            )));
+        }
+        Ok(resolved)
+    }
+
+    /// Resolve a client-supplied path to a store under one of the roots.
+    ///
+    /// A store is a directory a backend reads many files out of, rather than
+    /// one file. Which of those files may be opened is the backend's to
+    /// enforce; this only settles which directory it may work in.
+    pub fn resolve_store(&self, requested: &str) -> Result<PathBuf> {
+        let resolved = self.locate(requested)?;
+        if !resolved.is_dir() {
+            return Err(ServerError::BadRequest(format!(
+                "{requested} is not a directory"
+            )));
+        }
+        Ok(resolved)
+    }
+
+    /// The path a request names, once it is known to be inside a root.
+    fn locate(&self, requested: &str) -> Result<PathBuf> {
         if requested.is_empty() {
             return Err(ServerError::BadRequest("empty path".to_string()));
         }
@@ -73,12 +99,6 @@ impl PathPolicy {
                         // would disclose where symlinks point.
                         return Err(ServerError::PathNotAllowed(format!(
                             "{} is outside the configured data roots",
-                            requested.display()
-                        )));
-                    }
-                    if !resolved.is_file() {
-                        return Err(ServerError::BadRequest(format!(
-                            "{} is not a regular file",
                             requested.display()
                         )));
                     }
@@ -212,6 +232,45 @@ mod tests {
             policy.resolve(""),
             Err(ServerError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn a_store_resolves_only_when_it_is_a_directory() {
+        let dir = root_with_files();
+        let policy = PathPolicy::new(&[dir.path().to_path_buf()]).expect("policy");
+        let root = fs::canonicalize(dir.path()).unwrap();
+
+        assert_eq!(policy.resolve_store("sub").unwrap(), root.join("sub"));
+        // A file is no more a store than a directory is a file.
+        assert!(matches!(
+            policy.resolve_store("data.npy"),
+            Err(ServerError::BadRequest(_))
+        ));
+        assert!(matches!(
+            policy.resolve_store(""),
+            Err(ServerError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn a_store_outside_the_roots_is_rejected() {
+        let dir = root_with_files();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("secret.zarr")).unwrap();
+        let policy = PathPolicy::new(&[dir.path().to_path_buf()]).expect("policy");
+
+        let absolute = fs::canonicalize(outside.path())
+            .unwrap()
+            .join("secret.zarr");
+        let err = policy
+            .resolve_store(absolute.to_str().unwrap())
+            .unwrap_err();
+        assert!(matches!(err, ServerError::PathNotAllowed(_)), "{err}");
+
+        // A link is followed before the roots are compared, here as for a file.
+        std::os::unix::fs::symlink(&absolute, dir.path().join("link.zarr")).unwrap();
+        let err = policy.resolve_store("link.zarr").unwrap_err();
+        assert!(matches!(err, ServerError::PathNotAllowed(_)), "{err}");
     }
 
     #[test]

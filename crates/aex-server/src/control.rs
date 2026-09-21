@@ -42,6 +42,9 @@ const NPY_FORMAT: &str = "npy";
 /// underneath, so it is served by the same backend.
 const HDF5_FORMATS: [&str; 5] = ["hdf5", "h5", "he5", "nc", "netcdf4"];
 
+/// A Zarr store, which is a directory rather than a file.
+const ZARR_FORMAT: &str = "zarr";
+
 /// Not a format: a dataset with no storage behind it, for measuring what the
 /// transfer costs when reading the data costs nothing. Served only when the
 /// server was started with it enabled.
@@ -55,8 +58,7 @@ pub struct ControlService {
     /// The port the data plane really bound, which is not the configured one
     /// when that was 0.
     data_port: u16,
-    /// Shared by every HDF5 file this server opens.
-    #[cfg(feature = "hdf5")]
+    /// Shared by every compressed file this server opens.
     decode_cache: Arc<aex_core::DecodeCache>,
     /// Whether the cache has been reported too small, so it is said once.
     warned_small_cache: std::sync::atomic::AtomicBool,
@@ -74,7 +76,6 @@ impl ControlService {
             sessions,
             transfers,
             paths,
-            #[cfg(feature = "hdf5")]
             decode_cache: Arc::new(aex_core::DecodeCache::new(
                 config.transfer.decode_cache_bytes,
             )),
@@ -107,11 +108,31 @@ impl ControlService {
             return Ok(handle);
         }
 
-        let path = self.paths.resolve(&request.path)?;
-        let format = if request.format.is_empty() {
-            format_from_extension(&path)?
+        // A store is a directory, so which rule resolves the path depends on
+        // the format, and the format has to be settled first.
+        let asked = if request.format.is_empty() {
+            format_from_extension(std::path::Path::new(&request.path)).ok()
         } else {
-            request.format.to_ascii_lowercase()
+            Some(request.format.to_ascii_lowercase())
+        };
+        if asked.as_deref() == Some(ZARR_FORMAT) {
+            let root = self.paths.resolve_store(&request.path)?;
+            let file: Arc<dyn ArrayFile> =
+                Arc::new(aex_core::ZarrFile::open(&root, self.decode_cache.clone())?);
+            let handle = session.files().insert(file);
+            tracing::debug!(
+                session = %hex(session.id()),
+                handle,
+                path = %root.display(),
+                "opened store"
+            );
+            return Ok(handle);
+        }
+
+        let path = self.paths.resolve(&request.path)?;
+        let format = match asked {
+            Some(format) => format,
+            None => format_from_extension(&path)?,
         };
         let file: Arc<dyn ArrayFile> = if format == NPY_FORMAT {
             Arc::new(NpyFile::open(&path)?)
@@ -119,7 +140,8 @@ impl ControlService {
             self.open_hdf5(&path)?
         } else {
             return Err(ServerError::BadRequest(format!(
-                "format {format:?} is not supported; this server serves {NPY_FORMAT:?} and {:?}",
+                "format {format:?} is not supported; this server serves {NPY_FORMAT:?}, \
+                 {ZARR_FORMAT:?} and {:?}",
                 HDF5_FORMATS[0]
             )));
         };

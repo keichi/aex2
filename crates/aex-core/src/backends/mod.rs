@@ -1,8 +1,8 @@
 //! Backend implementations.
 //!
-//! `.npy` and, with the `hdf5` feature, HDF5 are the real formats. [`null`] is
-//! not a format at all: it is a dataset with no storage behind it, for
-//! measuring what the transfer costs when reading the data costs nothing.
+//! `.npy`, Zarr and, with the `hdf5` feature, HDF5 are the real formats.
+//! [`null`] is not a format at all: it is a dataset with no storage behind it,
+//! for measuring what the transfer costs when reading the data costs nothing.
 //!
 //! The traits they implement live in [`crate::backend`].
 
@@ -27,9 +27,10 @@ pub(crate) fn will_need(file: &std::fs::File, at: u64, len: u64) {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn will_need(_file: &std::fs::File, _at: u64, _len: u64) {}
 
-#[cfg(feature = "hdf5")]
+pub(crate) mod chunks;
 pub mod decode_cache;
 #[cfg(feature = "hdf5")]
 pub mod hdf5;
 pub mod npy;
 pub mod null;
+pub mod zarr;

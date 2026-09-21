@@ -25,6 +25,9 @@ hdf5 = { workspace = true, optional = true }
 
 [dev-dependencies]
 aex-client.workspace = true
+# Compresses the chunks of the Zarr fixtures the way a writer would.
+zstd.workspace = true
+crc32c.workspace = true
 # Checks what a float32 becomes when the server narrows it.
 half = "2"
 aex-core.workspace = true
@@ -56,6 +59,10 @@ path = "faults.rs"
 name = "hdf5"
 path = "hdf5.rs"
 required-features = ["hdf5"]
+
+[[test]]
+name = "zarr"
+path = "zarr.rs"
 
 [[test]]
 name = "gather"

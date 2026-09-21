@@ -25,6 +25,8 @@ aex-proto = { path = "crates/aex-proto" }
 aex-wire = { path = "crates/aex-wire" }
 
 clap = { version = "4", features = ["derive"] }
+# Zarr's crc32c codec. Pure Rust.
+crc32c = "0.6"
 dashmap = "6"
 # zlib-rs: pure Rust and faster than the default miniz_oxide.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
@@ -35,6 +37,7 @@ hdf5-sys = { package = "hdf5-metno-sys", version = "0.12" }
 npyz = "0.9"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 socket2 = { version = "0.6", features = ["all"] }
 # Vendors and builds SZ3; needs cmake, a C++17 compiler and libclang.
 sz3 = "0.4"
@@ -50,6 +53,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Vendors and builds zfp; needs cmake and libclang. `static` also turns OpenMP
 # off, so one connection is one compressing core, as it is for SZ3.
 zfp-sys = { version = "0.4", features = ["static"] }
+# Zarr's default compressor. Builds libzstd with cc; no cmake or libclang.
+zstd = { version = "0.13", default-features = false }
 
 proptest = "1"
 tempfile = "3"
