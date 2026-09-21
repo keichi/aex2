@@ -70,14 +70,14 @@
 | AEX2 サーバ | `benchmarks/mdx2/aex-decode-cache-64m.toml` (制御 50391) |
 | HTTP サーバ | `benchmarks/mdx2/nginx-zarr.conf` (8080、`/mnt/aexram` を配る) |
 | ストア | `mem{,-shard,-noisy,-noisy-shard}.zarr` (4 GiB、4 MiB チャンク、zstd) |
-| 読み手 | `benchmarks/mdx2/zarr-procs.py` (両方) と `aexbench --prefault` |
+| 読み手 | `benchmarks/mdx2/read-procs.py` (両方) と `aexbench --prefault` |
 | Rust / iPerf3 / kernel | 1.98.1 / 3.16 / 6.8.0-136 |
 | zarr-python / numcodecs | 3.4.0 / 0.17.0 |
 | fsspec / aiohttp / obstore / nginx | 2026.9.0 / 3.14.3 / 0.11.1 / 1.24.0 |
 | sysctl | 掃引の間ずっと `tuned` (`tcp_rmem` / `tcp_wmem` の上限 256 MiB) |
 | iPerf3 (サーバ→クライアント) | 前 26.1 / 162、後 26.0 〜 28.8 / 167 Gbit/s (1 本 / 16 本) |
 
-- **両方を同じスクリプトの中で回した。** `zarr-procs.py` が `zarr.open_array(...)[:]` と
+- **両方を同じスクリプトの中で回した。** `read-procs.py` が `zarr.open_array(...)[:]` と
   `aex.Client(...).open(...)["array"][:]` を同じループ・同じ計時・同じ確保の仕方で
   読む。どちらも毎回新しい配列を確保する (`aexbench` だけが `--prefault`)
 - **条件は 1 回ずつ交互に**回し、中央値を採った (RTT 0 の表は n = 5、掃引は n = 3)
@@ -85,7 +85,7 @@
   速かったため (1 GiB で 1,590 対 1,043 MiB/s)。相手には速いほうを使わせる
 - デコードキャッシュは 64 MiB なので、AEX2 は**毎回ほぼ全チャンクを伸長する**
 - 4 通りのストアについて、両方の読み手が**同じバイトを返すことを確かめてから**測った
-  (`zarr-procs.py --check`)
+  (`read-procs.py --check`)
 
 ### nginx が律速でないことの確認
 
@@ -160,7 +160,7 @@ credit 16 × 4 MiB = 64 MiB しか飛ばさない。zarr-python の 1 プロセ�
 
 ## 遠くなるとどうなるか
 
-netem で往復を足した掃引。n = 3 の中央値、`zarr-procs.py` の 16 プロセス対
+netem で往復を足した掃引。n = 3 の中央値、`read-procs.py` の 16 プロセス対
 AEX2 の 16 接続 (どちらも Python)。zarr-python の 1 プロセスは掃いた最良値。
 
 ### 圧縮が効かないストア (`mem-noisy.zarr`、35 %)
@@ -468,7 +468,7 @@ $ ssh aex2-eval2 "tmux new-session -d -s remote 'cd aex2 &&
 
 ```console
 $ ssh aex2-eval2 "bash -lc 'cd ~/aex2 && for s in mem.zarr mem-noisy.zarr; do
-    .venv/bin/python benchmarks/mdx2/zarr-procs.py http://192.168.100.207:8080/\$s \
+    .venv/bin/python benchmarks/mdx2/read-procs.py http://192.168.100.207:8080/\$s \
       --via obstore --check aex:http://192.168.100.207:50391/\$s; done'"
 ```
 
@@ -514,7 +514,7 @@ $ STORE=mem.zarr ELEMENTS=1073741824 QUALITIES="|--codec gzip" RATES=" " \
 ```
 
 届く精度は転送してから確かめる。上限を要求しても、feature 無しのサーバは黙って
-正確なデータを返す (`zarr-procs.py` はその場合その回を落とす)。
+正確なデータを返す (`read-procs.py` はその場合その回を落とす)。
 
 ```python
 import aex, numpy as np
@@ -525,12 +525,12 @@ for eps in (0.001, 0.01, 1.0):
     print(eps, np.abs(a.at(abs_error=eps)[0:4096].astype("f8") - exact).max())
 ```
 
-1 点だけ測るなら `zarr-procs.py` を直に呼ぶ。`--backend aex` は URL の最後の区切りまでを
+1 点だけ測るなら `read-procs.py` を直に呼ぶ。`--backend aex` は URL の最後の区切りまでを
 制御プレーンの宛先、その後ろをストア名として読む。
 
 ```console
-$ .venv/bin/python benchmarks/mdx2/zarr-procs.py \
+$ .venv/bin/python benchmarks/mdx2/read-procs.py \
     http://192.168.100.207:8080/mem-noisy.zarr --via obstore --concurrency 64 --procs 1 16
-$ .venv/bin/python benchmarks/mdx2/zarr-procs.py \
+$ .venv/bin/python benchmarks/mdx2/read-procs.py \
     http://192.168.100.207:50391/mem-noisy.zarr --backend aex --streams 16 --procs 1
 ```

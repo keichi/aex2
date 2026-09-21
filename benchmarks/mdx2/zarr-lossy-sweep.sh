@@ -40,7 +40,7 @@ COUNTERS=${COUNTERS:-1}
 # /disk/, can be swept by the same script.
 HTTP=${HTTP:-http://$SERVER_IP:8080}
 AEX=http://$SERVER_IP:50391
-PY=".venv/bin/python -u benchmarks/mdx2/zarr-procs.py"
+PY=".venv/bin/python -u benchmarks/mdx2/read-procs.py"
 ELEMENTS=${ELEMENTS:-$((1 << 28))}    # 1 GiB, as the SZ3 measurement used
 # Exact, exact-but-smaller, and three bounds. The field runs to about 300, so
 # 1.0 is coarse and 1e-3 is not.

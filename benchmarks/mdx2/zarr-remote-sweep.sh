@@ -41,7 +41,7 @@ VIA=${VIA:-obstore}
 # /disk/, can be swept by the same script.
 HTTP=${HTTP:-http://$SERVER_IP:8080}
 AEX=http://$SERVER_IP:50391
-PY=".venv/bin/python -u benchmarks/mdx2/zarr-procs.py"
+PY=".venv/bin/python -u benchmarks/mdx2/read-procs.py"
 ELEMENTS=$((1 << 30))
 
 restore() {

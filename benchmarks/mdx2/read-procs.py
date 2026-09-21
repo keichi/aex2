@@ -1,19 +1,22 @@
 """Read the same array through readers that all cross the same link.
 
-zarr-python against a store served over HTTP, and AEX2's Python client against
-the same store on the same machine, in one loop with one timing, so that what
-is compared is the readers and not two benchmarks.
+zarr-python against a store served over HTTP, h5py and h5pyd against the same
+HDF5 file, and AEX2's Python client against the same data on the same machine,
+in one loop with one timing, so that what is compared is the readers and not
+several benchmarks.
 
-Also the question this started as: is zarr-python's ceiling the machine, or one
+Also the question this started as: is a reader's ceiling the machine, or one
 Python process? Each worker process reads its own disjoint slice. If N
 processes go N times faster, then neither the storage nor the codec was the
 limit -- one interpreter was. Sweeping past the core count shows where the
 machine takes over.
 
 Usage:
-  python zarr-procs.py /mnt/aexram/mem.zarr                  # local, as before
-  python zarr-procs.py http://SERVER:8080/mem.zarr --via obstore
-  python zarr-procs.py http://SERVER:50391/mem.zarr --backend aex --streams 16
+  python read-procs.py /mnt/aexram/mem.zarr                  # local, as before
+  python read-procs.py http://SERVER:8080/mem.zarr --via obstore
+  python read-procs.py http://SERVER:50391/mem.zarr --backend aex --streams 16
+  python read-procs.py http://SERVER:8080/mem.h5 --backend h5py --cache none
+  python read-procs.py http://SERVER:5101/home/test/mem.h5 --backend h5pyd
 """
 
 import argparse
@@ -51,6 +54,43 @@ def open_array(args, store=None, backend=None):
             array = array.at(abs_error=args.abs_error or None, codec=args.codec or None)
         return array, client
 
+    if backend == "h5py":
+        import fsspec
+        import h5py
+
+        # libhdf5 reads the file itself, over a file object that turns its
+        # seeks into range requests. What that costs depends on how the object
+        # caches, so the setting is swept rather than defaulted.
+        handle = fsspec.open(store, block_size=args.block, cache_type=args.cache).open()
+        f = h5py.File(handle, "r")
+        return f["array"], f
+
+    if backend == "h5pyd":
+        import urllib.parse
+
+        import h5pyd
+
+        # The endpoint is the server, the path is the domain within it. The
+        # rest comes from the environment, which h5pyd only reads from a
+        # config file of its own.
+        #
+        # A standalone HSDS runs one service node, and everything a client
+        # reads passes through that one Python process. Several of them are
+        # started on consecutive ports to let it use the machine, and the
+        # readers are spread over them.
+        url = urllib.parse.urlsplit(store)
+        host, _, port = url.netloc.partition(":")
+        port = int(port) + args.rank % args.endpoints
+        f = h5pyd.File(
+            url.path,
+            "r",
+            endpoint=f"{url.scheme}://{host}:{port}",
+            username=os.environ.get("HS_USERNAME"),
+            password=os.environ.get("HS_PASSWORD"),
+            bucket=os.environ.get("HS_BUCKET"),
+        )
+        return f["array"], f
+
     import zarr
 
     if args.concurrency:
@@ -68,10 +108,28 @@ def open_array(args, store=None, backend=None):
     return zarr.open_array(f"{store}/array", mode="r"), None
 
 
+def read(array, start, stop, piece):
+    """Read rows start..stop and return the bytes delivered.
+
+    In `piece` rows at a time when that is set: HSDS assembles a whole
+    selection in memory before it answers, so a quarter of a gigabyte asked
+    for at once by each of sixteen readers gets it killed by the kernel.
+    Reading in pieces is what its own documentation has a client do; the
+    readers that stream a request do not need it and are not given it.
+
+    The pieces are not joined, because joining them would charge the reader
+    for a copy the others never make.
+    """
+    if not piece:
+        return array[start:stop].nbytes
+    return sum(array[at : min(at + piece, stop)].nbytes for at in range(start, stop, piece))
+
+
 def work(args, k, procs, done):
     """Read process k's slice of the array and report what it cost."""
     session = None
     try:
+        args.rank = k
         array, session = open_array(args)
         # The split is along the leading axis, which for a two-dimensional field
         # is rows rather than elements. A quality view wraps the array with the
@@ -79,11 +137,11 @@ def work(args, k, procs, done):
         rows = min(args.elements, getattr(array, "array", array).shape[0])
         step = rows // procs
         cpu = time.process_time()
-        out = array[k * step : (k + 1) * step]
+        delivered = read(array, k * step, (k + 1) * step, args.piece)
         # The server drops a quality it cannot apply and sends exact data, so a
         # run that posts a good number may not have compressed anything.
         applied = getattr(array, "applied_quality", None)
-        done.put((out.nbytes, time.process_time() - cpu, applied))
+        done.put((delivered, time.process_time() - cpu, applied))
     except BaseException as error:  # noqa: BLE001 - reported through the queue
         # The parent blocks on the queue, so a child that dies quietly hangs
         # the sweep rather than failing it.
@@ -140,9 +198,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("store", help="Store path, or URL whose last segment names the store")
     parser.add_argument("elements", nargs="?", type=int, default=1 << 30)
-    parser.add_argument("--backend", choices=["zarr", "aex"], default="zarr")
+    parser.add_argument("--backend", choices=["zarr", "aex", "h5py", "h5pyd"], default="zarr")
     parser.add_argument(
         "--via", choices=["fsspec", "obstore"], default="fsspec", help="How zarr-python reaches it"
+    )
+    parser.add_argument(
+        "--cache", default="none", help="h5py: how the fsspec file object caches (fsspec name)"
+    )
+    parser.add_argument(
+        "--block", type=int, default=4 << 20, help="h5py: fsspec block size in bytes"
+    )
+    parser.add_argument(
+        "--endpoints", type=int, default=1, help="h5pyd: HSDS servers, on consecutive ports"
+    )
+    parser.add_argument(
+        "--piece", type=int, default=0, help="Rows per read; 0 asks for the whole slice at once"
     )
     parser.add_argument("--procs", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--streams", type=int, default=1, help="AEX2 connections per process")
@@ -159,14 +229,21 @@ def main() -> None:
     )
     parser.add_argument("--codec", default="", help="AEX2 wire codec: sz, zfp or gzip")
     args = parser.parse_args()
+    # Which worker this is; only the HSDS endpoints are chosen from it.
+    args.rank = 0
 
     # The label has to say what would otherwise be invisible in a sweep log.
-    how = (
-        f"aex x{args.streams}"
-        + (f" {args.codec or 'sz'}{args.abs_error or ''}" if args.abs_error or args.codec else "")
-        if args.backend == "aex"
-        else f"zarr/{args.via}" + (f" c{args.concurrency}" if args.concurrency else "")
-    )
+    if args.backend == "aex":
+        quality = ""
+        if args.abs_error or args.codec:
+            quality = f" {args.codec or 'sz'}{args.abs_error or ''}"
+        how = f"aex x{args.streams}{quality}"
+    elif args.backend == "h5py":
+        how = f"h5py {args.cache}/{args.block >> 20}M"
+    elif args.backend == "h5pyd":
+        how = f"h5pyd e{args.endpoints}"
+    else:
+        how = f"zarr/{args.via}" + (f" c{args.concurrency}" if args.concurrency else "")
     if not args.label:
         print(f"== {args.store}  {how}")
     if args.check:
