@@ -14,11 +14,6 @@ from aex import AexNotFoundError, AexValueError, ArrayProxy, GroupProxy
 SHAPE = (12, 7, 5)
 
 
-# This build serves stored bytes as they are, so the fixtures say so. What
-# zarr-python writes by default is zstd, which arrives with the codecs.
-UNCOMPRESSED = {"compressors": None}
-
-
 @pytest.fixture(scope="module")
 def zarr_path(data_dir):
     """A store shaped like the HDF5 fixture, so the two can be read alike."""
@@ -26,26 +21,17 @@ def zarr_path(data_dir):
     root = zarr.create_group(path, zarr_format=3)
     g1 = root.create_group("g1")
     x, y = np.meshgrid(np.arange(200), np.arange(100))
-    ds1 = g1.create_array("ds1", shape=(100, 200), dtype="float32", chunks=(32, 64), **UNCOMPRESSED)
+    ds1 = g1.create_array("ds1", shape=(100, 200), dtype="float32", chunks=(32, 64))
     ds1[...] = (x + y * 200).astype(np.float32)
-    g1.create_array("ds2", shape=(100, 200), dtype="float64", chunks=(32, 64), **UNCOMPRESSED)
+    g1.create_array("ds2", shape=(100, 200), dtype="float64", chunks=(32, 64))
     g3 = g1.create_group("g3")
-    g3.create_array("ds3", shape=(100, 200), dtype="int8", chunks=(32, 64), **UNCOMPRESSED)
+    g3.create_array("ds3", shape=(100, 200), dtype="int8", chunks=(32, 64))
     # Never written, so every chunk is missing and reads as the fill value.
-    g3.create_array(
-        "ds4",
-        shape=(100, 200),
-        dtype="int16",
-        chunks=(32, 64),
-        fill_value=-3,
-        **UNCOMPRESSED,
-    )
+    g3.create_array("ds4", shape=(100, 200), dtype="int16", chunks=(32, 64), fill_value=-3)
     g2 = root.create_group("g2")
-    g2.create_array("ds5", shape=(100, 200), dtype="int32", chunks=(32, 64), **UNCOMPRESSED)
-    g2.create_array("ds6", shape=(100, 200), dtype="int64", chunks=(32, 64), **UNCOMPRESSED)
-    selection = root.create_array(
-        "selection", shape=SHAPE, dtype="int32", chunks=(5, 3, 2), **UNCOMPRESSED
-    )
+    g2.create_array("ds5", shape=(100, 200), dtype="int32", chunks=(32, 64))
+    g2.create_array("ds6", shape=(100, 200), dtype="int64", chunks=(32, 64))
+    selection = root.create_array("selection", shape=SHAPE, dtype="int32", chunks=(5, 3, 2))
     selection[...] = np.arange(np.prod(SHAPE), dtype=np.int32).reshape(SHAPE)
     return str(path)
 
@@ -101,7 +87,7 @@ def test_every_dtype_matches_zarr_python(dtype, client, data_dir):
     values = np.arange(35).reshape(5, 7)
     if np.dtype(dtype) == np.bool_:
         values = values % 3 == 0
-    array = zarr.create_array(str(path), shape=(5, 7), dtype=dtype, chunks=(2, 3), **UNCOMPRESSED)
+    array = zarr.create_array(str(path), shape=(5, 7), dtype=dtype, chunks=(2, 3))
     array[...] = values.astype(dtype)
 
     # zarr-python puts a bare array at the root of its own store, so the file
@@ -111,6 +97,33 @@ def test_every_dtype_matches_zarr_python(dtype, client, data_dir):
     got = proxy[...]
     assert got.dtype == np.dtype(dtype)
     np.testing.assert_array_equal(got, zarr.open_array(str(path))[...])
+
+
+CHAINS = {
+    "uncompressed": None,
+    # What zarr-python writes when it is not told otherwise.
+    "default": "auto",
+    "gzip": [zarr.codecs.GzipCodec()],
+    "zstd+crc32c": [zarr.codecs.ZstdCodec(), zarr.codecs.Crc32cCodec()],
+}
+
+
+@pytest.mark.parametrize("chain", list(CHAINS), ids=list(CHAINS))
+def test_every_codec_chain_matches_zarr_python(chain, client, data_dir):
+    path = data_dir / f"codec-{chain}.zarr"
+    compressors = CHAINS[chain]
+    # A shape the chunks do not cover evenly, so edge chunks are padded before
+    # they are compressed.
+    values = np.arange(35, dtype=np.float32).reshape(5, 7)
+    array = zarr.create_array(
+        str(path), shape=(5, 7), dtype="float32", chunks=(2, 3), compressors=compressors
+    )
+    array[...] = values
+
+    proxy = client.open(str(path))[""]
+    np.testing.assert_array_equal(proxy[...], zarr.open_array(str(path))[...])
+    # Reading a piece at a time goes back to the same decoded chunks.
+    np.testing.assert_array_equal(proxy[1:4, ::2], values[1:4, ::2])
 
 
 def test_a_store_that_is_not_one_is_refused(client, data_dir):

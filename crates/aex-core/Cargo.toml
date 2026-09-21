@@ -15,6 +15,9 @@ npyz.workspace = true
 # Zarr metadata: one JSON document per node.
 serde.workspace = true
 serde_json.workspace = true
+# Zarr chunk codecs.
+crc32c.workspace = true
+zstd.workspace = true
 thiserror.workspace = true
 # The GZIP codec, and the inflate side of the HDF5 deflate filter.
 flate2.workspace = true

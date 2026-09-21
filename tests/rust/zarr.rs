@@ -4,6 +4,7 @@ use std::path::Path;
 
 use aex_client::{ClientConfig, Index, Item};
 use aex_core::ErrorClass;
+use crc32c::crc32c;
 
 #[path = "support.rs"]
 mod support;
@@ -14,7 +15,8 @@ const ROWS: usize = 300;
 const COLS: usize = 1000;
 const CHUNK: [usize; 2] = [64, 300];
 
-/// Write `<name>/group/grid` holding 0, 1, 2, ... and return the values.
+/// Write `<name>/group/{grid,packed}` holding 0, 1, 2, ... and return the
+/// values. `packed` holds the same numbers with its chunks compressed.
 fn write_grid(server: &TestServer, name: &str) -> Vec<f32> {
     let store = server.root().join(name);
     node(&store, "", r#"{"zarr_format": 3, "node_type": "group"}"#);
@@ -24,7 +26,8 @@ fn write_grid(server: &TestServer, name: &str) -> Vec<f32> {
         r#"{"zarr_format": 3, "node_type": "group"}"#,
     );
     let values: Vec<f32> = (0..ROWS * COLS).map(|i| i as f32).collect();
-    write_array(&store.join("group"), "grid", &values);
+    write_array(&store.join("group"), "grid", &values, false);
+    write_array(&store.join("group"), "packed", &values, true);
     values
 }
 
@@ -43,7 +46,12 @@ fn node(store: &Path, at: &str, json: &str) {
 ///
 /// The chunks are laid out by hand rather than with a library: the point of
 /// the test is that the server reads what a store really holds.
-fn write_array(parent: &Path, name: &str, values: &[f32]) {
+fn write_array(parent: &Path, name: &str, values: &[f32], packed: bool) {
+    let codecs = if packed {
+        r#", {"name": "zstd"}, {"name": "crc32c"}"#
+    } else {
+        ""
+    };
     node(
         parent,
         name,
@@ -54,7 +62,8 @@ fn write_array(parent: &Path, name: &str, values: &[f32]) {
                                  "configuration": {{"chunk_shape": {CHUNK:?}}}}},
                  "chunk_key_encoding": {{"name": "default"}},
                  "fill_value": 0.0,
-                 "codecs": [{{"name": "bytes", "configuration": {{"endian": "little"}}}}]}}"#
+                 "codecs": [{{"name": "bytes",
+                              "configuration": {{"endian": "little"}}}}{codecs}]}}"#
         ),
     );
     let dir = parent.join(name);
@@ -72,7 +81,12 @@ fn write_array(parent: &Path, name: &str, values: &[f32]) {
             }
             let key = dir.join("c").join(cr.to_string());
             std::fs::create_dir_all(&key).expect("mkdir");
-            let bytes: Vec<u8> = chunk.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut bytes: Vec<u8> = chunk.iter().flat_map(|v| v.to_le_bytes()).collect();
+            if packed {
+                bytes = zstd::bulk::compress(&bytes, 3).expect("zstd");
+                let sum = crc32c(&bytes);
+                bytes.extend(sum.to_le_bytes());
+            }
             std::fs::write(key.join(cc.to_string()), bytes).expect("write");
         }
     }
@@ -100,15 +114,17 @@ fn an_array_arrives_whole_over_every_stream_count() {
             ..ClientConfig::default()
         });
         let handle = client.open("grid.zarr").expect("open");
-        let array = client
-            .read_selection_as::<f32>(handle, "/group/grid", &[])
-            .expect("read");
-        assert_eq!(array.shape, [ROWS as u64, COLS as u64]);
-        assert!(array.data == all, "streams={streams}");
-        let array = client
-            .read_selection_as::<f32>(handle, "group/grid", &every_other_row)
-            .expect("read");
-        assert!(array.data == odd_rows, "streams={streams}");
+        for name in ["/group/grid", "group/packed"] {
+            let array = client
+                .read_selection_as::<f32>(handle, name, &[])
+                .expect("read");
+            assert_eq!(array.shape, [ROWS as u64, COLS as u64]);
+            assert!(array.data == all, "{name} streams={streams}");
+            let array = client
+                .read_selection_as::<f32>(handle, name, &every_other_row)
+                .expect("read");
+            assert!(array.data == odd_rows, "{name} streams={streams}");
+        }
         client.disconnect().expect("disconnect");
     }
 }
@@ -127,7 +143,7 @@ fn the_hierarchy_is_browsable() {
 
     let children = client.list_children(handle, "group").expect("list group");
     let names: Vec<&str> = children.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["grid"]);
+    assert_eq!(names, ["grid", "packed"]);
 
     let Item::Dataset(info) = client.get_item(handle, "/group/grid").expect("grid") else {
         panic!("grid must be a dataset");

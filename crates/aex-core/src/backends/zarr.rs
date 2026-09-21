@@ -8,6 +8,9 @@
 //! Unlike HDF5 there is no index to build: a chunk's name follows from its
 //! coordinates, so nothing has to be read before the first transfer.
 //!
+//! The codecs a chunk went through are listed in the order they were applied,
+//! so decoding runs the bytes-to-bytes ones backwards.
+//!
 //! Every path read here — a node's metadata as much as a chunk — goes through
 //! [`StoreRoot::under`], which resolves symlinks and refuses anything that
 //! lands outside the store. The server decides which directory may be served;
@@ -20,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -208,11 +212,23 @@ pub struct ZarrArray {
     shape: Vec<u64>,
     grid: ChunkGrid,
     key: KeyEncoding,
+    /// The bytes-to-bytes codecs, in the order they were applied when writing.
+    codecs: Vec<ChunkCodec>,
     /// One element's worth of bytes, as stored.
     fill: Vec<u8>,
     cache: Arc<DecodeCache>,
     /// Tells this array's chunks apart from others' in the shared cache.
     cache_key: u64,
+}
+
+/// A codec that turns a chunk's bytes into other bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkCodec {
+    Gzip,
+    Zstd,
+    /// A checksum rather than a transformation: four little-endian bytes of
+    /// CRC-32C at the end of what it wrapped.
+    Crc32c,
 }
 
 /// How a chunk's coordinates become its file name.
@@ -244,7 +260,7 @@ impl ZarrArray {
                 "{prefix} uses a storage transformer"
             )));
         }
-        check_codecs(prefix, &meta.codecs)?;
+        let codecs = parse_codecs(prefix, &meta.codecs)?;
 
         if meta.chunk_grid.name != "regular" {
             return Err(AexError::UnsupportedZarr(format!(
@@ -276,6 +292,7 @@ impl ZarrArray {
             shape: meta.shape,
             grid,
             key: key_encoding(prefix, &meta.chunk_key_encoding)?,
+            codecs,
             fill: fill_bytes(dtype, &meta.fill_value)
                 .map_err(|e| AexError::MalformedZarr(format!("{prefix}: {e}")))?,
             cache,
@@ -336,7 +353,21 @@ impl ZarrArray {
             fill_from(&self.fill, 0, &mut chunk);
             return Ok(chunk);
         };
-        let bytes = std::fs::read(&path)?;
+        let mut bytes = std::fs::read(&path)?;
+        let malformed = |what: String| AexError::MalformedZarr(format!("chunk {key}: {what}"));
+        // The codecs are listed in the order they were applied.
+        for codec in self.codecs.iter().rev() {
+            bytes = match codec {
+                ChunkCodec::Gzip => ungzip(&bytes, self.grid.chunk_bytes()).ok_or_else(|| {
+                    malformed("the gzip stream does not expand to a chunk".to_string())
+                })?,
+                ChunkCodec::Zstd => zstd::bulk::decompress(&bytes, chunk_bytes)
+                    .map_err(|e| malformed(format!("zstd: {e}")))?,
+                ChunkCodec::Crc32c => {
+                    strip_crc32c(bytes).ok_or_else(|| malformed("CRC-32C mismatch".to_string()))?
+                }
+            };
+        }
         if bytes.len() != chunk_bytes {
             return Err(AexError::MalformedZarr(format!(
                 "chunk {key} holds {} bytes instead of {chunk_bytes}",
@@ -473,11 +504,12 @@ fn key_encoding(prefix: &str, named: &Option<Named>) -> Result<KeyEncoding> {
     })
 }
 
-/// Refuse a codec chain this build cannot undo.
+/// The bytes-to-bytes codecs of a chain, refusing one this build cannot undo.
 ///
-/// Nothing is applied yet: only `bytes` little-endian data is served, so a
-/// chain that passes here leaves the chunk exactly as it is stored.
-fn check_codecs(prefix: &str, codecs: &[Named]) -> Result<()> {
+/// `bytes` and an identity `transpose` change nothing about the stored bytes,
+/// so they are checked and then forgotten.
+fn parse_codecs(prefix: &str, codecs: &[Named]) -> Result<Vec<ChunkCodec>> {
+    let mut chain = Vec::new();
     for codec in codecs {
         match codec.name.as_str() {
             // Every target is little-endian and so is the wire, so big-endian
@@ -507,6 +539,9 @@ fn check_codecs(prefix: &str, codecs: &[Named]) -> Result<()> {
                     )));
                 }
             }
+            "gzip" => chain.push(ChunkCodec::Gzip),
+            "zstd" => chain.push(ChunkCodec::Zstd),
+            "crc32c" => chain.push(ChunkCodec::Crc32c),
             other => {
                 return Err(AexError::UnsupportedZarr(format!(
                     "{prefix} uses the {other:?} codec, which is not decoded"
@@ -514,7 +549,25 @@ fn check_codecs(prefix: &str, codecs: &[Named]) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(chain)
+}
+
+/// Undo gzip, refusing to produce more than `limit` bytes.
+fn ungzip(bytes: &[u8], limit: u64) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(limit as usize);
+    flate2::read::GzDecoder::new(bytes)
+        .take(limit + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
+/// Drop the trailing CRC-32C, if it is the one the rest of the bytes have.
+fn strip_crc32c(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
+    let at = bytes.len().checked_sub(4)?;
+    let stored = u32::from_le_bytes(bytes[at..].try_into().expect("four bytes"));
+    bytes.truncate(at);
+    (crc32c::crc32c(&bytes) == stored).then_some(bytes)
 }
 
 /// One element of `dtype` holding the JSON fill value, as it would be stored.
@@ -1021,6 +1074,7 @@ mod tests {
                     &Some(serde_json::from_str(encoding).expect("encoding")),
                 )
                 .expect("encoding"),
+                codecs: Vec::new(),
                 fill: vec![0; 4],
                 cache: Arc::new(DecodeCache::new(0)),
                 cache_key: 0,
@@ -1063,7 +1117,7 @@ mod tests {
     fn unservable_arrays_are_rejected() {
         // A store AEX cannot serve is the requester's problem; a store that
         // disagrees with itself will not serve however often it is asked.
-        let cases: [(&str, ErrorClass, &str); 11] = [
+        let cases: [(&str, ErrorClass, &str); 12] = [
             ("version 2", ErrorClass::Request, r#"{"zarr_format": 2}"#),
             ("version 4", ErrorClass::Request, r#"{"zarr_format": 4}"#),
             (
@@ -1110,6 +1164,11 @@ mod tests {
                 r#"{"codecs": [{"name": "bytes"}, {"name": "blosc"}]}"#,
             ),
             (
+                "a sharded array",
+                ErrorClass::Request,
+                r#"{"codecs": [{"name": "sharding_indexed"}]}"#,
+            ),
+            (
                 "a storage transformer",
                 ErrorClass::Request,
                 r#"{"storage_transformers": [{}]}"#,
@@ -1143,6 +1202,141 @@ mod tests {
         let mut tail = vec![0u8; 8];
         array.read_range(&layout, 8, &mut tail).expect("read");
         assert_eq!(tail, bytes_of(&[3i32, 4]));
+    }
+
+    /// `bytes` through the codec chain, the way a writer would apply it.
+    fn encode(chain: &[ChunkCodec], mut bytes: Vec<u8>) -> Vec<u8> {
+        use std::io::Write as _;
+        for codec in chain {
+            bytes = match codec {
+                ChunkCodec::Gzip => {
+                    let mut out =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    out.write_all(&bytes).expect("gzip");
+                    out.finish().expect("gzip")
+                }
+                ChunkCodec::Zstd => zstd::bulk::compress(&bytes, 3).expect("zstd"),
+                ChunkCodec::Crc32c => {
+                    let sum = crc32c::crc32c(&bytes);
+                    bytes.extend(sum.to_le_bytes());
+                    bytes
+                }
+            };
+        }
+        bytes
+    }
+
+    #[test]
+    fn compressed_chunks_read_back_under_every_chain() {
+        let chains: [&[ChunkCodec]; 6] = [
+            &[],
+            &[ChunkCodec::Gzip],
+            &[ChunkCodec::Zstd],
+            &[ChunkCodec::Crc32c],
+            &[ChunkCodec::Zstd, ChunkCodec::Crc32c],
+            &[ChunkCodec::Gzip, ChunkCodec::Crc32c],
+        ];
+        for chain in chains {
+            let names: Vec<String> = chain
+                .iter()
+                .map(|c| match c {
+                    ChunkCodec::Gzip => r#"{"name": "gzip"}"#.to_string(),
+                    ChunkCodec::Zstd => r#"{"name": "zstd"}"#.to_string(),
+                    ChunkCodec::Crc32c => r#"{"name": "crc32c"}"#.to_string(),
+                })
+                .collect();
+            let store = StoreBuilder::new();
+            // A shape the chunks do not cover evenly, so edge chunks are
+            // padded before they are compressed.
+            let (shape, chunk) = ([5u64, 7], [2u64, 3]);
+            store.array(
+                "a",
+                "int32",
+                &shape,
+                &chunk,
+                &format!(
+                    r#"{{"codecs": [{{"name": "bytes",
+                                      "configuration": {{"endian": "little"}}}}{}]}}"#,
+                    names.iter().map(|n| format!(", {n}")).collect::<String>()
+                ),
+            );
+            let values: Vec<i32> = (0..35).collect();
+            let flat = write_chunks(&store, "a", &shape, &chunk, &values);
+            // Rewrite each chunk through the chain.
+            for row in 0..3 {
+                for col in 0..3 {
+                    let key = format!("a/c/{row}/{col}");
+                    let raw = std::fs::read(store.path().join(&key)).expect("read");
+                    store.write(&key, &encode(chain, raw));
+                }
+            }
+
+            let file = store.open().expect("open");
+            let array = array_at(&file, "a");
+            assert_eq!(read_all(array.as_ref(), &[]), flat, "{names:?}");
+            check_ranges(array.as_ref(), &flat);
+            assert_eq!(array.decoded_chunk_bytes(), Some(2 * 3 * 4));
+        }
+    }
+
+    #[test]
+    fn a_corrupt_chunk_is_reported() {
+        // Each case damages the one chunk that holds the whole array.
+        let cases: [(&str, Vec<u8>); 5] = [
+            (r#"{"name": "gzip"}"#, b"not gzip at all".to_vec()),
+            (r#"{"name": "zstd"}"#, b"not zstd at all".to_vec()),
+            (
+                r#"{"name": "crc32c"}"#,
+                // The right length, the wrong checksum.
+                [bytes_of(&[1i32, 2]), vec![0, 0, 0, 0]].concat(),
+            ),
+            (
+                r#"{"name": "gzip"}"#,
+                // Valid gzip, but not of a whole chunk.
+                encode(&[ChunkCodec::Gzip], vec![0u8; 4]),
+            ),
+            (r#"{"name": "crc32c"}"#, vec![1, 2]),
+        ];
+        for (codec, chunk) in cases {
+            let store = StoreBuilder::new();
+            store.array(
+                "a",
+                "int32",
+                &[2],
+                &[2],
+                &format!(r#"{{"codecs": [{{"name": "bytes"}}, {codec}]}}"#),
+            );
+            store.write("a/c/0", &chunk);
+            let file = store.open().expect("open");
+            let array = array_at(&file, "a");
+            let layout = array.layout(&[], &QualitySpec::default()).expect("layout");
+            let mut out = vec![0u8; layout.total_bytes as usize];
+            let err = array.read_range(&layout, 0, &mut out).expect_err(codec);
+            assert!(matches!(err, AexError::MalformedZarr(_)), "{codec}: {err}");
+            assert_eq!(err.class(), ErrorClass::Permanent, "{codec}");
+        }
+    }
+
+    #[test]
+    fn a_decompression_bomb_does_not_expand() {
+        let store = StoreBuilder::new();
+        store.array(
+            "a",
+            "int32",
+            &[2],
+            &[2],
+            r#"{"codecs": [{"name": "bytes"}, {"name": "gzip"}]}"#,
+        );
+        // Sixteen megabytes of zeros in a few kilobytes: the reader must stop
+        // at one chunk, not at the end of the stream.
+        store.write("a/c/0", &encode(&[ChunkCodec::Gzip], vec![0u8; 1 << 24]));
+
+        let file = store.open().expect("open");
+        let array = array_at(&file, "a");
+        let layout = array.layout(&[], &QualitySpec::default()).expect("layout");
+        let mut out = vec![0u8; layout.total_bytes as usize];
+        let err = array.read_range(&layout, 0, &mut out).expect_err("bomb");
+        assert!(matches!(err, AexError::MalformedZarr(_)), "{err}");
     }
 
     #[test]
