@@ -213,6 +213,25 @@ def test_group_proxy_items(file_proxy):
     assert isinstance(item, ArrayProxy)
 
 
+class _ListingOnly:
+    """The native client with get_item taken away, to prove it is not used."""
+
+    def __init__(self, native):
+        self._native = native
+
+    def list_children(self, *args):
+        return self._native.list_children(*args)
+
+    def get_item(self, *args):
+        raise AssertionError("the children were asked for one at a time")
+
+
+def test_group_proxy_values_come_from_one_listing(file_proxy):
+    file_proxy._native = _ListingOnly(file_proxy._native)
+    assert [item.name for item in file_proxy.values()] == ["/array"]
+    assert [name for name, _ in file_proxy.items()] == ["array"]
+
+
 def test_group_proxy_dict(file_proxy):
     mapping = dict(file_proxy)
     assert list(mapping) == ["array"]
