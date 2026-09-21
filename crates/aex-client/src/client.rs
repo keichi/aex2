@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aex_core::{DType, ErrorClass, Index, QualitySpec, Reduced};
+use aex_core::{AttrValue, DType, ErrorClass, Index, QualitySpec, Reduced};
 use aex_proto::aex_control_client::AexControlClient;
 use aex_proto::convert::{check_fancy_limit, indices_to_proto, quality_to_proto};
 use aex_proto::function_argument::Value;
@@ -105,7 +105,9 @@ impl FunctionArg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     Dataset(DatasetInfo),
-    Group,
+    /// A group, with its attributes; the root group holds the netCDF global
+    /// ones.
+    Group(Vec<(String, AttrValue)>),
 }
 
 /// An array's metadata.
@@ -113,6 +115,8 @@ pub enum Item {
 pub struct DatasetInfo {
     pub dtype: DType,
     pub shape: Vec<u64>,
+    /// Sorted by name, and empty for a format without attributes.
+    pub attrs: Vec<(String, AttrValue)>,
 }
 
 impl DatasetInfo {
@@ -821,20 +825,18 @@ fn item_from_proto(item: &aex_proto::Item) -> Result<(String, Item)> {
         .as_ref()
         .ok_or_else(|| ClientError::Protocol(format!("item {:?} is neither kind", item.name)))?;
 
+    let attrs = item
+        .attrs
+        .iter()
+        .map(attr_from_proto)
+        .collect::<Result<Vec<_>>>()?;
+
     let converted = match data {
-        aex_proto::item::Data::Group(_) => Item::Group,
+        aex_proto::item::Data::Group(_) => Item::Group(attrs),
         aex_proto::item::Data::Dataset(dataset) => {
             let dtype =
                 DType::from_i32(dataset.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
-            let shape = dataset
-                .shape
-                .iter()
-                .map(|&n| {
-                    u64::try_from(n).map_err(|_| {
-                        ClientError::Protocol(format!("negative axis length {n} in a shape"))
-                    })
-                })
-                .collect::<Result<Vec<u64>>>()?;
+            let shape = shape_from_proto(&dataset.shape)?;
             if dataset.ndim as usize != shape.len() {
                 return Err(ClientError::Protocol(format!(
                     "dataset {:?} says it has {} dimensions but its shape has {}",
@@ -843,10 +845,57 @@ fn item_from_proto(item: &aex_proto::Item) -> Result<(String, Item)> {
                     shape.len()
                 )));
             }
-            Item::Dataset(DatasetInfo { dtype, shape })
+            Item::Dataset(DatasetInfo {
+                dtype,
+                shape,
+                attrs,
+            })
         }
     };
     Ok((item.name.clone(), converted))
+}
+
+/// Convert one attribute off the wire.
+fn attr_from_proto(attr: &aex_proto::Attribute) -> Result<(String, AttrValue)> {
+    let value = attr
+        .value
+        .as_ref()
+        .ok_or_else(|| ClientError::Protocol(format!("attribute {:?} has no value", attr.name)))?;
+    let converted = match value {
+        aex_proto::attribute::Value::Text(text) => AttrValue::Text(text.clone()),
+        aex_proto::attribute::Value::Array(array) => {
+            let dtype =
+                DType::from_i32(array.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
+            let shape = shape_from_proto(&array.shape)?;
+            // Nothing downstream can recover from a length that disagrees with
+            // the type, so it is caught where the bytes arrive.
+            let expected = shape.iter().product::<u64>() * dtype.itemsize();
+            if array.data.len() as u64 != expected {
+                return Err(ClientError::Protocol(format!(
+                    "attribute {:?} is {} bytes, but {shape:?} of {dtype} is {expected}",
+                    attr.name,
+                    array.data.len(),
+                )));
+            }
+            AttrValue::Array {
+                dtype,
+                shape,
+                data: array.data.clone(),
+            }
+        }
+    };
+    Ok((attr.name.clone(), converted))
+}
+
+/// The wire carries shapes as int64, as numpy does.
+fn shape_from_proto(shape: &[i64]) -> Result<Vec<u64>> {
+    shape
+        .iter()
+        .map(|&n| {
+            u64::try_from(n)
+                .map_err(|_| ClientError::Protocol(format!("negative axis length {n} in a shape")))
+        })
+        .collect()
 }
 
 /// Read a 16-byte identifier out of what the server sent.
@@ -890,6 +939,30 @@ mod tests {
                 ndim: shape.len() as i32,
                 shape,
             })),
+            attrs: Vec::new(),
+        }
+    }
+
+    fn text_attr(name: &str, text: &str) -> aex_proto::Attribute {
+        aex_proto::Attribute {
+            name: name.to_string(),
+            value: Some(aex_proto::attribute::Value::Text(text.to_string())),
+        }
+    }
+
+    fn array_attr(
+        name: &str,
+        dtype: DType,
+        shape: Vec<i64>,
+        data: Vec<u8>,
+    ) -> aex_proto::Attribute {
+        aex_proto::Attribute {
+            name: name.to_string(),
+            value: Some(aex_proto::attribute::Value::Array(aex_proto::AttrArray {
+                dtype: dtype.as_i32(),
+                shape,
+                data,
+            })),
         }
     }
 
@@ -922,11 +995,65 @@ mod tests {
         let item = aex_proto::Item {
             name: "/".to_string(),
             data: Some(aex_proto::item::Data::Group(aex_proto::Group {})),
+            attrs: vec![text_attr("Conventions", "CF-1.8")],
         };
         assert_eq!(
             item_from_proto(&item).unwrap(),
-            ("/".to_string(), Item::Group)
+            (
+                "/".to_string(),
+                Item::Group(vec![(
+                    "Conventions".to_string(),
+                    AttrValue::Text("CF-1.8".into())
+                )])
+            )
         );
+    }
+
+    #[test]
+    fn attributes_arrive_in_order_and_keep_their_dtype() {
+        let mut item = dataset(DType::Int16, vec![4]);
+        item.attrs = vec![
+            array_attr("_FillValue", DType::Int16, vec![], vec![0xfd, 0xff]),
+            text_attr("units", "K"),
+        ];
+        let (_, item) = item_from_proto(&item).unwrap();
+        let Item::Dataset(info) = item else {
+            panic!("expected a dataset");
+        };
+        assert_eq!(
+            info.attrs,
+            [
+                (
+                    "_FillValue".to_string(),
+                    AttrValue::Array {
+                        dtype: DType::Int16,
+                        shape: vec![],
+                        data: vec![0xfd, 0xff],
+                    }
+                ),
+                ("units".to_string(), AttrValue::Text("K".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_attribute_that_makes_no_sense_is_a_protocol_error() {
+        let with_attr = |attr| {
+            let mut item = dataset(DType::Int16, vec![4]);
+            item.attrs = vec![attr];
+            item_from_proto(&item)
+        };
+
+        // Neither kind set: an older or broken server.
+        let empty = aex_proto::Attribute {
+            name: "units".to_string(),
+            value: None,
+        };
+        assert!(matches!(with_attr(empty), Err(ClientError::Protocol(_))));
+
+        // Two int16 would be four bytes, not two.
+        let short = array_attr("valid_range", DType::Int16, vec![2], vec![0, 0]);
+        assert!(matches!(with_attr(short), Err(ClientError::Protocol(_))));
     }
 
     #[test]
@@ -935,6 +1062,7 @@ mod tests {
         let empty = aex_proto::Item {
             name: "array".to_string(),
             data: None,
+            attrs: Vec::new(),
         };
         assert!(matches!(
             item_from_proto(&empty),

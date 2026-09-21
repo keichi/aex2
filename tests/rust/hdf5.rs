@@ -15,25 +15,45 @@ const COLS: usize = 1000;
 fn write_grid(server: &TestServer, name: &str) -> Vec<f32> {
     let values: Vec<f32> = (0..ROWS * COLS).map(|i| i as f32).collect();
     let file = hdf5::File::create(server.root().join(name)).expect("create");
+    attr(&file, "Conventions", "CF-1.8");
     let group = file.create_group("group").expect("group");
-    group
+    let grid = group
         .new_dataset::<f32>()
         .shape([ROWS, COLS])
         .create("grid")
-        .expect("dataset")
-        .write_raw(&values)
-        .expect("write");
-    group
+        .expect("dataset");
+    attr(&grid, "units", "K");
+    grid.write_raw(&values).expect("write");
+    let packed = group
         .new_dataset::<f32>()
         .shape([ROWS, COLS])
         .chunk([64, 300])
         .shuffle()
         .deflate(4)
         .create("packed")
-        .expect("dataset")
-        .write_raw(&values)
-        .expect("write");
+        .expect("dataset");
+    attr(&packed, "units", "Pa");
+    packed.write_raw(&values).expect("write");
     values
+}
+
+/// Write a variable-length text attribute.
+fn attr(location: &hdf5::Location, name: &str, value: &str) {
+    let value: hdf5::types::VarLenUnicode = value.parse().expect("utf-8");
+    location
+        .new_attr::<hdf5::types::VarLenUnicode>()
+        .create(name)
+        .expect("attribute")
+        .write_scalar(&value)
+        .expect("write");
+}
+
+/// The text attribute called `name`, or `None`.
+fn text_attr(attrs: &[(String, aex_client::AttrValue)], name: &str) -> Option<String> {
+    attrs.iter().find(|(n, _)| n == name).map(|(_, v)| match v {
+        aex_client::AttrValue::Text(text) => text.clone(),
+        other => panic!("{name} is {other:?}, not text"),
+    })
 }
 
 #[test]
@@ -86,14 +106,45 @@ fn the_hierarchy_is_browsable() {
     let root = client.list_children(handle, "/").expect("list /");
     assert_eq!(root.len(), 1);
     assert_eq!(root[0].0, "group");
-    assert!(matches!(root[0].1, Item::Group));
+    assert!(matches!(root[0].1, Item::Group(_)));
     let Item::Dataset(info) = client.get_item(handle, "/group/grid").expect("grid") else {
         panic!("grid must be a dataset");
     };
     assert_eq!(info.shape, [ROWS as u64, COLS as u64]);
+    assert_eq!(text_attr(&info.attrs, "units").as_deref(), Some("K"));
     assert_eq!(
         error_class(client.get_item(handle, "/group/missing")),
         aex_core::ErrorClass::Request
+    );
+}
+
+#[test]
+fn attributes_travel_with_the_items_that_carry_them() {
+    let server = TestServer::start();
+    write_grid(&server, "grid.h5");
+    let client = server.connect();
+    let handle = client.open("grid.h5").expect("open");
+
+    // netCDF keeps its global attributes on the root group.
+    let Item::Group(attrs) = client.get_item(handle, "/").expect("root") else {
+        panic!("the root must be a group");
+    };
+    assert_eq!(text_attr(&attrs, "Conventions").as_deref(), Some("CF-1.8"));
+
+    // One listing carries every child's attributes, so a reader that wants
+    // them all pays one round trip rather than one per variable.
+    let children = client.list_children(handle, "group").expect("list group");
+    let units: Vec<Option<String>> = children
+        .iter()
+        .map(|(_, item)| match item {
+            Item::Dataset(info) => text_attr(&info.attrs, "units"),
+            Item::Group(attrs) => text_attr(attrs, "units"),
+        })
+        .collect();
+    assert_eq!(
+        units,
+        [Some("K".to_string()), Some("Pa".to_string())],
+        "every child of a listing carries its own attributes"
     );
 }
 

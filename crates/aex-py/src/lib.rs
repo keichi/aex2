@@ -393,7 +393,7 @@ impl Client {
 fn item_to_py(item: Item) -> Option<(&'static str, Vec<u64>)> {
     match item {
         Item::Dataset(info) => Some((info.dtype.descr(), info.shape)),
-        Item::Group => None,
+        Item::Group(_) => None,
     }
 }
 
