@@ -84,10 +84,9 @@ pub struct Transfer {
     pub decode_cache_bytes: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Tcp {
-    pub nodelay: bool,
     /// 0 leaves the OS default.
     pub sndbuf: usize,
     /// Congestion control algorithm. Linux only; empty leaves the OS default.
@@ -139,16 +138,6 @@ impl Default for Transfer {
             max_fetch_bytes: 16 * 1024 * 1024,
             inline_limit_bytes: 64 * 1024,
             decode_cache_bytes: 1 << 30,
-        }
-    }
-}
-
-impl Default for Tcp {
-    fn default() -> Self {
-        Tcp {
-            nodelay: true,
-            sndbuf: 0,
-            congestion: String::new(),
         }
     }
 }
@@ -234,7 +223,6 @@ mod tests {
         assert_eq!(cfg.transfer.inline_limit_bytes, 64 * 1024);
         assert_eq!(cfg.transfer.read_buffer_bytes, 512 * 1024);
         assert_eq!(cfg.transfer.decode_cache_bytes, 1 << 30);
-        assert!(cfg.tcp.nodelay);
         assert!(!cfg.enable_null_backend, "synthetic data is opt-in");
         cfg.validate().expect("the defaults must be valid");
     }

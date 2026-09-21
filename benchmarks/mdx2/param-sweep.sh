@@ -25,11 +25,10 @@ RTTS=(0 10 50)
 . "$(dirname "$0")/netem.sh"
 
 # What the code ships today, and so the point every axis crosses.
-BASE_STREAMS=4 BASE_CHUNK=4194304 BASE_CREDIT=4 BASE_RCVBUF=0
+BASE_STREAMS=4 BASE_CHUNK=4194304 BASE_CREDIT=4
 STREAMS=(1 2 4 8 16)
 CHUNKS=(262144 1048576 4194304 16777216)
 CREDITS=(1 2 4 8 16 64)
-RCVBUFS=(0 4194304 16777216 67108864 268435456)
 
 BYTES=$((4 << 30))
 PORT_DEFAULT=50191    # aex.toml
@@ -64,8 +63,5 @@ for r in $(seq "$REPS"); do
         for k in "${CREDITS[@]}"; do
             run $PORT_DEFAULT "$p credit" --streams $BASE_STREAMS --chunk $BASE_CHUNK --credit "$k"
         done
-        for b in "${RCVBUFS[@]}"; do
-            run $PORT_DEFAULT "$p rcvbuf" --streams $BASE_STREAMS --chunk $BASE_CHUNK \
-                --credit $BASE_CREDIT --rcvbuf "$b"
-        done    done
+    done
 done

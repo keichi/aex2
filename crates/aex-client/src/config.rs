@@ -41,12 +41,6 @@ pub struct ClientConfig {
     pub credit: u32,
     /// How many times a chunk may be fetched again before the transfer fails.
     pub max_retries: u32,
-    /// Whether to disable Nagle on the data connections. A fetch is 48 bytes
-    /// that a whole chunk is waiting on, so holding it back costs a round trip.
-    pub tcp_nodelay: bool,
-    /// `SO_RCVBUF` for the data connections. `None` leaves the OS to tune it,
-    /// which caps the window below what a high bandwidth-delay link needs.
-    pub rcvbuf: Option<usize>,
     /// `host:port` to reach the data plane at instead of what the server
     /// advertises, for when the path goes through a tunnel or a proxy.
     pub data_endpoint: Option<String>,
@@ -62,8 +56,6 @@ impl Default for ClientConfig {
             chunk_bytes: 0,
             credit: DEFAULT_CREDIT,
             max_retries: 3,
-            tcp_nodelay: true,
-            rcvbuf: None,
             data_endpoint: None,
         }
     }
@@ -102,25 +94,10 @@ impl ClientConfig {
         if let Some(retries) = lookup("AEX_MAX_RETRIES").and_then(|v| v.parse().ok()) {
             self.max_retries = retries;
         }
-        if let Some(nodelay) = lookup("AEX_TCP_NODELAY").and_then(|v| parse_bool(&v)) {
-            self.tcp_nodelay = nodelay;
-        }
-        if let Some(bytes) = lookup("AEX_RCVBUF").and_then(|v| v.parse().ok()) {
-            self.rcvbuf = Some(bytes);
-        }
         if let Some(endpoint) = lookup("AEX_DATA_ENDPOINT") {
             self.data_endpoint = Some(endpoint);
         }
         self
-    }
-}
-
-/// Read a flag as a benchmark script is likely to write one.
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
     }
 }
 
@@ -149,8 +126,6 @@ mod tests {
         assert_eq!(config.chunk_bytes, 0);
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.credit, DEFAULT_CREDIT);
-        assert!(config.tcp_nodelay);
-        assert_eq!(config.rcvbuf, None);
     }
 
     #[test]
@@ -159,17 +134,13 @@ mod tests {
             "AEX_STREAMS" => Some("16".to_string()),
             "AEX_CONNECT_TIMEOUT_MS" => Some("250".to_string()),
             "AEX_CHUNK_BYTES" => Some("262144".to_string()),
-            "AEX_TCP_NODELAY" => Some("off".to_string()),
-            "AEX_RCVBUF" => Some("8388608".to_string()),
             "AEX_CREDIT" => Some("1".to_string()),
             _ => None,
         });
         assert_eq!(config.streams, 16);
-        assert_eq!(config.rcvbuf, Some(8 << 20));
         assert_eq!(config.credit, 1);
         assert_eq!(config.connect_timeout, Duration::from_millis(250));
         assert_eq!(config.chunk_bytes, 256 * 1024);
-        assert!(!config.tcp_nodelay);
         // Untouched settings keep their defaults.
         assert_eq!(config.max_message_bytes, 4 * 1024 * 1024);
         assert_eq!(config.max_retries, 3);
@@ -179,10 +150,8 @@ mod tests {
     fn an_unparseable_value_leaves_the_default() {
         let config = ClientConfig::default().with_env(|name| match name {
             "AEX_STREAMS" => Some("many".to_string()),
-            "AEX_TCP_NODELAY" => Some("perhaps".to_string()),
             _ => None,
         });
         assert_eq!(config.streams, DEFAULT_STREAMS);
-        assert!(config.tcp_nodelay);
     }
 }

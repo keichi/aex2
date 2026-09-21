@@ -196,7 +196,7 @@ fn accept_loop(
 fn serve_connection(mut stream: TcpStream, peer: SocketAddr, context: Arc<Context>) {
     // Back to blocking, with a short timeout so that a read can be interrupted
     // by the server stopping.
-    if let Err(e) = configure(&stream, &context.config) {
+    if let Err(e) = configure(&stream) {
         tracing::warn!(%peer, "cannot configure a data connection: {e}");
         return;
     }
@@ -263,11 +263,11 @@ fn set_congestion(_socket: &Socket, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn configure(stream: &TcpStream, config: &ServerConfig) -> io::Result<()> {
+fn configure(stream: &TcpStream) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     // Without this, Nagle holds back a DATA header whose payload has already
     // gone, and every small reply waits for an ack.
-    stream.set_nodelay(config.tcp.nodelay)?;
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(POLL_INTERVAL))?;
     Ok(())
 }
