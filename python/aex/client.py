@@ -1,7 +1,7 @@
 """The client, and proxies for the files and groups it opens."""
 
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, ItemsView, Iterator, Mapping, ValuesView
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import TracebackType
 from typing import Any, Self, TypeVar
@@ -93,7 +93,7 @@ class GroupProxy(Mapping[str, "ArrayProxy | GroupProxy"]):
     a ``GroupProxy`` for a group. A leading ``/`` makes the path absolute, and
     ``in`` tests for a path without raising. Iterating and ``keys()`` yield the
     child names like ``h5py``; ``values()`` and ``items()`` give the proxies,
-    one request per child.
+    and cost one request for the whole group rather than one per child.
     """
 
     def __init__(self, client: Client, handle: int, name: str) -> None:
@@ -117,6 +117,21 @@ class GroupProxy(Mapping[str, "ArrayProxy | GroupProxy"]):
     def __getitem__(self, name: str) -> "ArrayProxy | GroupProxy":
         path = self._join_names(self.name, name)
         return _proxy(self._client, self.handle, path, self._native.get_item(self.handle, path))
+
+    def _children(self) -> dict[str, "ArrayProxy | GroupProxy"]:
+        """Every child, built from one listing: it already carries the metadata."""
+        return {
+            name: _proxy(self._client, self.handle, self._join_names(self.name, name), item)
+            for name, item in self._native.list_children(self.handle, self.name)
+        }
+
+    def values(self) -> ValuesView["ArrayProxy | GroupProxy"]:
+        """The child proxies, as of now."""
+        return self._children().values()
+
+    def items(self) -> ItemsView[str, "ArrayProxy | GroupProxy"]:
+        """The child names and proxies, as of now."""
+        return self._children().items()
 
     def __iter__(self) -> Iterator[str]:
         for name, _ in self._native.list_children(self.handle, self.name):
