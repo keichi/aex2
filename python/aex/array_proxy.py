@@ -509,9 +509,11 @@ def _download(func: Any, tree: Any) -> Any:
     """Replace every ArrayProxy in ``tree`` with its data, as the policy allows."""
     proxies: list[ArrayProxy] = []
     _collect(tree, proxies)
-    nbytes = sum(p.nbytes for p in {id(p): p for p in proxies}.values())
+    # By proxy rather than by occurrence: np.add(arr, arr) is one transfer.
+    unique = {id(proxy): proxy for proxy in proxies}
+    nbytes = sum(p.nbytes for p in unique.values())
     _check_fallback(f"np.{getattr(func, '__name__', func)}", nbytes, stacklevel=4)
-    return _replace(tree)
+    return _replace(tree, {at: proxy._fetch_all() for at, proxy in unique.items()})
 
 
 def _check_fallback(what: str, nbytes: int, stacklevel: int = 3) -> None:
@@ -543,11 +545,11 @@ def _collect(tree: Any, found: list[ArrayProxy]) -> None:
             _collect(item, found)
 
 
-def _replace(tree: Any) -> Any:
+def _replace(tree: Any, data: dict[int, npt.NDArray[Any]]) -> Any:
     if isinstance(tree, ArrayProxy):
-        return tree._fetch_all()
+        return data[id(tree)]
     if isinstance(tree, (list, tuple)):
-        return type(tree)(_replace(item) for item in tree)
+        return type(tree)(_replace(item, data) for item in tree)
     if isinstance(tree, dict):
-        return {key: _replace(item) for key, item in tree.items()}
+        return {key: _replace(item, data) for key, item in tree.items()}
     return tree
