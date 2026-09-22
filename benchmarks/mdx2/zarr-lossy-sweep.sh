@@ -20,6 +20,7 @@
 # would say nothing about real data.
 #
 # Usage: [RTTS="0 100"] [RATES="1gbit"] [STORE=... ELEMENTS=...] zarr-lossy-sweep.sh [reps]
+#   A cold disk-resident round: HTTP=http://SERVER:8080/disk COLD=/home/mdxuser/disk
 #   Both sides must be built with the sz feature, and the fixture must exist:
 #   mkzarr.py /mnt/aexram/wave.zarr 268435456 plain wave
 
@@ -35,7 +36,9 @@ read -r -a RATES <<< "${RATES:-10gbit 2gbit 1gbit}"
 RATE_RTT=${RATE_RTT:-10}
 STORE=${STORE:-wave.zarr}
 COUNTERS=${COUNTERS:-1}
-HTTP=http://$SERVER_IP:8080
+# Overridable so that the disk-resident stores, which nginx serves under
+# /disk/, can be swept by the same script.
+HTTP=${HTTP:-http://$SERVER_IP:8080}
 AEX=http://$SERVER_IP:50391
 PY=".venv/bin/python -u benchmarks/mdx2/zarr-procs.py"
 ELEMENTS=${ELEMENTS:-$((1 << 28))}    # 1 GiB, as the SZ3 measurement used
@@ -51,6 +54,7 @@ trap restore EXIT
 
 point() {
     local tag=$1 q name
+    COLD_STORE=$STORE
     flush_metrics
     run "$tag zarr p16" \
         "$PY $HTTP/$STORE $ELEMENTS --via obstore --procs 16 --reps 1 --label \"$tag zarr p16\""

@@ -3,6 +3,10 @@
 # wire and the CPU behind them are half the answer.
 #
 # Source this after netem.sh: it uses $SERVER and $CLIENT.
+#
+# COLD names the directory the stores are in, on the server, and must be a path
+# that means the same there: /home/mdxuser/disk, not ~/disk, which the local
+# shell would expand to the wrong home.
 
 # Bytes the server sent and CPU seconds it spent, as one pair to difference.
 # Both readers are served by the same machine, so one pair covers aex-server
@@ -15,10 +19,20 @@ for p in $(pgrep -x aex-server) $(pgrep -x nginx); do cat "/proc/$p/stat"; done 
 EOF
 }
 
+# Evict $COLD_STORE's pages on the server, so the run reads the disk the store
+# lives on. Both readers meet the same files, so this is even-handed: it is the
+# stored bytes that are read, not the delivered ones.
+cold() {
+    [ -n "${COLD:-}" ] || return 0
+    ssh "$SERVER" "cd aex2 && target/release/dropcache \$(find $COLD/$COLD_STORE -type f)" \
+        > /dev/null
+}
+
 # run <label> <command to run on the client>. COUNTERS=1 adds the server's side.
 run() {
     local label=$1 before after
     shift
+    cold
     [ -n "${COUNTERS:-}" ] && before=$(counters)
     ssh "$CLIENT" "bash -lc 'cd aex2 && $*'"
     if [ -n "${COUNTERS:-}" ]; then

@@ -20,6 +20,9 @@
 # rather than served from the previous rep.
 #
 # Usage: [RTTS="0 100"] [STORES="mem.zarr"] [COUNTERS=1] zarr-remote-sweep.sh [reps]
+#   A cold disk-resident round: HTTP=http://SERVER:8080/disk COLD=/home/mdxuser/disk
+#   STORES="disk-noisy.zarr disk.zarr" -- the stores are the same files for both
+#   readers, and every run starts with their pages evicted.
 
 set -euo pipefail
 
@@ -34,7 +37,9 @@ read -r -a STORES <<< "${STORES:-mem-noisy.zarr mem.zarr}"
 # and sixty. Not sweeping it would be measuring a default rather than a reader.
 read -r -a CONCURRENCY <<< "${CONCURRENCY:-10 64 256}"
 VIA=${VIA:-obstore}
-HTTP=http://$SERVER_IP:8080
+# Overridable so that the disk-resident stores, which nginx serves under
+# /disk/, can be swept by the same script.
+HTTP=${HTTP:-http://$SERVER_IP:8080}
 AEX=http://$SERVER_IP:50391
 PY=".venv/bin/python -u benchmarks/mdx2/zarr-procs.py"
 ELEMENTS=$((1 << 30))
@@ -52,6 +57,7 @@ for _ in $(seq "$REPS"); do
         for store in "${STORES[@]}"; do
             case $store in *noisy*) p=none ;; *) p=counting-f32 ;; esac
             tag="rtt+$rtt $store"
+            COLD_STORE=$store
             flush_metrics
             for c in "${CONCURRENCY[@]}"; do
                 run "$tag zarr p1 c$c" \
