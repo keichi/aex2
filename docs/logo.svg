@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="2172" height="468" viewBox="0 80 2172 468" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="2146" height="468" viewBox="0 80 2146 468" role="img" aria-labelledby="title desc">
   <title id="title">AEX2 logo</title>
   <desc id="desc">Selected array elements flow through parallel streams into a gathered result beside the AEX2 wordmark.</desc>
   <!-- Transfer streams, drawn behind the source cells. -->
@@ -40,21 +40,13 @@
     <rect x="980" y="288" width="64" height="64" rx="13"/>
   </g>
 
-  <!-- AEX2 wordmark. Glyphs are outlined from Noto Sans JP SemiBold. -->
-  <g transform="translate(1060 57) scale(.43 .33)">
+  <!-- AEX2 wordmark. Glyphs are outlined from Futura Medium. -->
+  <g transform="translate(1060 450) scale(.20 -.158)">
     <g fill="#102a43">
-      <g transform="translate(0 1160) scale(1 -1)">
-        <path d="M-2 0 239 739H393L633 0H494L382 393Q364 452 348 514Q332 576 315 636H311Q296 575 279 513.5Q262 452 245 393L132 0ZM140 200V303H489V200Z"/>
-      </g>
-      <g transform="translate(632 1160) scale(1 -1)">
-        <path d="M94 0V739H539V628H226V440H491V329H226V111H550V0Z"/>
-      </g>
-      <g transform="translate(1240 1160) scale(1 -1)">
-        <path d="M15 0 225 381 28 739H174L256 576Q270 550 282.5 523Q295 496 312 462H316Q330 496 342 523Q354 550 366 576L444 739H583L387 375L597 0H451L361 174Q347 202 332.5 231.5Q318 261 301 295H297Q282 261 268.5 231.5Q255 202 242 174L155 0Z"/>
-      </g>
+      <path d="M1092 375H431L259 0H8L772 1641L1509 0H1254L1092 375ZM997 594L768 1119L528 594H997Z"/>
+      <path d="M2554 1325H1935V954H2536V735H1935V219H2554V0H1702V1544H2554V1325Z"/>
+      <path d="M3183 807L2758 1544H3023L3318 1021L3628 1544H3895L3450 807L3917 0H3656L3314 591L2962 0H2698L3183 807Z"/>
     </g>
-    <g fill="#0964e8" transform="translate(1851 1160) scale(1 -1)">
-      <path d="M43 0V76Q148 170 220.5 248.5Q293 327 330.5 394.5Q368 462 368 521Q368 559 354.5 587.5Q341 616 315 632Q289 648 250 648Q208 648 173.5 625Q139 602 110 569L37 641Q86 694 139.5 723Q193 752 267 752Q336 752 387 724Q438 696 466.5 646Q495 596 495 528Q495 459 460.5 388Q426 317 367.5 245.5Q309 174 236 103Q265 106 298 108.5Q331 111 357 111H529V0Z"/>
-    </g>
+    <path d="M4453 219H5028V0H3991L4527 649Q4606 746 4659.5 817Q4713 888 4741 936Q4798 1030 4798 1105Q4798 1213 4722 1286Q4646 1359 4534 1359Q4300 1359 4266 1082H4034Q4090 1570 4527 1570Q4738 1570 4881 1436Q5025 1302 5025 1104Q5025 978 4958 857Q4924 794 4858.5 707.5Q4793 621 4693 503L4453 219Z" fill="#0964e8"/>
   </g>
 </svg>
