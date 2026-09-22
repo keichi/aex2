@@ -70,6 +70,22 @@ $ cd ~/aex2 && uv pip install h5py 'zarr>=3'
 
 `zarr` は Zarr のフィクスチャを作るためと、zarr-python 自身との比較を測るために要る。
 
+zarr-python に**同じストアをネットワーク越しに読ませる**比較 ([リモート比較](benchmark-zarr-remote.md))
+をするときは、サーバに nginx を、**クライアント側の venv** に読み手を入れる。
+
+```console
+$ ssh aex2-eval1 'sudo apt-get install -y nginx && sudo systemctl disable --now nginx'
+$ ssh aex2-eval2 "bash -lc 'cd ~/aex2 && uv pip install \"zarr>=3\" fsspec aiohttp obstore'"
+```
+
+- nginx は配布物のサービスとしてではなく、**リポジトリの
+  `benchmarks/mdx2/nginx-zarr.conf` を指して単体で**起動する。測定が依存する設定を
+  1 つのファイルに集めるためで、`systemctl disable` はそれを邪魔しないようにする
+- `obstore` は既定で平文 HTTP を拒む。`allow_http` を渡さないと**送ってもいない要求を
+  10 回再試行して数分黙る** (`zarr-procs.py` が渡している)
+- クライアント VM にはこれまで `zarr` すら入っていなかった。ストアを読むのは
+  サーバ側だけだったため
+
 v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `uv sync` する。
 
 ### ツールのバージョン
@@ -81,6 +97,9 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | numpy | 2.5.3 | — |
 | libhdf5 | 2.2.0 (ソースから `/usr/local`) | Mac (Homebrew) と同じ |
 | protoc | 3.21.12 (apt) | — |
+| zarr-python / numcodecs | 3.4.0 / 0.17.0 | 両方の VM で同じ |
+| nginx | 1.24.0 (apt) | サーバのみ |
+| fsspec / aiohttp / obstore | 2026.9.0 / 3.14.3 / 0.11.1 | クライアントのみ |
 
 測定結果にはこの表の値を「条件」として書く。
 
@@ -101,10 +120,14 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/mem-shard.zarr` | 同じチャンクを 256 MiB の shard に束ねたもの = **ファイル 16 個** | `... mem-shard.zarr 1073741824 sharded counting` |
 | `/mnt/aexram/mem-noisy.zarr` | 圧縮の効きにくい中身を `plain` で。`--pattern none` で読む | `... mem-noisy.zarr 1073741824 plain noisy` |
 | `/mnt/aexram/mem-noisy-shard.zarr` | 同じ中身を `sharded` で | `... mem-noisy-shard.zarr 1073741824 sharded noisy` |
+| `/mnt/aexram/wave.zarr` | `wave.npy` と同じ場を Zarr で。131072 × 2048、4 MiB チャンク。誤差保証圧縮を測れる唯一の Zarr フィクスチャ | `... wave.zarr 268435456 plain wave` |
+| `/mnt/aexram/wave-q2.zarr` | 同じ場を `numcodecs.Quantize(2)` に通して格納 (最大誤差 3.9e-3)。**保存の時点で精度を落とした相手**として測るため | `... wave-q2.zarr 268435456 plain wave 2` |
 | `/mnt/aexram/mem-noisy-big.zarr` | 同じ中身を **64 MiB チャンク**で。デコードキャッシュが接続をまたいで共有する場面を作る (既定の 1 GiB キャッシュで測る) | `... mem-noisy-big.zarr 1073741824 big noisy` |
 | `~/disk/disk{,-shard,-noisy,-noisy-shard}.zarr` | 上の 4 つを virtio ディスクに置いたもの。コールド読みの比較用 | `... ~/disk/disk.zarr 1073741824 plain counting` など |
 
 - `mknpy` と `mkzarr.py` の第 2 引数はバイト数ではなく**要素数**
+- `wave` のストアだけ 2 次元である (`.npy` と同じ 2048 要素の行)。誤差保証圧縮の
+  予測器は近傍を使うので、1 本の長い行では同じ仕事にならない
 - Zarr のフィクスチャには `.venv` に `zarr>=3` が要る (`uv pip install 'zarr>=3'`)。
   `plain` と `sharded` の対は**ファイル数だけが違う**ので、転送のホットパスに乗る
   `open` の回数が効くかどうかがそのまま出る
@@ -132,6 +155,9 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
   $ sudo mkdir -p /mnt/aexram && sudo mount -t tmpfs -o size=12G,mode=1777 tmpfs /mnt/aexram
   ```
 
+- ディスクのストアを HTTP でも配るなら、nginx の `/disk/` を使う
+  (`nginx-zarr.conf`)。掃引側は `COLD=/home/mdxuser/disk` を渡すと 1 回ごとに
+  そのストアのページを落とす。**`~/disk` と書くとローカルのホームに展開される**
 - コールドなディスク読みを測るときは、各回の前に
   `target/release/dropcache ~/disk/disk.npy` でそのファイルのページだけ落とす (root 不要)
 - 生成したフィクスチャはリポジトリの外にあるので同期では消えない。`~/aex2` の中には置かない
@@ -170,6 +196,25 @@ $ ssh aex2-eval1 "bash -lc 'cd aex2 && cargo clippy --all-targets --all-features
 |---|---|---|
 | `aex.toml` | 50191 / 50192 | 基準 (すべて既定値) |
 | `aex-decode-cache-64m.toml` | 50391 / 50392 | `decode_cache_bytes` を 64 MiB に。圧縮 HDF5 を毎回伸長させる |
+
+リモート比較のときは、同じ `/mnt/aexram` を配る nginx も立てる。
+
+```console
+$ ssh aex2-eval1 'sudo nginx -c /home/mdxuser/aex2/benchmarks/mdx2/nginx-zarr.conf'
+$ ssh aex2-eval2 'curl -sI http://192.168.100.207:8080/mem.zarr/zarr.json | head -1'
+$ ssh aex2-eval1 'sudo nginx -c /home/mdxuser/aex2/benchmarks/mdx2/nginx-zarr.conf -s stop'
+```
+
+**nginx が律速でないことを測ってから**比較する。ストアの全チャンクを 16 プロセスの
+`curl` で取り、リンクに近い値が出ること (`curl -Z` は 1 スレッドなので、1 プロセスでは
+curl のほうが先に頭打ちになる)。
+
+```console
+$ ssh aex2-eval2 'seq 0 1023 | sed "s|^|url = \"http://192.168.100.207:8080/mem-noisy.zarr/array/c/|;
+    s|$|\"\noutput = \"/dev/null\"|" > /tmp/curl.conf
+  cd /tmp && split -n l/16 -d curl.conf part
+  time (for f in part*; do curl -s -Z --parallel-max 8 -K $f & done; wait)'
+```
 
 ```console
 $ for c in aex aex-decode-cache-64m; do
