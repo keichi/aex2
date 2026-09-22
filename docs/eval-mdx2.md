@@ -155,6 +155,9 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
   $ sudo mkdir -p /mnt/aexram && sudo mount -t tmpfs -o size=12G,mode=1777 tmpfs /mnt/aexram
   ```
 
+- ディスクのストアを HTTP でも配るなら、nginx の `/disk/` を使う
+  (`nginx-zarr.conf`)。掃引側は `COLD=/home/mdxuser/disk` を渡すと 1 回ごとに
+  そのストアのページを落とす。**`~/disk` と書くとローカルのホームに展開される**
 - コールドなディスク読みを測るときは、各回の前に
   `target/release/dropcache ~/disk/disk.npy` でそのファイルのページだけ落とす (root 不要)
 - 生成したフィクスチャはリポジトリの外にあるので同期では消えない。`~/aex2` の中には置かない
