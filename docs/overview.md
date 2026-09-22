@@ -167,7 +167,7 @@ tests/python/      v1 から移植した pytest と numpy との差分テスト
 | [gather が省く往復](benchmark-gather.md) | VM 間 + netem | 往復 100 ms で 64 個なら 6,460 ms が 102 ms (63.5 倍) |
 | [HDF5 バックエンド](benchmark-hdf5.md) | VM 間 | contiguous な HDF5 は `.npy` と同速。gzip は伸長が律速 |
 | [Zarr と sharding](benchmark-zarr.md) | VM 間 | チャンクを fetch に合わせるかどうかで 5.4 倍。差は 1 要求が使えるコア数 (14.4 対 3)。確保し直しを潰して +32.7 % |
-| [HDF5 のリモート比較](benchmark-hdf5-remote.md) | VM 間 + netem | 同じ `.h5` を h5py + HTTP と HSDS にも読ませた。HSDS に 2.25 〜 6.68 倍、h5py に 1.3 〜 4.3 倍。よく圧縮できるファイルは 25 ms より遠いと h5py が勝つ |
+| [HDF5 のリモート比較](benchmark-hdf5-remote.md) | VM 間 + netem | 同じ `.h5` を h5py + HTTP と HSDS にも読ませた。HSDS に 2.25 〜 6.68 倍、h5py に 1.3 〜 4.3 倍。よく圧縮できるファイルは 25 ms より遠いと h5py が勝つ。コールドなディスクでは無圧縮だけ差が 1.9 倍に縮む |
 | [zarr-python とのリモート比較](benchmark-zarr-remote.md) | VM 間 + netem | 同じストアを HTTP でも配って比べた。16 プロセスの zarr-python に 1.53 〜 2.01 倍。よく圧縮できるデータは 25 ms より遠いと逆転し、1 Gbit/s の回線なら SZ3 で 7.0 倍取り返す。コールドディスクでは差が 1.25 倍まで縮む |
 | [誤差保証圧縮 (SZ3)](benchmark-sz.md) | VM 間 + tc | 勝ち負けを決めるのは帯域。1 Gbit/s で 4.6 〜 13.8 倍 |
 | [SZ3 と ZFP の比較](benchmark-zfp.md) | VM 間 + tc | 圧縮率は SZ3、速度は ZFP。2.5 〜 7.4 Gbit/s で入れ替わる |

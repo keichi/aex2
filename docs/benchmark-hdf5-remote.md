@@ -50,7 +50,11 @@ h5serv は測っていない。**HDF Group 自身が 2022 年に sunset を宣�
 9. **HSDS は素直に使うと落ちる。** 16 プロセスが 256 MiB ずつ頼むと、選択範囲を
    まるごとメモリに組み立てるのでサーバのプロセスがカーネルに殺される。
    16 MiB ずつに分けると落ちず、しかも 1.36 倍速い
-10. **h5serv は測っていない。** HDF Group 自身が 2022 年に sunset を宣言しており、
+10. **ディスクに置くと、無圧縮のファイルでだけ差が縮む。** コールドな virtio では
+    AEX2 が 12,012 → 2,391 MiB/s (ディスクの上限) まで落ち、対 h5py が 4.3 → 1.9 倍、
+    対 HSDS が 5.7 → 1.3 倍になる。**圧縮されたファイルは −4 〜 +3 % しか変わらず**、
+    遠距離の逆転 (0.83 倍) もそのままである
+11. **h5serv は測っていない。** HDF Group 自身が 2022 年に sunset を宣言しており、
     比較の相手として成立しない
 
 ## 条件
@@ -66,6 +70,7 @@ h5serv は測っていない。**HDF Group 自身が 2022 年に sunset を宣�
 | HTTP サーバ | `benchmarks/mdx2/nginx-zarr.conf` (8080、`/mnt/aexram` を配る) |
 | HSDS | `benchmarks/mdx2/hsds.sh 8 2` (5101〜5108、`/mnt/aexram/hsds` のハードリンクを読む) |
 | ファイル | `mem.h5` / `mem-gzip.h5` / `mem-gzip-noisy.h5` (いずれも 4 GiB、2^30 要素の float32) |
+| 同 (ディスクの回) | `~/disk/disk{,-gzip,-gzip-noisy}.h5` (同じ中身、virtio ディスク) |
 | 読み手 | `benchmarks/mdx2/read-procs.py` (3 つとも) と `aexbench --prefault` |
 | h5py / h5pyd / HSDS | 3.16.0 (同梱 libhdf5 2.0.0) / 1.0.0 / 1.0.1 |
 | sysctl | 掃引の間ずっと `tuned` (`tcp_rmem` / `tcp_wmem` の上限 256 MiB) |
@@ -222,6 +227,52 @@ in-flight (streams × credit × chunk) を増やすことである。**圧縮が
 AEX2 が 3.5 倍速いと書けてしまう。掃いた本当の値は 1,966 で、**負けているのは
 こちら (0.83 倍)** である。先読みが往復を隠すぶんが、遠いところでは効く。
 
+## ディスクに置いた場合 (コールド)
+
+ここまでは 3 者とも tmpfs の上のファイルを読んでいる。同じ 3 つを virtio ディスク
+(`~/disk/disk{,-gzip,-gzip-noisy}.h5`) にも置き、**各回の前にそのファイルのページを
+`dropcache` で落として**測り直した (2026-09-23)。n = 3 の中央値、16 並列 (MiB/s)。
+
+nginx は同じ設定ファイルの `/disk/` で配り、HSDS はそのディレクトリをバケツにした
+別のサーバ群 (`ROOT=/home/mdxuser BUCKET=disk`)、AEX2 は 2 つ目の root として
+最初から持っている。**3 者が同じファイルを読むことは `--check` で確かめてある。**
+
+### 追加 RTT なし
+
+括弧内は tmpfs の同じ条件 ([上の表](#遠くなるとどうなるか)) との差。
+
+| ファイル | h5py 16 | HSDS 16 | AEX2 16 | 対 h5py | 対 HSDS |
+|---|---:|---:|---:|---:|---:|
+| `disk.h5` (無圧縮) | 1,248 (−56 %) | 1,820 (−13 %) | **2,391 (−80 %)** | 1.92 | 1.31 |
+| `disk-gzip-noisy.h5` (27 %) | 2,765 (−9 %) | 1,581 (+3 %) | 3,538 (−11 %) | 1.28 | 2.24 |
+| `disk-gzip.h5` (0.9 %) | 6,690 (−4 %) | 1,876 (−2 %) | 7,700 (±0 %) | 1.15 | 4.10 |
+
+### 追加 RTT 100 ms
+
+| ファイル | h5py 16 | HSDS 16 | AEX2 16 | 対 h5py | 対 HSDS |
+|---|---:|---:|---:|---:|---:|
+| `disk.h5` | 622 | 431 | 1,212 | 1.95 | 2.81 |
+| `disk-gzip-noisy.h5` | 879 | 526 | 1,351 | 1.54 | 2.57 |
+| `disk-gzip.h5` | 1,937 | 585 | 1,602 | **0.83** | 2.74 |
+
+- **変わるのは無圧縮のファイルだけである。** `disk.h5` で AEX2 は 12,012 → 2,391 と
+  5 分の 1 になる。この 2,391 はこの VM の virtio が出す上限で、
+  [コールドな `.npy` の 16 接続 (2,478)](benchmark-zarr.md#コールドな-virtio-ディスク)
+  とほぼ同じ値である。**AEX2 自身ではなくディスクを測っている**
+- **そこでは 3 者の差が縮む** (4.3 倍 → 1.9 倍、5.7 倍 → 1.3 倍)。ディスクが律速に
+  なれば、誰が読んでも同じ速さに近づく。**「AEX2 が速い」と言えるのはデータが
+  メモリに載っているときである**
+- **圧縮されたファイルは tmpfs とほとんど変わらない** (−4 〜 +3 %)。ディスクから
+  読む量が 1/4 (`noisy`) や 1/100 (`gzip`) しかないので、ディスクが律速にならない
+- **遠距離の逆転はディスクでもそのまま。** `disk-gzip.h5` の 100 ms は 0.83 倍で、
+  tmpfs の 0.83 倍と一致する。ワイヤのバイト数で決まる現象なので、置き場所に依らない
+- **コールドの無圧縮では HSDS が h5py を上回る** (1,820 対 1,248)。ここだけ順位が
+  入れ替わる。h5py は 16 プロセスがそれぞれ range request を直列に出すので、
+  ディスクへの要求が深くならないのだと見ている (掘り下げていない)
+- **HSDS の内部キャッシュは落とせない。** `dropcache` が落とすのはページキャッシュで、
+  DN が持つチャンクキャッシュ (128 MiB × 16) はそのまま残る。**HSDS にはこのぶん
+  有利な測り方**になっている
+
 ## 相手の設定を掃く
 
 [Zarr のリモート比較](benchmark-zarr-remote.md#相手の設定を掃くことの重み) で
@@ -308,6 +359,10 @@ fsspec のキャッシュ方式は**ファイルによって最良が変わる**
 - **kerchunk は測っていない。** HDF5 のチャンクを Zarr に見せて obstore で並列に
   引く形は、ここでの h5py + HTTP よりさらに強い可能性がある
 - HSDS の**書き込み性能は見ていない**。この比較は読みだけである
+- **ディスクの回は RTT 0 と 100 ms の 2 点だけ**で、16 並列のみ。間の 5 / 25 ms は
+  測っていない
+- **ディスクの回で HSDS のチャンクキャッシュは落ちていない** (`dropcache` は
+  ページキャッシュだけ)。HSDS に有利な側の偏りである
 
 ## 再現方法
 
@@ -357,6 +412,32 @@ $ ssh aex2-eval2 "tmux new-session -d -s h5c 'cd aex2 &&
 ```console
 $ ssh aex2-eval1 'ss -ltn | grep -oE ":51[0-9]+" | sort -u'
 ```
+
+ディスクの回は、フィクスチャを作り、そのディレクトリをバケツにした HSDS を立てて、
+`COLD` を渡して回す ([Zarr の掃引](benchmark-zarr-remote.md) と同じ形で、
+`measure.sh` が毎回そのファイルのページを落とす)。nginx は同じ設定ファイルの
+`/disk/` で配る。
+
+```console
+$ ssh aex2-eval1 "bash -lc 'cd ~/aex2 &&
+    .venv/bin/python benchmarks/mdx2/mkh5.py ~/disk/disk.h5 1073741824 contiguous counting &&
+    .venv/bin/python benchmarks/mdx2/mkh5.py ~/disk/disk-gzip.h5 1073741824 gzip counting &&
+    .venv/bin/python benchmarks/mdx2/mkh5.py ~/disk/disk-gzip-noisy.h5 1073741824 gzip noisy'"
+$ ssh aex2-eval1 "bash -lc 'cd aex2 && ROOT=/home/mdxuser BUCKET=disk bash benchmarks/mdx2/hsds.sh 8 2 &&
+    export HS_ENDPOINT=http://localhost:5101 HS_USERNAME=test HS_PASSWORD=test \
+      HS_BUCKET=disk HS_ROOT=/home/mdxuser/disk &&
+    ~/hsds-venv/bin/hstouch /home/ ; ~/hsds-venv/bin/hstouch /home/test/ ;
+    for f in disk.h5 disk-gzip.h5 disk-gzip-noisy.h5; do
+      ~/hsds-venv/bin/python benchmarks/mdx2/hslink.py \$f /home/test/\$f 1048576; done'"
+$ ssh aex2-eval2 "tmux new-session -d -s h5disk 'cd aex2 &&
+    SERVER=192.168.100.207 CLIENT=192.168.101.235 RTTS=\"0 100\" PROCS=16 COUNTERS=1 \
+    HTTP=http://192.168.100.207:8080/disk COLD=/home/mdxuser/disk HS_BUCKET=disk \
+    FILES=\"disk-gzip-noisy.h5 disk.h5 disk-gzip.h5\" \
+    bash benchmarks/mdx2/h5-remote-sweep.sh 3 2>&1 | tee ~/h5-disk.txt'"
+```
+
+**nginx の worker は `mdxuser` で動かす** (設定ファイルの `user mdxuser;`)。
+`/home/mdxuser` は他人が辿れないので、既定の worker では 403 になる。
 
 配り方と 1 回の大きさの掃引は、サーバを立て直しながら `--endpoints` と `--piece` を
 振って測った。

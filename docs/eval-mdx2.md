@@ -165,6 +165,7 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/wave-q2.zarr` | 同じ場を `numcodecs.Quantize(2)` に通して格納 (最大誤差 3.9e-3)。**保存の時点で精度を落とした相手**として測るため | `... wave-q2.zarr 268435456 plain wave 2` |
 | `/mnt/aexram/mem-noisy-big.zarr` | 同じ中身を **64 MiB チャンク**で。デコードキャッシュが接続をまたいで共有する場面を作る (既定の 1 GiB キャッシュで測る) | `... mem-noisy-big.zarr 1073741824 big noisy` |
 | `~/disk/disk{,-shard,-noisy,-noisy-shard}.zarr` | 上の 4 つを virtio ディスクに置いたもの。コールド読みの比較用 | `... ~/disk/disk.zarr 1073741824 plain counting` など |
+| `~/disk/disk{,-gzip,-gzip-noisy}.h5` | `mem*.h5` と同じ中身を virtio ディスクに置いたもの。[HDF5 のリモート比較](benchmark-hdf5-remote.md#ディスクに置いた場合-コールド)のコールド測定用 | `.venv/bin/python benchmarks/mdx2/mkh5.py ~/disk/disk.h5 1073741824 contiguous counting` など |
 
 - `mknpy` と `mkzarr.py` の第 2 引数はバイト数ではなく**要素数**
 - `wave` のストアだけ 2 次元である (`.npy` と同じ 2048 要素の行)。誤差保証圧縮の

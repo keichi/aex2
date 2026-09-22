@@ -18,6 +18,11 @@
 #
 # Usage: [RTTS="0 100"] [FILES="mem.h5"] [ENDPOINTS=8] [COUNTERS=1] h5-remote-sweep.sh [reps]
 #        (start that many HSDS servers first: hsds.sh $ENDPOINTS 2)
+#
+#   A cold disk-resident round, as in the Zarr sweeps:
+#   HTTP=http://SERVER:8080/disk COLD=/home/mdxuser/disk HS_BUCKET=disk
+#   FILES="disk.h5 disk-gzip.h5" -- the file is the same one for all three
+#   readers, and every run starts with its pages evicted.
 
 set -euo pipefail
 
@@ -35,11 +40,15 @@ ENDPOINTS=${ENDPOINTS:-8}
 # answers, so a quarter of a gigabyte at a time from sixteen readers gets it
 # killed by the kernel; in 16 MiB pieces it is both alive and faster.
 PIECE=${PIECE:-4194304}
-HTTP=http://$SERVER_IP:8080
+# Overridable so that the files on the virtio disk, which nginx serves under
+# /disk/, can be swept by the same script.
+HTTP=${HTTP:-http://$SERVER_IP:8080}
 HSDS=http://$SERVER_IP:5101/home/test
 AEX=http://$SERVER_IP:50391
 # h5pyd has no config file here, so the credentials travel with the command.
-HS="HS_USERNAME=test HS_PASSWORD=test HS_BUCKET=hsds"
+# The bucket is the directory HSDS was started on: hsds for the tmpfs
+# fixtures, disk for the ones on the virtio disk.
+HS="HS_USERNAME=test HS_PASSWORD=test HS_BUCKET=${HS_BUCKET:-hsds}"
 PY=".venv/bin/python -u benchmarks/mdx2/read-procs.py"
 ELEMENTS=$((1 << 30))
 
@@ -56,6 +65,7 @@ for _ in $(seq "$REPS"); do
         for file in "${FILES[@]}"; do
             case $file in *noisy*) p=none ;; *) p=counting-f32 ;; esac
             tag="rtt+$rtt $file"
+            COLD_STORE=$file
             flush_metrics
             for procs in "${PROCS[@]}"; do
                 for cache in "${CACHES[@]}"; do
