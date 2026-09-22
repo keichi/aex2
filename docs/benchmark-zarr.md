@@ -560,12 +560,12 @@ $ AEX_LOG=aex_server=debug target/release/aex-server --config benchmarks/mdx2/ae
 ...  DEBUG aex_server::control: decode cache hits=7168 misses=1024 races=0 ...
 ```
 
-`zarr-why.py` と `zarr-procs.py` は `benchmarks/mdx2/` にある。
+`zarr-why.py` と `read-procs.py` は `benchmarks/mdx2/` にある。
 
 ```console
 $ ssh aex2-eval1 "bash -lc 'cd aex2 &&
     .venv/bin/python benchmarks/mdx2/zarr-why.py /mnt/aexram/mem-noisy.zarr &&
-    .venv/bin/python benchmarks/mdx2/zarr-procs.py /mnt/aexram/mem-noisy.zarr'"
+    .venv/bin/python benchmarks/mdx2/read-procs.py /mnt/aexram/mem-noisy.zarr'"
 ```
 
 zarr-python の 1 プロセスの比較はサーバ上で次を実行した。

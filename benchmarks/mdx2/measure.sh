@@ -10,11 +10,11 @@
 
 # Bytes the server sent and CPU seconds it spent, as one pair to difference.
 # Both readers are served by the same machine, so one pair covers aex-server
-# decompressing and nginx reading files alike.
+# decompressing, nginx reading files, and HSDS's nodes alike.
 counters() {
     ssh "$SERVER" bash -s <<'EOF'
 grep enp3s0 /proc/net/dev | tr ':' ' ' | awk '{printf "%s ", $10}'
-for p in $(pgrep -x aex-server) $(pgrep -x nginx); do cat "/proc/$p/stat"; done |
+for p in $(pgrep -x aex-server) $(pgrep -x nginx) $(pgrep -f hsds); do cat "/proc/$p/stat"; done |
     awk '{s += $14 + $15} END {print s}'
 EOF
 }

@@ -82,9 +82,48 @@ $ ssh aex2-eval2 "bash -lc 'cd ~/aex2 && uv pip install \"zarr>=3\" fsspec aioht
   `benchmarks/mdx2/nginx-zarr.conf` を指して単体で**起動する。測定が依存する設定を
   1 つのファイルに集めるためで、`systemctl disable` はそれを邪魔しないようにする
 - `obstore` は既定で平文 HTTP を拒む。`allow_http` を渡さないと**送ってもいない要求を
-  10 回再試行して数分黙る** (`zarr-procs.py` が渡している)
+  10 回再試行して数分黙る** (`read-procs.py` が渡している)
 - クライアント VM にはこれまで `zarr` すら入っていなかった。ストアを読むのは
   サーバ側だけだったため
+
+HDF5 を**ネットワーク越しに読む相手**との比較 ([HDF5 のリモート比較](benchmark-hdf5-remote.md))
+には、クライアントに h5py と h5pyd を、サーバに HSDS を入れる。HSDS は aiohttp などを
+自前のバージョンで引くので、`~/aex2/.venv` ではなく**専用の venv** に入れる。
+
+```console
+$ ssh aex2-eval2 "bash -lc 'cd ~/aex2 && uv pip install h5py h5pyd requests'"
+$ ssh aex2-eval1 "bash -lc 'uv venv --python 3.13 ~/hsds-venv &&
+    uv pip install --python ~/hsds-venv/bin/python hsds h5pyd h5py'"
+```
+
+HSDS がリンクできるのは**自分のバケツのディレクトリの中にあるファイルだけ**なので、
+fixture へのハードリンクをそこに置く。tmpfs なので実体は増えない。ドメインを置く
+フォルダは 1 度だけ作る。
+
+```console
+$ ssh aex2-eval1 'mkdir -p /mnt/aexram/hsds &&
+    for f in mem.h5 mem-gzip.h5 mem-gzip-noisy.h5; do ln -f /mnt/aexram/$f /mnt/aexram/hsds/$f; done'
+$ ssh aex2-eval1 "bash -lc 'cd aex2 && bash benchmarks/mdx2/hsds.sh 1 4 &&
+    export HS_ENDPOINT=http://localhost:5101 HS_USERNAME=test HS_PASSWORD=test HS_BUCKET=hsds &&
+    ~/hsds-venv/bin/hstouch /home/ && ~/hsds-venv/bin/hstouch /home/test/'"
+```
+
+pip で入れた HSDS には、この比較のために直した箇所が 1 つある。**データノードの
+ポートが 6101 に固定** (`hsds_app.py` の `dn_port = 6101  # TBD: pull this from config`)
+なので、2 つ目のサーバを立てると 1 つ目のポートを取り合って死ぬ。環境変数を見るように
+直す。サーバを 1 つしか立てないなら要らない。
+
+```console
+$ ssh aex2-eval1 "sed -i 's/dn_port = 6101 .*/dn_port = int(os.environ.get(\"HSDS_DN_PORT\", 6101))/' \
+    ~/hsds-venv/lib/python3.13/site-packages/hsds/hsds_app.py"
+```
+
+- サーバの起動・停止は `benchmarks/mdx2/hsds.sh`、ファイルのリンクは
+  `benchmarks/mdx2/hslink.py` で行う。**`hsload --link` は使わない** ── この
+  h5pyd はサイズ固定のデータセットに maxshape を送って HSDS に拒まれ、contiguous な
+  データセットにはチャンク形を書かないので、HSDS が 1 回の読みでファイル全体を取りに行く
+- HSDS は**データをコピーしない**。チャンクは元の `.h5` に残り、HSDS が持つのは
+  その位置の表だけである。だから 3 つのサーバが同じバイトを読む
 
 v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `uv sync` する。
 
@@ -100,6 +139,8 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | zarr-python / numcodecs | 3.4.0 / 0.17.0 | 両方の VM で同じ |
 | nginx | 1.24.0 (apt) | サーバのみ |
 | fsspec / aiohttp / obstore | 2026.9.0 / 3.14.3 / 0.11.1 | クライアントのみ |
+| h5py / h5pyd | 3.16.0 / 1.0.0 | 両方 (h5py 同梱の libhdf5 は 2.0.0) |
+| HSDS / h5json | 1.0.1 / 2.0.0 | サーバの `~/hsds-venv` のみ |
 
 測定結果にはこの表の値を「条件」として書く。
 
@@ -124,6 +165,7 @@ v1 との比較をするときだけ、`~/aex` に v1 (`4dcb6c3`) を置いて `
 | `/mnt/aexram/wave-q2.zarr` | 同じ場を `numcodecs.Quantize(2)` に通して格納 (最大誤差 3.9e-3)。**保存の時点で精度を落とした相手**として測るため | `... wave-q2.zarr 268435456 plain wave 2` |
 | `/mnt/aexram/mem-noisy-big.zarr` | 同じ中身を **64 MiB チャンク**で。デコードキャッシュが接続をまたいで共有する場面を作る (既定の 1 GiB キャッシュで測る) | `... mem-noisy-big.zarr 1073741824 big noisy` |
 | `~/disk/disk{,-shard,-noisy,-noisy-shard}.zarr` | 上の 4 つを virtio ディスクに置いたもの。コールド読みの比較用 | `... ~/disk/disk.zarr 1073741824 plain counting` など |
+| `~/disk/disk{,-gzip,-gzip-noisy}.h5` | `mem*.h5` と同じ中身を virtio ディスクに置いたもの。[HDF5 のリモート比較](benchmark-hdf5-remote.md#ディスクに置いた場合-コールド)のコールド測定用 | `.venv/bin/python benchmarks/mdx2/mkh5.py ~/disk/disk.h5 1073741824 contiguous counting` など |
 
 - `mknpy` と `mkzarr.py` の第 2 引数はバイト数ではなく**要素数**
 - `wave` のストアだけ 2 次元である (`.npy` と同じ 2048 要素の行)。誤差保証圧縮の
