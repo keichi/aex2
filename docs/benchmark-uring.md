@@ -306,6 +306,8 @@ gather はコールドで測ってから決める。
 
 ## 再現方法
 
+`poolbench` と掃引スクリプトは削除した。再現するときはコミット `7ff1f07` を checkout する。
+
 ```console
 $ benchmarks/mdx2/sync.sh
 $ benchmarks/mdx2/uring-sweep.sh 5 mem  | tee ~/uring-mem.txt

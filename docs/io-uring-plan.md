@@ -4,7 +4,8 @@
 [測定](benchmark-uring.md) の結果、段階 1・段階 2 とも着手しないことにした。
 コールドディスクで得られるものは `posix_fadvise(WILLNEED)` の先読みで同じだけ得られ、
 メモリ常駐では io_uring が負ける。残りの節は、環境が変わったときに測り直すための
-記録として残す。
+記録として残す。`poolbench` はその後削除したので、手順 0 を再現するときはコミット
+`7ff1f07` を checkout する。
 
 §3 の「要確認」は解決済み: `buffers_for` は存在せず、`dataplane.rs` は
 `config.transfer.read_buffers` (既定 1) をそのまま使う。README の記述も既定 1 である。
