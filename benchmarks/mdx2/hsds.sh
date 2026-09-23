@@ -3,7 +3,7 @@
 # Start (or stop) the HSDS servers the comparison reads from, on aex2-eval1.
 #
 # A standalone HSDS runs one service node, and every byte a client reads is
-# copied by that one Python process; it stops at about 300 MiB/s however many
+# copied by that one Python process; it stops at about 400 MiB/s however many
 # data nodes are behind it. So several run on consecutive ports; hsds_app.py
 # is patched to read HSDS_DN_PORT (docs/eval-mdx2.md).
 #
