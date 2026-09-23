@@ -13,8 +13,9 @@ use serde::Deserialize;
 
 use crate::error::{Result, ServerError};
 
-/// The data plane frame version this server speaks.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The data plane frame version this server speaks, widened to the control
+/// plane's u32.
+pub const PROTOCOL_VERSION: u32 = aex_wire::PROTOCOL_VERSION as u32;
 
 /// Streams granted when the client expresses no preference.
 ///
