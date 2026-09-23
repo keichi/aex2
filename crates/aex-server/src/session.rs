@@ -349,9 +349,6 @@ mod tests {
     struct EmptyFile;
 
     impl ArrayFile for EmptyFile {
-        fn contains(&self, _path: &str) -> bool {
-            false
-        }
         fn get_item(&self, path: &str) -> CoreResult<Item> {
             Err(aex_core::AexError::NotFound(path.to_string()))
         }

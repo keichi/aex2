@@ -181,10 +181,6 @@ impl NullFile {
 }
 
 impl ArrayFile for NullFile {
-    fn contains(&self, path: &str) -> bool {
-        matches!(normalize_path(path), "" | DATASET_NAME)
-    }
-
     fn get_item(&self, path: &str) -> Result<Item> {
         match normalize_path(path) {
             "" => Ok(Item::Group),
@@ -338,9 +334,9 @@ mod tests {
     #[test]
     fn the_hierarchy_looks_like_any_other_backend() {
         let file = NullFile::from_spec("float32:8").expect("spec");
-        assert!(file.contains("/"));
-        assert!(file.contains("array"));
-        assert!(!file.contains("other"));
+        assert!(file.get_item("/").is_ok());
+        assert!(file.get_item("array").is_ok());
+        assert!(!file.get_item("other").is_ok());
         assert!(matches!(file.get_item("/"), Ok(Item::Group)));
         assert!(matches!(file.get_item("array"), Ok(Item::Dataset(_))));
         assert!(file.get_item("other").is_err());

@@ -108,11 +108,6 @@ impl std::fmt::Debug for Hdf5File {
 }
 
 impl ArrayFile for Hdf5File {
-    fn contains(&self, path: &str) -> bool {
-        let path = normalize_path(path);
-        path.is_empty() || self.file.loc_info_by_name(path).is_ok()
-    }
-
     fn get_item(&self, path: &str) -> Result<Item> {
         self.item(normalize_path(path))
     }
@@ -943,9 +938,9 @@ mod tests {
 
         let file = open(&path).unwrap();
         for p in ["", "/", "outer", "/outer/inner/", "outer/inner/a", "alias"] {
-            assert!(file.contains(p), "{p}");
+            assert!(file.get_item(p).is_ok(), "{p}");
         }
-        assert!(!file.contains("outer/missing"));
+        assert!(!file.get_item("outer/missing").is_ok());
         assert!(matches!(file.get_item("/outer").unwrap(), Item::Group));
         assert_eq!(read_all(&*dataset(&file, "/alias"), &[]).1, [3]);
 
@@ -1001,7 +996,7 @@ mod tests {
         assert!(status.success());
 
         let file = open(dir.path().join("t.h5")).unwrap();
-        assert!(!file.contains("leak"));
+        assert!(!file.get_item("leak").is_ok());
         assert!(matches!(
             file.get_item("leak").unwrap_err(),
             AexError::NotFound(_)

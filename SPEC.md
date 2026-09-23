@@ -973,7 +973,6 @@ ScatterBuffer { ptr, len }  ← 複数スレッドが非重複領域に書くた
 
 ```rust
 pub trait ArrayFile: Send + Sync {
-    fn contains(&self, path: &str) -> bool;
     fn get_item(&self, path: &str) -> Result<Item>;
     fn list_children(&self, path: &str) -> Result<Vec<(String, Item)>>;
 

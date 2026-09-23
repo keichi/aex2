@@ -160,10 +160,6 @@ impl ZarrFile {
 }
 
 impl ArrayFile for ZarrFile {
-    fn contains(&self, path: &str) -> bool {
-        matches!(self.node(normalize_path(path)), Ok(Some(_)))
-    }
-
     fn get_item(&self, path: &str) -> Result<Item> {
         let path = normalize_path(path);
         match self.node(path)? {
@@ -1927,7 +1923,7 @@ mod tests {
         let file = store.open().expect("open");
 
         // A name that walks out of the store never reaches the filesystem.
-        assert!(!file.contains("../../etc/passwd"));
+        assert!(!file.get_item("../../etc/passwd").is_ok());
         let err = file.get_item("../secret").expect_err("traversal");
         assert!(matches!(err, AexError::MalformedZarr(_)), "{err}");
 
@@ -1977,9 +1973,9 @@ mod tests {
         std::fs::create_dir_all(store.path().join("g1/loose")).expect("mkdir");
 
         let file = store.open().expect("open");
-        assert!(file.contains("g1/g2/deep"));
-        assert!(file.contains("/g1/g2/deep/"));
-        assert!(!file.contains("g1/loose"));
+        assert!(file.get_item("g1/g2/deep").is_ok());
+        assert!(file.get_item("/g1/g2/deep/").is_ok());
+        assert!(!file.get_item("g1/loose").is_ok());
         assert!(matches!(file.get_item("g1").expect("group"), Item::Group));
 
         let names: Vec<String> = file

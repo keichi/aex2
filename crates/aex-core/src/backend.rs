@@ -20,9 +20,6 @@ use crate::selection::{Index, SelectionLayout};
 /// Every method takes `&self`: one file is shared by all the connections of a
 /// session, and by every connection thread of the data plane.
 pub trait ArrayFile: Send + Sync {
-    /// Whether anything lives at `path`.
-    fn contains(&self, path: &str) -> bool;
-
     /// The item at `path`.
     fn get_item(&self, path: &str) -> Result<Item>;
 

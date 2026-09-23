@@ -230,10 +230,6 @@ impl NpyFile {
 }
 
 impl ArrayFile for NpyFile {
-    fn contains(&self, path: &str) -> bool {
-        matches!(normalize_path(path), "" | DATASET_NAME)
-    }
-
     fn get_item(&self, path: &str) -> Result<Item> {
         match normalize_path(path) {
             "" => Ok(Item::Group),
@@ -627,7 +623,7 @@ mod tests {
 
         // v1 exposed the array under both spellings of the path.
         for name in [DATASET_NAME, "/array", "/array/"] {
-            assert!(file.contains(name), "{name} must exist");
+            assert!(file.get_item(name).is_ok(), "{name} must exist");
             let Item::Dataset(dataset) = file.get_item(name).expect(name) else {
                 panic!("{name} must be a dataset");
             };
@@ -639,7 +635,7 @@ mod tests {
         }
 
         for root in ["", "/"] {
-            assert!(file.contains(root));
+            assert!(file.get_item(root).is_ok());
             assert!(matches!(file.get_item(root), Ok(Item::Group)));
             let children = file.list_children(root).expect("list root");
             assert_eq!(children.len(), 1);
@@ -654,7 +650,7 @@ mod tests {
         let (_dir, path) = write_npy(&bytes);
         let file = NpyFile::open(&path).expect("open");
 
-        assert!(!file.contains("data"));
+        assert!(!file.get_item("data").is_ok());
         let err = file.get_item("data").unwrap_err();
         assert!(matches!(err, AexError::NotFound(_)), "{err}");
         // The message has to say where the array actually is: "data" is what
