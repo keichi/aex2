@@ -26,8 +26,7 @@ use std::time::Duration;
 
 use aex_proto::aex_control_server::AexControlServer;
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
-use tokio_stream::StreamExt;
+use tonic::transport::server::TcpIncoming;
 
 pub use crate::config::ServerConfig;
 use crate::control::ControlService;
@@ -135,18 +134,11 @@ impl Server {
             .max_decoding_message_size(config.limits.grpc_max_message_bytes)
             .max_encoding_message_size(config.limits.grpc_max_message_bytes);
 
-        // The listener is ours, so tonic's own tcp_nodelay never reaches these
-        // sockets and Nagle holds the tail of a reply until the client's ACK.
-        // That costs every selection answered inline a second round trip,
+        // The listener is ours, so the builder's tcp_nodelay never reaches
+        // these sockets and Nagle holds the tail of a reply until the client's
+        // ACK. That costs every selection answered inline a second round trip,
         // which is the one thing the inline path exists to avoid.
-        let incoming = TcpListenerStream::new(control).map(|accepted| {
-            if let Ok(stream) = &accepted {
-                if let Err(e) = stream.set_nodelay(true) {
-                    tracing::warn!("cannot disable Nagle on a control connection: {e}");
-                }
-            }
-            accepted
-        });
+        let incoming = TcpIncoming::from(control).with_nodelay(Some(true));
 
         let result = tonic::transport::Server::builder()
             .add_service(service)

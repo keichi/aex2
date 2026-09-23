@@ -16,7 +16,6 @@ serde.workspace = true
 socket2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
-tokio-stream.workspace = true
 toml.workspace = true
 tonic.workspace = true
 tracing.workspace = true

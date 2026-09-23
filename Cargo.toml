@@ -42,7 +42,6 @@ socket2 = { version = "0.6", features = ["all"] }
 sz3 = "0.4"
 thiserror = "2"
 tokio = "1"
-tokio-stream = { version = "0.1", features = ["net"] }
 toml = "1"
 tonic = "0.14"
 tonic-prost = "0.14"
