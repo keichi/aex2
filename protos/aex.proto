@@ -92,7 +92,7 @@ enum DataType {
 
 message Dataset {
     DataType dtype = 1;
-    int32 ndim = 2;
+    reserved 2;  // ndim, which shape already says
     repeated int64 shape = 3;
 }
 
@@ -168,10 +168,9 @@ message Index {
         Fancy fancy    = 3;  // arr[[1, 5, 10]]
         bool  ellipsis = 4;  // arr[...]
         bool  newaxis  = 5;  // arr[None]
-        // A boolean mask is expanded to integer indices by the client: a sparse
-        // mask can be larger on the wire than the selection it describes.
-        Fancy mask_true_indices = 6;
     }
+    // mask_true_indices. A mask goes as the fancy index it expands to.
+    reserved 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,9 +217,7 @@ message TransferPlan {
     uint32 codec       = 6;
     QualitySpec applied_quality = 7;
 
-    // Valid until this instant. Every FETCH pushes it further out, so a plan
-    // expires only if the client really did go quiet.
-    uint64 expires_unix_ms = 8;
+    reserved 8;  // expires_unix_ms, which no client read
 
     // Set when total_bytes fits the server's inline limit. The client is then
     // done: no ticket is issued and the data plane is not used at all.
@@ -291,6 +288,6 @@ message ApplyFunctionRequest {
 message ApplyFunctionReply {
     DataType dtype = 1;
     repeated int64 shape = 2;
-    bytes data = 3;                 // Set when the result fits the inline limit
-    optional TransferPlan plan = 4; // For results that do not; unused so far
+    bytes data = 3;  // Set when the result fits the inline limit
+    reserved 4;      // plan, for results that do not; never sent
 }

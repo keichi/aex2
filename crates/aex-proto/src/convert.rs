@@ -69,7 +69,7 @@ pub fn index_from_proto(index: &crate::Index, max_fancy: u64) -> Result<Index> {
             stop: slice.stop,
             step: slice.step,
         },
-        index::Kind::Fancy(fancy) | index::Kind::MaskTrueIndices(fancy) => {
+        index::Kind::Fancy(fancy) => {
             check_fancy_len(fancy.indices.len(), max_fancy)?;
             Index::Fancy(fancy.indices.clone())
         }
@@ -189,19 +189,6 @@ mod tests {
         };
         assert_ne!(index_to_proto(&open), index_to_proto(&closed));
         assert_eq!(index_from_proto(&index_to_proto(&open), ANY).unwrap(), open);
-    }
-
-    #[test]
-    fn a_boolean_mask_arrives_as_the_indices_it_expanded_to() {
-        let wire = crate::Index {
-            kind: Some(index::Kind::MaskTrueIndices(Fancy {
-                indices: vec![0, 3, 7],
-            })),
-        };
-        assert_eq!(
-            index_from_proto(&wire, ANY).unwrap(),
-            Index::Fancy(vec![0, 3, 7])
-        );
     }
 
     #[test]

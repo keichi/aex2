@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aex_core::{
     ArrayDataset, ArrayFile, AttrValue, Axis, Codec, Function, Item, NpyFile, NullFile, ReduceArgs,
@@ -209,13 +208,12 @@ impl ControlService {
             );
             // No request_id and no ticket: there is nothing left to fetch, and
             // a zero request_id is how the client knows that.
-            return plan_reply(&layout, codec, &applied, 0, Vec::new(), 0, inline_data);
+            return plan_reply(&layout, codec, &applied, 0, Vec::new(), inline_data);
         }
 
         let entry = self
             .transfers
             .insert(*session.id(), dataset.clone(), layout)?;
-        let expires = unix_ms_from_now(self.transfers.ttl_secs());
         tracing::debug!(
             session = %hex(session.id()),
             request_id = entry.request_id(),
@@ -229,7 +227,6 @@ impl ControlService {
             &applied,
             entry.request_id(),
             entry.ticket().to_vec(),
-            expires,
             Vec::new(),
         )
     }
@@ -434,7 +431,6 @@ impl AexControl for ControlService {
             dtype: reduced.dtype.as_i32(),
             shape: shape_to_proto(&reduced.shape)?,
             data: reduced.data,
-            plan: None,
         }))
     }
 }
@@ -465,7 +461,6 @@ fn plan_reply(
     applied: &aex_core::QualitySpec,
     request_id: u32,
     ticket: Vec<u8>,
-    expires_unix_ms: u64,
     inline_data: Vec<u8>,
 ) -> Result<TransferPlan> {
     Ok(TransferPlan {
@@ -476,21 +471,8 @@ fn plan_reply(
         total_bytes: layout.total_bytes,
         codec: codec.as_u32(),
         applied_quality: Some(quality_to_proto(applied)),
-        expires_unix_ms,
         inline_data,
     })
-}
-
-/// Wall-clock milliseconds `secs` from now.
-///
-/// Only the client reads this, and only to tell a user how long it has. The
-/// server times its own plans on a monotonic clock.
-fn unix_ms_from_now(secs: u64) -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or(0)
-        .saturating_add(secs.saturating_mul(1000))
 }
 
 impl ControlService {
@@ -599,7 +581,6 @@ fn dataset_to_proto(dataset: &dyn ArrayDataset) -> Result<Dataset> {
     let shape = shape_to_proto(dataset.shape())?;
     Ok(Dataset {
         dtype: dataset.dtype().as_i32(),
-        ndim: shape.len() as i32,
         shape,
     })
 }
@@ -669,7 +650,6 @@ mod tests {
             panic!("expected a dataset");
         };
         assert_eq!(dataset.dtype, DType::Float32.as_i32());
-        assert_eq!(dataset.ndim, 2);
         assert_eq!(dataset.shape, vec![1000, 200]);
     }
 
@@ -683,7 +663,6 @@ mod tests {
         let Some(aex_proto::item::Data::Dataset(dataset)) = item.data else {
             panic!("expected a dataset");
         };
-        assert_eq!(dataset.ndim, 0);
         assert!(dataset.shape.is_empty());
     }
 

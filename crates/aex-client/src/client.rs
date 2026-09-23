@@ -837,14 +837,6 @@ fn item_from_proto(item: &aex_proto::Item) -> Result<(String, Item)> {
             let dtype =
                 DType::from_i32(dataset.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
             let shape = shape_from_proto(&dataset.shape)?;
-            if dataset.ndim as usize != shape.len() {
-                return Err(ClientError::Protocol(format!(
-                    "dataset {:?} says it has {} dimensions but its shape has {}",
-                    item.name,
-                    dataset.ndim,
-                    shape.len()
-                )));
-            }
             Item::Dataset(DatasetInfo {
                 dtype,
                 shape,
@@ -936,7 +928,6 @@ mod tests {
             name: "array".to_string(),
             data: Some(aex_proto::item::Data::Dataset(aex_proto::Dataset {
                 dtype: dtype.as_i32(),
-                ndim: shape.len() as i32,
                 shape,
             })),
             attrs: Vec::new(),
@@ -1082,16 +1073,6 @@ mod tests {
         // A negative axis length.
         assert!(matches!(
             item_from_proto(&dataset(DType::Int8, vec![-1])),
-            Err(ClientError::Protocol(_))
-        ));
-
-        // ndim disagreeing with the shape means the two were built separately.
-        let mut inconsistent = dataset(DType::Int8, vec![2, 3]);
-        if let Some(aex_proto::item::Data::Dataset(d)) = inconsistent.data.as_mut() {
-            d.ndim = 3;
-        }
-        assert!(matches!(
-            item_from_proto(&inconsistent),
             Err(ClientError::Protocol(_))
         ));
     }

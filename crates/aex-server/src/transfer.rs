@@ -122,11 +122,6 @@ impl TransferRegistry {
         self.config.limits.transfer_ttl_sec.saturating_mul(1000)
     }
 
-    /// How long from now a plan issued now would survive, in seconds.
-    pub fn ttl_secs(&self) -> u64 {
-        self.config.limits.transfer_ttl_sec
-    }
-
     /// Register a resolved selection and mint its ticket.
     pub fn insert(
         &self,
