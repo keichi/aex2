@@ -514,13 +514,10 @@ impl Chunked {
             } else if self.filters.is_empty() {
                 dataset.raw.read_exact_at(out, entry.addr + start)?;
             } else {
-                let decoded = self
-                    .cache
-                    .get_or_decode((self.cache_key, chunk as u64), |spare| {
+                self.cache
+                    .read_into((self.cache_key, chunk as u64), start, out, |spare| {
                         self.decode(&dataset.raw, entry, spare)
                     })?;
-                let start = start as usize;
-                out.copy_from_slice(&decoded[start..start + out.len()]);
             }
             Ok(())
         })

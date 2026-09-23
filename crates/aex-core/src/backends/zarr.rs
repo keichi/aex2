@@ -404,18 +404,14 @@ impl ZarrArray {
                 let mut coords = Vec::new();
                 grid.walk(at, dst, |chunk, start, out| {
                     let key = self.key_of(grid, chunk as u64, &mut coords);
-                    let decoded =
-                        self.cache
-                            .get_or_decode((self.cache_key, chunk as u64), |spare| {
-                                let Some(path) = self.root.under(&key)? else {
-                                    return Ok(self.fill_chunk(grid.chunk_bytes(), spare));
-                                };
-                                let bytes = std::fs::read(&path)?;
-                                undo(&key, codecs, bytes, grid.chunk_bytes(), spare)
-                            })?;
-                    let start = start as usize;
-                    out.copy_from_slice(&decoded[start..start + out.len()]);
-                    Ok(())
+                    self.cache
+                        .read_into((self.cache_key, chunk as u64), start, out, |spare| {
+                            let Some(path) = self.root.under(&key)? else {
+                                return Ok(self.fill_chunk(grid.chunk_bytes(), spare));
+                            };
+                            let bytes = std::fs::read(&path)?;
+                            undo(&key, codecs, bytes, grid.chunk_bytes(), spare)
+                        })
                 })
             }
             Store::Sharded(sharded) => {
@@ -427,27 +423,25 @@ impl ZarrArray {
                     let key = self.key_of(&sharded.shards, shard as u64, &mut Vec::new());
                     sharded.inner.walk(in_shard, out, |chunk, start, out| {
                         let n = shard as u64 * per_shard + chunk as u64;
-                        let decoded = self.cache.get_or_decode((self.cache_key, n), |spare| {
-                            let entry = index[n as usize];
-                            if entry.is_missing() {
-                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
-                            }
-                            let Some(path) = self.root.under(&key)? else {
-                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
-                            };
-                            let mut bytes = vec![0u8; entry.nbytes as usize];
-                            File::open(&path)?.read_exact_at(&mut bytes, entry.offset)?;
-                            undo(
-                                &key,
-                                &sharded.codecs,
-                                bytes,
-                                sharded.inner.chunk_bytes(),
-                                spare,
-                            )
-                        })?;
-                        let start = start as usize;
-                        out.copy_from_slice(&decoded[start..start + out.len()]);
-                        Ok(())
+                        self.cache
+                            .read_into((self.cache_key, n), start, out, |spare| {
+                                let entry = index[n as usize];
+                                if entry.is_missing() {
+                                    return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
+                                }
+                                let Some(path) = self.root.under(&key)? else {
+                                    return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
+                                };
+                                let mut bytes = vec![0u8; entry.nbytes as usize];
+                                File::open(&path)?.read_exact_at(&mut bytes, entry.offset)?;
+                                undo(
+                                    &key,
+                                    &sharded.codecs,
+                                    bytes,
+                                    sharded.inner.chunk_bytes(),
+                                    spare,
+                                )
+                            })
                     })
                 })
             }
