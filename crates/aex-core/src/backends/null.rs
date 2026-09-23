@@ -79,7 +79,7 @@ impl NullDataset {
         }
 
         let (dtype, shape) = spec.split_once(':').ok_or_else(|| bad("no ':'"))?;
-        let dtype = dtype_from_name(dtype).ok_or_else(|| bad("unknown dtype"))?;
+        let dtype = DType::from_name(dtype).ok_or_else(|| bad("unknown dtype"))?;
         let shape = shape
             .split('x')
             .map(|dim| {
@@ -203,31 +203,6 @@ impl ArrayFile for NullFile {
             other => Err(AexError::NotFound(other.to_string())),
         }
     }
-}
-
-/// An element type by name.
-///
-/// Spelled out rather than taken as a numpy `descr`, where `i8` means eight
-/// bytes and not eight bits — a trap not worth leaving in a command line.
-fn dtype_from_name(name: &str) -> Option<DType> {
-    let dtype = match name {
-        "int8" => DType::Int8,
-        "int16" => DType::Int16,
-        "int32" => DType::Int32,
-        "int64" => DType::Int64,
-        "uint8" => DType::Uint8,
-        "uint16" => DType::Uint16,
-        "uint32" => DType::Uint32,
-        "uint64" => DType::Uint64,
-        "float16" => DType::Float16,
-        "float32" => DType::Float32,
-        "float64" => DType::Float64,
-        "complex64" => DType::Complex64,
-        "complex128" => DType::Complex128,
-        "bool" => DType::Bool,
-        _ => return None,
-    };
-    Some(dtype)
 }
 
 #[cfg(test)]

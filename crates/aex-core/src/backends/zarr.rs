@@ -317,7 +317,7 @@ impl ZarrArray {
         let name = meta.data_type.as_str().ok_or_else(|| {
             AexError::UnsupportedZarr(format!("{prefix}: only the core data types are served"))
         })?;
-        let dtype = dtype_of(name).ok_or_else(|| {
+        let dtype = DType::from_name(name).ok_or_else(|| {
             AexError::UnsupportedDType(format!("{prefix}: Zarr data type {name:?}"))
         })?;
 
@@ -829,27 +829,6 @@ fn flatten<'a>(
         }
         _ => false,
     }
-}
-
-/// The AEX type of a Zarr core data type name.
-fn dtype_of(name: &str) -> Option<DType> {
-    Some(match name {
-        "bool" => DType::Bool,
-        "int8" => DType::Int8,
-        "int16" => DType::Int16,
-        "int32" => DType::Int32,
-        "int64" => DType::Int64,
-        "uint8" => DType::Uint8,
-        "uint16" => DType::Uint16,
-        "uint32" => DType::Uint32,
-        "uint64" => DType::Uint64,
-        "float16" => DType::Float16,
-        "float32" => DType::Float32,
-        "float64" => DType::Float64,
-        "complex64" => DType::Complex64,
-        "complex128" => DType::Complex128,
-        _ => return None,
-    })
 }
 
 fn key_encoding(prefix: &str, named: &Option<Named>) -> Result<KeyEncoding> {
