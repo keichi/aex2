@@ -31,8 +31,7 @@ pub(crate) struct ChunkGrid {
     run_axis: usize,
 }
 
-// The HDF5 backend is optional, so a build without it has no caller for some
-// of these. Sharding, which wants the rest, will close the gap.
+// Some of these have no caller in a build without HDF5.
 #[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
 impl ChunkGrid {
     /// `None` if the ranks disagree, a chunk axis is zero, or a chunk is too

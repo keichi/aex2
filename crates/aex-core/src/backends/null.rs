@@ -1,23 +1,11 @@
 //! A dataset with nothing behind it.
 //!
-//! Every measurement so far has had storage in the path: a file, a page cache,
-//! a `pread`. This one has none. It answers a read from a small repeating
-//! pattern that stays in cache, so what is left to measure is the transfer
-//! itself — the framing, the socket, and the copies either side of it.
+//! Reads come from a small repeating pattern instead of storage, so what is
+//! measured is the transfer itself, comparable to `iperf3`. `@<period>` picks
+//! whether the pattern stays in cache or has to come from memory.
 //!
-//! That makes it directly comparable to what `iperf3` does, which also sends
-//! the same small buffer over and over. The difference between this and the
-//! `.npy` backend is what reading the data costs; the difference between this
-//! and `iperf3` is what the protocol costs.
-//!
-//! The pattern's length is part of the specification, which makes it an
-//! instrument for a second question: a pattern that fits in cache costs almost
-//! nothing to read, and one much larger than cache has to be fetched from
-//! memory like any real data. The difference between the two is what reading
-//! costs, with no filesystem anywhere near it.
-//!
-//! It serves data that was never stored anywhere, so a server only offers it
-//! when explicitly told to. It is a measuring instrument, not a format.
+//! A measuring instrument, not a format: a server serves it only when
+//! explicitly enabled.
 
 use std::sync::Arc;
 
@@ -51,12 +39,8 @@ pub struct NullDataset {
 }
 
 impl NullDataset {
-    /// Build one from a specification: `<dtype>:<dim>[x<dim>...][@<period>]`.
-    ///
-    /// For instance `float32:1000x200`, or `uint8:4294967296` for a stream of a
-    /// given number of bytes. `@<period>` sets the length of the pattern the
-    /// reads come from: leave it out and they come from cache, set it far above
-    /// the cache and they come from memory like any real data would.
+    /// Build from `<dtype>:<dim>[x<dim>...][@<period>]`, e.g. `float32:1000x200`
+    /// or `uint8:4294967296`.
     pub fn from_spec(spec: &str) -> Result<Self> {
         let bad = |what: &str| {
             AexError::BadSelection(format!(
@@ -120,7 +104,6 @@ impl NullDataset {
         })
     }
 
-    /// Length of the logical byte stream.
     pub fn data_len(&self) -> u64 {
         self.data_len
     }
@@ -255,9 +238,7 @@ mod tests {
 
     #[test]
     fn every_byte_says_where_it_came_from() {
-        // The byte at position p is p as u8, whatever range is asked for and
-        // wherever in the pattern that range happens to start. A caller can
-        // check what arrived without holding a copy of the whole thing.
+        // Byte p is p as u8 regardless of range start or pattern phase.
         let dataset = NullDataset::from_spec("uint8:1048576").expect("spec");
         let layout = whole(&dataset);
 
@@ -278,9 +259,7 @@ mod tests {
 
     #[test]
     fn the_pattern_length_can_be_set_and_does_not_change_what_arrives() {
-        // A pattern far larger than cache makes a read cost what a real one
-        // costs. What it produces has to stay the same, or the two are not
-        // measuring the same transfer.
+        // A period far above cache must produce the same bytes.
         let small = NullDataset::from_spec("uint8:1048576").expect("spec");
         let large = NullDataset::from_spec("uint8:1048576@16777216").expect("spec");
         assert_eq!(small.period(), 64 * 1024);

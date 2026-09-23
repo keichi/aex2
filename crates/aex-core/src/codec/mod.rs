@@ -126,7 +126,6 @@ impl BlockSpec {
         })
     }
 
-    /// Elements in the block.
     pub fn count(&self) -> u64 {
         self.dims[..self.ndim as usize]
             .iter()
@@ -139,7 +138,6 @@ impl BlockSpec {
         self.count() * self.dtype.itemsize()
     }
 
-    /// The axes, C order, fastest last.
     pub fn dims(&self) -> &[u32] {
         &self.dims[..self.ndim as usize]
     }

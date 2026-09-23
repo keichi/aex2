@@ -3,10 +3,8 @@
 //! Holds the server-side logic — backends, selection resolution, reductions —
 //! independent of tokio and tonic, so its unit tests stay fast.
 //!
-//! The central concept is the **logical byte stream**: the result of a
-//! selection, flattened in C order. [`selection`] resolves a selection into
-//! one, [`backend`] reads ranges of it, and every offset on the wire is a
-//! position in it.
+//! The central concept is the **logical byte stream** (see [`selection`]):
+//! every wire offset is a position in it.
 
 pub mod backend;
 pub mod backends;

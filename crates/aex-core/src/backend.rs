@@ -1,8 +1,7 @@
 //! What a backend has to provide.
 //!
-//! The traits are sized for four formats even though only `.npy` is
-//! implemented: HDF5, netCDF4 and Zarr all present a hierarchy of groups and
-//! datasets, and all of them can serve a range of a logical byte stream.
+//! HDF5, netCDF-4 and Zarr all present a hierarchy of groups and datasets, each
+//! able to serve a range of a logical byte stream.
 //!
 //! A dataset answers two questions: what a selection resolves to, and what the
 //! bytes of a range of that selection are. Everything the data plane needs is
@@ -20,7 +19,6 @@ use crate::selection::{Index, SelectionLayout};
 /// Every method takes `&self`: one file is shared by all the connections of a
 /// session, and by every connection thread of the data plane.
 pub trait ArrayFile: Send + Sync {
-    /// The item at `path`.
     fn get_item(&self, path: &str) -> Result<Item>;
 
     /// The children of the group at `path`, in a stable order.
@@ -63,10 +61,8 @@ pub enum AttrValue {
 #[derive(Clone)]
 pub enum Item {
     Dataset(Arc<dyn ArrayDataset>),
-    /// A container. It carries no data of its own, which is why this is a unit
-    /// variant: nothing yet distinguishes one group from another. Attributes
-    /// did not change that, since they hang off a path rather than off an item
-    /// (see `ArrayFile::attrs`).
+    /// A container with no data; attributes hang off the path, so it needs no
+    /// fields.
     Group,
 }
 
@@ -90,7 +86,6 @@ pub trait ArrayDataset: Send + Sync {
     /// Length of each axis; empty for a scalar array.
     fn shape(&self) -> &[u64];
 
-    /// Number of dimensions.
     fn ndim(&self) -> usize {
         self.shape().len()
     }
@@ -104,17 +99,12 @@ pub trait ArrayDataset: Send + Sync {
         SelectionLayout::resolve(self.shape(), self.dtype(), indices, quality)
     }
 
-    /// Write `[offset, offset + dst.len())` of the layout's logical byte stream
-    /// into `dst`.
+    /// Write `[offset, offset + dst.len())` of the logical byte stream into
+    /// `dst`. The caller reuses `dst` per connection so a transfer allocates
+    /// nothing; how the bytes are stored stays invisible to the send path.
     ///
-    /// The caller owns the buffer: the data plane keeps one per connection and
-    /// reuses it, so a transfer allocates nothing. Whether the backend serves
-    /// this with a `pread`, a decompression or a remote read is its own
-    /// business, and stays invisible to the send path.
-    ///
-    /// `&self` rather than `&mut self` because every connection thread reads
-    /// the same dataset at once. A backend needing state does so with interior
-    /// mutability.
+    /// Takes `&self` because connection threads read concurrently; keep any
+    /// state in interior mutability.
     fn read_range(&self, layout: &SelectionLayout, offset: u64, dst: &mut [u8]) -> Result<()>;
 
     /// Ask the storage to start fetching `[offset, offset + len)` of the

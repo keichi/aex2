@@ -122,7 +122,6 @@ impl Codec {
         Self::from_u8(v as u8)
     }
 
-    /// Whether this is one of the lossy, error-bounded codecs.
     pub const fn is_error_bounded(self) -> bool {
         matches!(self, Codec::Sz | Codec::Zfp)
     }
@@ -182,10 +181,8 @@ pub struct QualitySpec {
     /// Which error-bounded codec should carry it. `None` takes the build's
     /// own, which is what a client with no preference asks for.
     ///
-    /// Unlike the rest, this one is not a field of the proto `QualitySpec`: it
-    /// travels as `PrepareSelectionRequest.requested_codec` going out and as
-    /// `TransferPlan.codec` coming back, which is where the wire already had
-    /// room for it.
+    /// Not in the proto `QualitySpec`: travels as
+    /// `PrepareSelectionRequest.requested_codec` and `TransferPlan.codec`.
     pub codec: Option<Codec>,
 }
 
@@ -236,17 +233,10 @@ impl QualitySpec {
                         .abs_error_bound
                         .is_some_and(|bound| bound.is_finite() && bound > 0.0)
             }
-            // Only these two. Both halve the element and keep it a float, so
-            // the wire length is exactly half and the values still mean what
-            // they meant. A cast that changes the kind of number — a float to
-            // an integer, say — is a different question, about saturation and
-            // rounding and signedness, and is not answered here.
-            //
-            // Nothing checks that the values fit: float32 to float16 overflows
-            // to infinity above 65504, the way `numpy.astype` does. Finding
-            // out would mean reading the whole selection before agreeing to
-            // send it, and the plan says what was applied, so a caller that
-            // cares can look at what arrived.
+            // Only these two: each halves the length and stays a float. Other
+            // casts raise questions not answered here.
+            // No range check: f32 -> f16 overflows to inf above 65504 as
+            // `numpy.astype` does; checking would need a full pass before planning.
             Encoding::DtypeCast => matches!(
                 (dtype, self.cast_dtype),
                 (DType::Float64, Some(DType::Float32)) | (DType::Float32, Some(DType::Float16))
@@ -254,15 +244,9 @@ impl QualitySpec {
         }
     }
 
-    /// The codec that carries this quality, once `codec` has had the build's
-    /// default filled in for it.
-    ///
-    /// Under an error bound, a codec that is not one of the error-bounded
-    /// ones reads as no preference rather than as a request: a client from
-    /// before there was a choice leaves the field at RAW, and RAW cannot carry
-    /// a bound. Anywhere else the answer is RAW unless a lossless codec this
-    /// build has was named. Falling back to RAW there needs no telling: a
-    /// lossless codec changes the bytes on the wire and nothing else.
+    /// The codec carrying this quality, with the build default filled in. Under
+    /// an error bound, a non-error-bounded codec means no preference (old clients
+    /// send RAW); otherwise RAW unless a lossless codec this build has was named.
     pub fn codec(&self) -> Codec {
         match self.encoding {
             Encoding::ErrorBound => self
@@ -432,8 +416,7 @@ mod tests {
             .applied(DType::Float32)
             .is_exact());
 
-        // A bound relative to the value range would have to mean the whole
-        // selection's range, which no single block can see.
+        // Relative bounds are never honoured.
         assert!(error_bound(None, Some(1e-3))
             .applied(DType::Float32)
             .is_exact());
@@ -458,9 +441,7 @@ mod tests {
                 ..error_bound(Some(1e-3), None)
             };
             assert_eq!(asked.codec(), want);
-            // Asking for one this build does not have falls back to the
-            // lossless default rather than quietly using the other one: the
-            // client asked for that codec's error behaviour, not any codec's.
+            // An unavailable codec falls back to EXACT, not to the other codec.
             let applied = asked.applied(DType::Float32);
             assert_eq!(!applied.is_exact(), want.is_supported());
             if want.is_supported() {
@@ -471,8 +452,7 @@ mod tests {
 
     #[test]
     fn a_lossless_codec_in_that_field_reads_as_no_preference() {
-        // A client from before there was a choice leaves the field at RAW,
-        // and RAW cannot carry a bound, so it must not be read as one.
+        // RAW from a client that predates the choice means no preference.
         let asked = QualitySpec {
             codec: Some(Codec::Raw),
             ..error_bound(Some(1e-3), None)

@@ -40,8 +40,7 @@ fn compress_as<T: sz3::SZ3Compressible + Copy + Default>(
     }
     let data = builder.finish().map_err(refused)?;
     let config = sz3::Config::new(sz3::ErrorBound::Absolute(spec.eps));
-    // Appends, which is what puts the stream straight after the block header
-    // the caller has already written.
+    // Appends after the caller's block header.
     sz3::compress_into_with_config(&data, &config, dst).map_err(refused)
 }
 

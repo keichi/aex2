@@ -11,10 +11,7 @@
 //! The codecs a chunk went through are listed in the order they were applied,
 //! so decoding runs the bytes-to-bytes ones backwards.
 //!
-//! A sharded array puts many chunks in one file with an index of where each
-//! one sits. That is the same problem twice over — a shard is a chunk of the
-//! array, an inner chunk is a chunk of the shard — so the walk is the same
-//! one, called inside itself.
+//! Sharded arrays reuse the chunk walk nested inside itself (see `chunks.rs`).
 //!
 //! Every path read here — a node's metadata as much as a chunk — goes through
 //! [`StoreRoot::under`], which resolves symlinks and refuses anything that

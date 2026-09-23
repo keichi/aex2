@@ -363,7 +363,7 @@ fn broadcast_len(lengths: &[u64]) -> Result<u64> {
     Ok(result)
 }
 
-/// Normalise one index against one axis./// Normalise one index against one axis.
+/// Normalise one index against one axis.
 fn resolve_axis(index: &Index, dim: u64, axis: usize) -> Result<AxisSel> {
     let dim_i64 = i64::try_from(dim).map_err(|_| {
         AexError::BadSelection(format!(
@@ -1563,10 +1563,7 @@ mod tests {
 
     #[test]
     fn advanced_indexing_matches_numpy() {
-        // An index array makes the whole selection advanced: the integers
-        // beside it join the group, the group broadcasts to one dimension, and
-        // that dimension goes where the group was — or at the front, if a slice
-        // came between its members. Every line here was checked against numpy.
+        // Advanced indexing, every case checked against numpy.
         let cases: Vec<(&[u64], Vec<Index>, Vec<u64>)> = vec![
             // One array, on its own: the axes it does not name are untouched.
             (&[4, 5, 6], vec![Index::Fancy(vec![0, 1])], vec![2, 5, 6]),

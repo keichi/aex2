@@ -46,7 +46,6 @@ pub const ALL_DTYPES: [DType; 14] = [
 ];
 
 impl DType {
-    /// Size of one element in bytes.
     pub const fn itemsize(self) -> u64 {
         match self {
             DType::Int8 | DType::Uint8 | DType::Bool => 1,
@@ -79,7 +78,6 @@ impl DType {
         }
     }
 
-    /// To the wire `DataType` value.
     pub const fn as_i32(self) -> i32 {
         self as i32
     }
