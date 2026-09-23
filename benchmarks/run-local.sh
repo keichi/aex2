@@ -2,19 +2,8 @@
 #
 # Local transfer benchmark: AEX2 against what the machine can do at all.
 #
-# Three numbers matter and this measures all three. iperf3 on loopback says how
-# fast bytes can cross a socket; pread says how fast they can leave storage; and
-# AEX2 says how much of that a real transfer keeps. On loopback the first two
-# are the same memory bus, so the interesting reading is the CPU per gibibyte
-# rather than the throughput.
-#
-# Data is measured in two places. A RAM disk holds the resident case, where
-# every read is a memory copy. A file half again the size of RAM holds the
-# disk-resident case: it cannot be cached, and reading its tail evicts its head,
-# which is how a cold read is arranged without privileges to drop the cache.
-#
-# macOS only, for the RAM disk and the eviction trick. On Linux, mount a tmpfs
-# and write 3 to /proc/sys/vm/drop_caches instead.
+# iperf3 (socket), pread (storage) and AEX2, on a RAM disk and a file 1.5x RAM.
+# macOS only; see docs/benchmark-m2-local.md.
 #
 # Usage:
 #   benchmarks/run-local.sh setup      # build, make the RAM disk and fixtures

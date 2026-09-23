@@ -3,21 +3,9 @@
 # zarr-python reading a store over HTTP against AEX2 reading the same store,
 # from the same client, over the same link, at a sweep of distances.
 #
-# The comparison recorded so far had zarr-python reading the store on the
-# machine that holds it, which leaves open the obvious objection that the store
-# could simply be served over HTTP. Here both readers are on the client and
-# both cross the link; nginx serves the very same directories the AEX2 server
-# has as its roots.
-#
-# What differs is where the decompression happens, and therefore what travels:
-# AEX2 decompresses on the server and sends raw bytes, HTTP sends the
-# compressed chunks and the client decompresses. So the noisy stores (35 %) are
-# the close comparison and the counting ones (3 %) are where HTTP moves a
-# thirtieth of the bytes. COUNTERS=1 records both sides of that per run.
-#
-# Socket buffers are tuned throughout, as in the other delay sweeps, and the
-# server is the 64 MiB decode cache one so that every chunk is decompressed
-# rather than served from the previous rep.
+# Both readers run on the client; nginx serves the dirs AEX2 has as roots.
+# AEX2 decompresses server-side, HTTP ships compressed chunks (COUNTERS=1 records bytes).
+# Tuned socket buffers; 64 MiB decode cache so every chunk is decompressed.
 #
 # Usage: [RTTS="0 100"] [STORES="mem.zarr"] [COUNTERS=1] zarr-remote-sweep.sh [reps]
 #   A cold disk-resident round: HTTP=http://SERVER:8080/disk COLD=/home/mdxuser/disk

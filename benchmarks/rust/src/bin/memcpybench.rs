@@ -4,11 +4,8 @@
 //! payload several times over, so knowing what one copy costs says how much of
 //! the machine a given throughput is using.
 //!
-//! Reading and writing are measured alongside copying, because a copy on its
-//! own does not say whether it is at the limit. Reading is the cleanest measure
-//! of what the memory can do — one stream, no ownership traffic — so a copy
-//! that reaches half the read figure is at the limit rather than merely slow:
-//! it moves two bytes for every one it copies.
+//! Read and write are timed too: a copy at half the read figure is at the limit,
+//! since it moves two bytes per byte copied.
 //!
 //! The buffers are allocated and touched before the timing starts, so what is
 //! measured is the moving rather than the page faults.

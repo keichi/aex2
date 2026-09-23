@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Generate the .npy files run_benchmarks.py reads.
 
-Ported from v1, which wrote HDF5. .npy is the one format both v1 and v2 serve,
-so the same files measure both.
+.npy is the one format v1 and v2 both serve, so the same files measure both.
 """
 
 import argparse

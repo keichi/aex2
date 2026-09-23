@@ -1,30 +1,8 @@
 #!/bin/bash
 #
-# What error-bounded compression costs and what it buys, against the round trip.
-#
-# The question is not whether SZ3 compresses -- it does -- but where the trade
-# turns over. Compressing costs CPU on both sides and gives up the receiver's
-# zero copy; it pays only once the link is slower than what the codec can feed
-# it. The exact transfer is measured alongside every point as the thing to beat.
-#
-# Three axes, because the first one on its own gave the wrong impression. Round
-# trip alone never turns the trade over here: this link runs at 26 to 133
-# Gbit/s, so even at 50 ms an exact transfer still beats a compressed one. It
-# is *bandwidth* that decides, so the second sweep caps it.
-#
-# The third is connections, which for a compressed transfer is not a network
-# knob at all: SZ3 runs single-threaded inside each connection thread, so it is
-# the only thing that decides how many cores compress. The shipping default of
-# 8 was chosen for lossless transfers, where the link is the limit; it leaves
-# half of a 16-core server idle here and halves the bandwidth at which
-# compression starts to pay.
-#
-# The fixture is `wave.npy`: a smooth 2-d float32 field with noise in the low
-# bits. A counting ramp would compress unboundedly and say nothing about real
-# data, so it is not used here.
-#
-# Each pass visits every point once and the passes are repeated, because the
-# shared link drifts over the day; take the median across passes.
+# Where SZ3 starts to pay, across RTT, capped bandwidth and connections (=
+# compressing cores); see docs/benchmark-sz.md. The fixture is wave.npy: a counting
+# ramp compresses unboundedly. Passes repeat; take the median.
 #
 # Usage: benchmarks/mdx2/sz-sweep.sh [reps]
 #   The server must be up with the sz feature: aex.toml (50191).

@@ -3,21 +3,9 @@
 # What AEX2 can trade for the bytes it puts on the wire, against zarr-python
 # reading the same store over HTTP.
 #
-# The remote comparison found the one place zarr-python wins: a store that
-# compresses well, read from far enough away that the link decides, because
-# AEX2 decompresses on the server and sends raw bytes. AEX2 has two answers
-# that comparison never asked for -- deflate on the wire, which is exact, and
-# SZ3, which is not -- and this measures what each costs and buys.
-#
-# The axis is bandwidth rather than round trip. A compressed transfer is
-# limited by the cores that compress it, not by the link, so it pays only once
-# the link is slower than those cores can feed. Round trip is swept too,
-# uncapped, because zarr-python's thousand GETs answer to it and a compressed
-# transfer does not.
-#
-# The fixture is wave.zarr: a smooth two-dimensional field with noise in the
-# low bits. The counting stores compress unboundedly under an error bound and
-# would say nothing about real data.
+# Deflate (exact) and SZ3 on the wire vs zarr-python over HTTP. Bandwidth is the axis:
+# compression pays only below what the cores feed; RTT is swept uncapped for
+# zarr-python's GETs. wave.zarr, since counting stores compress unboundedly.
 #
 # Usage: [RTTS="0 100"] [RATES="1gbit"] [STORE=... ELEMENTS=...] zarr-lossy-sweep.sh [reps]
 #   A cold disk-resident round: HTTP=http://SERVER:8080/disk COLD=/home/mdxuser/disk

@@ -33,11 +33,9 @@ libc = "0.2"
 [features]
 # Needs libhdf5 >= 1.14 at build time.
 hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
-# Error-bounded lossy compression. Builds SZ3 from source: needs cmake, a
-# C++17 compiler and libclang.
+# Error-bounded lossy compression (SZ3); build needs are in the workspace Cargo.toml.
 sz = ["dep:sz3"]
-# The other error-bounded codec. Builds zfp from source: needs cmake and
-# libclang.
+# The other error-bounded codec (zfp); same.
 zfp = ["dep:zfp-sys"]
 
 [dev-dependencies]

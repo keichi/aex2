@@ -1,4 +1,4 @@
-"""v1's end-to-end workflows, ported onto the npy hierarchy."""
+"""End-to-end workflows on .npy files."""
 
 import numpy as np
 

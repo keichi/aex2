@@ -18,9 +18,7 @@ set_rtt() {
 # the same rate in series still pass that rate, and the link is only ever
 # measured in one direction anyway.
 #
-# Wanted because delay alone cannot answer what compression is for. This link
-# runs at 26 to 133 Gbit/s, so even at 50 ms of round trip an exact transfer
-# beats a compressed one; the trade only turns over on a narrow link.
+# Delay alone never makes compression pay on this link; a narrow cap does.
 set_rtt_rate() {
     local half rate=$2
     half=$(echo "$1 / 2" | bc -l)
