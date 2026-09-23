@@ -537,7 +537,7 @@ $ ssh aex2-eval1 'pid=$(pgrep -x aex-server)
 
 サーバのプロファイルは、**負荷を掛けている最中に**取る必要がある。クライアント側の
 シェルを生かしたまま負荷を背景に回し、その中から `ssh` でサーバの `perf` を起動する
-(`benchmarks/mdx2/zarr-prof.sh`)。`nohup ... &` を単発の `ssh` で投げると、
+(`zarr-prof.sh`)。`nohup ... &` を単発の `ssh` で投げると、
 接続が切れた時点で負荷が消えてサーバが暇なところを記録してしまう。
 `perf record -p PID` はこの VM では通らないので `-a` を使い、PMU が無いので
 `-e cpu-clock` を指定する。
@@ -560,7 +560,8 @@ $ AEX_LOG=aex_server=debug target/release/aex-server --config benchmarks/mdx2/ae
 ...  DEBUG aex_server::control: decode cache hits=7168 misses=1024 races=0 ...
 ```
 
-`zarr-why.py` と `read-procs.py` は `benchmarks/mdx2/` にある。
+`read-procs.py` は `benchmarks/mdx2/` にある。`zarr-prof.sh` と `zarr-why.py` は削除した。
+使うときはコミット `7ff1f07` から取り出す。
 
 ```console
 $ ssh aex2-eval1 "bash -lc 'cd aex2 &&
