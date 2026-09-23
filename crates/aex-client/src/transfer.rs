@@ -157,11 +157,7 @@ impl TransferResult {
 
     /// Throughput in mebibytes per second, for benchmarks.
     pub fn throughput_mib_per_sec(&self) -> f64 {
-        let seconds = self.elapsed.as_secs_f64();
-        if seconds <= 0.0 {
-            return 0.0;
-        }
-        self.bytes as f64 / seconds / (1024.0 * 1024.0)
+        mib_per_sec(self.bytes, self.elapsed)
     }
 }
 
@@ -188,12 +184,16 @@ impl ClientStats {
     }
 
     pub fn throughput_mib_per_sec(&self) -> f64 {
-        let seconds = self.elapsed.as_secs_f64();
-        if seconds <= 0.0 {
-            return 0.0;
-        }
-        self.bytes as f64 / seconds / (1024.0 * 1024.0)
+        mib_per_sec(self.bytes, self.elapsed)
     }
+}
+
+fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 {
+        return 0.0;
+    }
+    bytes as f64 / seconds / (1024.0 * 1024.0)
 }
 
 /// An array fetched from a server, as raw bytes.
