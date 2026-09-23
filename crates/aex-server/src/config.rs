@@ -13,8 +13,9 @@ use serde::Deserialize;
 
 use crate::error::{Result, ServerError};
 
-/// The data plane frame version this server speaks.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The data plane frame version this server speaks, widened to the control
+/// plane's u32.
+pub const PROTOCOL_VERSION: u32 = aex_wire::PROTOCOL_VERSION as u32;
 
 /// Streams granted when the client expresses no preference.
 ///
@@ -39,12 +40,9 @@ pub struct ServerConfig {
     /// the control plane on", which is right whenever the server cannot know
     /// how the client addresses it (NAT, container, several interfaces).
     pub data_advertise_host: String,
-    /// Whether to offer the synthetic backend, which answers reads from a
-    /// pattern rather than from storage.
-    ///
-    /// Off unless asked for. It serves data that was never stored anywhere and
-    /// takes no path under the data roots, so it is a measuring instrument for
-    /// the transfer path and has no business being reachable otherwise.
+    /// Offer the synthetic backend. Off by default: it serves data never
+    /// stored and bypasses the data roots, so it is only for measuring the
+    /// transfer path.
     pub enable_null_backend: bool,
     pub limits: Limits,
     pub transfer: Transfer,
@@ -151,7 +149,6 @@ impl Default for Paths {
 }
 
 impl ServerConfig {
-    /// Read a config file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)

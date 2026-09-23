@@ -3,9 +3,8 @@
 //! The connections are opened with the session and kept. A transfer puts its
 //! chunks on one queue and starts a thread per connection it needs; each thread
 //! takes the next chunk whenever it has room, so a slow connection simply ends
-//! up carrying less (work stealing). Room is the credit: how many fetches a
-//! connection may have outstanding at once, which hides the round trip on a
-//! long link.
+//! up carrying less (work stealing). Room is the credit: fetches a connection
+//! may have outstanding.
 //!
 //! The connection carries no state past the handshake, which is what makes
 //! recovery simple: a chunk is asked for by its position in the logical byte
@@ -29,6 +28,7 @@ use aex_wire::{
     ScatterBuffer, ScatterSlice, Ticket, READY_LEN,
 };
 
+use crate::client::HexBytes;
 use crate::error::{ClientError, Result};
 
 /// How long one read or write on a data connection may take.
@@ -39,7 +39,7 @@ use crate::error::{ClientError, Result};
 const IO_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What it takes to open a data connection.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnSettings {
     pub host: String,
     pub port: u16,
@@ -47,6 +47,18 @@ pub struct ConnSettings {
     /// Never logged: it is what a connection proves itself with.
     pub session_token: [u8; 16],
     pub connect_timeout: Duration,
+}
+
+impl std::fmt::Debug for ConnSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("session_id", &HexBytes(&self.session_id))
+            .field("session_token", &"<redacted>")
+            .field("connect_timeout", &self.connect_timeout)
+            .finish()
+    }
 }
 
 /// One data connection, past its handshake.
@@ -146,13 +158,9 @@ impl DataConn {
     }
 
     /// Read one data frame into its place in the chunk starting at `offset`.
-    ///
-    /// Raw bytes go from the kernel into the caller's buffer with nothing in
-    /// between, which is the whole reason the payload is raw and the header is
-    /// fixed width. An encoded block cannot do that: it is read somewhere else
-    /// and expanded into place. A server may answer one fetch with several
-    /// frames, and may encode some and not others, so both the position and the
-    /// codec come from the frame rather than from what the transfer agreed.
+    /// Raw frames go straight into `dst`, encoded ones through `packed`;
+    /// position and codec come from each frame, since a server may split a
+    /// fetch and encode only some frames.
     fn receive_data(
         &mut self,
         header: &FrameHeader,
@@ -216,7 +224,6 @@ impl DataConn {
         Ok(())
     }
 
-    /// Turn an error frame into the error it stands for.
     fn receive_error(&mut self, header: &FrameHeader) -> Result<ClientError> {
         let mut payload = vec![0u8; header.wire_len as usize];
         self.stream.read_exact(&mut payload)?;
@@ -257,12 +264,10 @@ struct Part<'a> {
 pub struct Fetched {
     pub streams: u32,
     pub retries: u32,
-    /// Payload bytes read off the data plane, which is less than the stream
-    /// when the transfer was encoded. Headers are not counted.
+    /// Payload bytes read, headers excluded.
     pub wire_bytes: u64,
 }
 
-/// The session's data connections.
 pub struct DataPool {
     settings: ConnSettings,
     /// `None` once a connection has broken, until a transfer rebuilds it.
@@ -443,7 +448,6 @@ struct Transfer<'a> {
     parts: &'a [Part<'a>],
     state: Mutex<State>,
     wake: Condvar,
-    /// Payload bytes read off the wire, over every connection of this transfer.
     wire_bytes: AtomicU64,
 }
 

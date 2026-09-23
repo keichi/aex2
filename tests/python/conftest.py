@@ -77,7 +77,7 @@ def client(server: str) -> Iterator[aex.Client]:
 
 @pytest.fixture(scope="session")
 def ds_paths(data_dir: Path) -> dict[str, str]:
-    """The datasets of v1's test file, one .npy each.
+    """Test datasets, one .npy each.
 
     ds1 is ``col + row * 200``, so every element says where it came from.
     """
@@ -112,8 +112,6 @@ def array_proxy(file_proxy: aex.FileProxy) -> aex.ArrayProxy:
 
 @pytest.fixture
 def open_array(client: aex.Client, ds_paths: dict[str, str]):  # type: ignore[no-untyped-def]
-    """Open one of the datasets by name."""
-
     def open_array(name: str) -> aex.ArrayProxy:
         proxy = client.open(ds_paths[name])["array"]
         assert isinstance(proxy, aex.ArrayProxy)

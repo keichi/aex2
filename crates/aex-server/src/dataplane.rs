@@ -1,4 +1,4 @@
-//! The data plane: raw TCP, two dedicated threads per connection.
+//! The data plane: raw TCP, one dedicated thread per connection.
 //!
 //! Reading a regular file has no true asynchronous form on Linux or macOS —
 //! `O_NONBLOCK` does not apply to it, and epoll and kqueue always report it
@@ -6,19 +6,9 @@
 //! An async runtime here would therefore not save a thread, so the connections
 //! get real ones and the control plane keeps tokio to itself.
 //!
-//! Each connection has two: one reading ([`crate::reader`]) and one writing.
-//! Doing both in turn on one thread leaves the disk idle while the socket works
-//! and the socket idle while the disk works, and for data that does not fit in
-//! memory that is most of the throughput.
-//!
 //! A connection carries no state past the handshake. Any connection may serve
 //! any fetch of its session, which is what later makes work stealing, parallel
 //! streams and re-fetching a lost chunk all fall out for free.
-//!
-//! Nothing is encrypted and no user is identified here. The session token
-//! proves which session a connection belongs to, and the ticket in each `FETCH`
-//! proves which transfers it may read; who may open which file was settled by
-//! the control plane before any of this existed.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -36,7 +26,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::config::ServerConfig;
 use crate::error::{Result, ServerError};
-use crate::reader::{Piece, ReadPipeline};
+use crate::reader::FetchReader;
 use crate::session::{Session, SessionId, SessionRegistry};
 use crate::transfer::TransferRegistry;
 
@@ -55,7 +45,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What to do after handling a frame.
 enum Disposition {
-    /// Keep serving this connection.
     Continue,
     /// Hang up. Used where continuing would mean talking to a peer that has
     /// already proved it is not following the protocol.
@@ -77,10 +66,8 @@ struct Context {
 }
 
 impl DataPlane {
-    /// Take the socket.
-    ///
-    /// Separate from serving so that a caller can bind port 0 and still learn
-    /// where to connect, which is also what the control plane advertises.
+    /// Take the socket; separate from serving so a caller binding port 0
+    /// learns the real port before advertising it.
     pub fn bind(
         config: Arc<ServerConfig>,
         sessions: Arc<SessionRegistry>,
@@ -317,7 +304,7 @@ fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) 
     let idle = Duration::from_secs(context.config.limits.data_conn_idle_timeout_sec);
     // The buffer is allocated here and reused for the life of the connection,
     // so a transfer in progress allocates nothing.
-    let pipeline = ReadPipeline::start(context.config.transfer.read_buffer_bytes as usize);
+    let mut reader = FetchReader::new(context.config.transfer.read_buffer_bytes as usize);
     // Where a block is compressed before it goes out. Empty for a transfer
     // that is not encoded, and reused for the life of the connection.
     let mut packed = Vec::new();
@@ -330,16 +317,14 @@ fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) 
         let header = match FrameHeader::decode(&bytes) {
             Ok(header) => header,
             Err(e) => {
-                send_connection_error(stream, e.class(), &e)?;
+                send_error(stream, None, e.class(), &e)?;
                 return Err(ServerError::Protocol(e.to_string()));
             }
         };
 
-        // Any activity keeps the session alive, so a transfer in progress
-        // cannot be cut off by the control plane's idle timeout.
         context.sessions.touch(session);
 
-        match handle_frame(stream, &header, session, context, &pipeline, &mut packed)? {
+        match handle_frame(stream, &header, session, context, &mut reader, &mut packed)? {
             Disposition::Continue => {}
             Disposition::Close => return Ok(()),
         }
@@ -351,11 +336,11 @@ fn handle_frame(
     header: &FrameHeader,
     session: &SessionId,
     context: &Context,
-    pipeline: &ReadPipeline,
+    reader: &mut FetchReader,
     packed: &mut Vec<u8>,
 ) -> Result<Disposition> {
     match header.frame_type {
-        FrameType::Fetch => handle_fetch(stream, header, session, context, pipeline, packed),
+        FrameType::Fetch => handle_fetch(stream, header, session, context, reader, packed),
         FrameType::Ping => {
             write_frame(stream, &FrameHeader::bare(FrameType::Pong), &[])?;
             Ok(Disposition::Continue)
@@ -363,13 +348,11 @@ fn handle_frame(
         // A reply to a ping this server sent. Nothing to do but note that the
         // peer is alive, which reading the frame already did.
         FrameType::Pong => Ok(Disposition::Continue),
-        // Server-to-client frames arriving from a client mean the two
-        // implementations disagree about who says what. That is wrong with the
-        // connection rather than with any one fetch, so it is reported against
-        // no transfer at all.
+        // A server-to-client frame from a client: the connection is at fault,
+        // not a fetch.
         other => {
             let e = ServerError::Protocol(format!("{other:?} is not a frame a client may send"));
-            send_connection_error(stream, ErrorClass::Protocol, &e)?;
+            send_error(stream, None, ErrorClass::Protocol, &e)?;
             Ok(Disposition::Close)
         }
     }
@@ -380,7 +363,7 @@ fn handle_fetch(
     header: &FrameHeader,
     session: &SessionId,
     context: &Context,
-    pipeline: &ReadPipeline,
+    reader: &mut FetchReader,
     packed: &mut Vec<u8>,
 ) -> Result<Disposition> {
     if header.wire_len != TICKET_LEN as u64 {
@@ -388,7 +371,7 @@ fn handle_fetch(
             "a fetch carries a {TICKET_LEN} byte ticket, not {} bytes",
             header.wire_len
         ));
-        send_error(stream, header, ErrorClass::Protocol, &e)?;
+        send_error(stream, Some(header), ErrorClass::Protocol, &e)?;
         return Ok(Disposition::Close);
     }
 
@@ -407,7 +390,7 @@ fn handle_fetch(
             "a fetch of {} bytes is over this server's limit of {max_fetch}",
             header.logical_len
         ));
-        send_error(stream, header, ErrorClass::Request, &e)?;
+        send_error(stream, Some(header), ErrorClass::Request, &e)?;
         return Ok(Disposition::Continue);
     }
 
@@ -415,7 +398,7 @@ fn handle_fetch(
         Ok(entry) => entry,
         Err(e) => {
             let class = e.class();
-            send_error(stream, header, class, &e)?;
+            send_error(stream, Some(header), class, &e)?;
             // A wrong ticket is either a bug or someone guessing at another
             // session's transfers; neither is worth carrying on with.
             return Ok(match class {
@@ -430,7 +413,7 @@ fn handle_fetch(
         .check_range(header.offset, header.logical_len)
     {
         let class = e.class();
-        send_error(stream, header, class, &e)?;
+        send_error(stream, Some(header), class, &e)?;
         return Ok(Disposition::Continue);
     }
 
@@ -446,41 +429,34 @@ fn handle_fetch(
             header.offset,
             header.offset.saturating_add(header.logical_len)
         ));
-        send_error(stream, header, ErrorClass::Request, &e)?;
+        send_error(stream, Some(header), ErrorClass::Request, &e)?;
         return Ok(Disposition::Continue);
     }
 
-    // Hand the range to the reader and write out each piece as it arrives. The
-    // pieces go as separate DATA frames; a fetch and a frame were never
-    // required to be the same size, and this is what that is for.
-    pipeline.request(entry.clone(), header.offset, header.logical_len);
-    loop {
-        match pipeline.next_piece() {
-            Piece::Data { offset, bytes, len } => {
-                let sent = send_piece(
-                    stream,
-                    header.request_id,
-                    entry.layout(),
-                    offset,
-                    &bytes[..len],
-                    packed,
-                );
-                pipeline.recycle(bytes);
-                sent?;
-            }
-            Piece::Done => break,
-            Piece::Failed(e) => {
-                // Whatever went out before this stands; the client abandons the
-                // fetch on the error and asks for the same range again, which
-                // is always safe because a fetch names what it wants.
-                let class = e.class();
-                send_error(stream, header, class, &e)?;
-                return Ok(Disposition::Continue);
-            }
-        }
-        // A large fetch off a cold cache takes a while, and the plan must not
-        // expire out from under the reply it is still sending.
-        context.transfers.touch(&entry);
+    let served = reader.serve(
+        &entry,
+        header.offset,
+        header.logical_len,
+        |offset, bytes| {
+            send_piece(
+                stream,
+                header.request_id,
+                entry.layout(),
+                offset,
+                bytes,
+                packed,
+            )?;
+            // A large fetch off a cold cache takes a while, and the plan must not
+            // expire out from under the reply it is still sending.
+            context.transfers.touch(&entry);
+            Ok::<_, ServerError>(())
+        },
+    )?;
+    if let Err(e) = served {
+        // Whatever went out before this stands; the client abandons the fetch
+        // on the error and asks for the same range again, which is always safe
+        // because a fetch names what it wants.
+        send_error(stream, Some(header), e.class(), &e)?;
     }
 
     Ok(Disposition::Continue)
@@ -519,47 +495,17 @@ fn send_piece(
     Ok(())
 }
 
-/// Report a failure against the fetch that caused it.
-///
-/// The reply names that fetch — its transfer, offset and length — so that the
-/// client can put exactly that chunk back on its queue rather than starting the
-/// transfer again.
+/// Report a failure against the fetch that caused it, so the client can
+/// requeue just that chunk, or against the connection (request 0) when no
+/// fetch is to blame.
 fn send_error(
     stream: &mut TcpStream,
-    fetch: &FrameHeader,
+    fetch: Option<&FrameHeader>,
     class: ErrorClass,
     error: impl std::fmt::Display,
 ) -> Result<()> {
-    send_error_for(
-        stream,
-        fetch.request_id,
-        fetch.offset,
-        fetch.logical_len,
-        class,
-        error,
-    )
-}
-
-/// Report a failure that no fetch can be blamed for.
-///
-/// A transfer is numbered from 1, so 0 says the trouble is with the connection
-/// itself rather than with anything that was asked for.
-fn send_connection_error(
-    stream: &mut TcpStream,
-    class: ErrorClass,
-    error: impl std::fmt::Display,
-) -> Result<()> {
-    send_error_for(stream, 0, 0, 0, class, error)
-}
-
-fn send_error_for(
-    stream: &mut TcpStream,
-    request_id: u32,
-    offset: u64,
-    logical_len: u64,
-    class: ErrorClass,
-    error: impl std::fmt::Display,
-) -> Result<()> {
+    let (request_id, offset, logical_len) =
+        fetch.map_or((0, 0, 0), |h| (h.request_id, h.offset, h.logical_len));
     tracing::debug!(request_id, ?class, "{error}");
     let payload = ErrorPayload::new(class, error.to_string()).encode();
     let header = FrameHeader::error(request_id, offset, logical_len, payload.len() as u64);

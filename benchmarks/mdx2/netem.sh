@@ -2,7 +2,8 @@
 #
 # Half the delay goes on each side, so ACKs are late too, and only traffic to
 # the peer is delayed, so ssh stays fast. Source this, then call set_rtt; the
-# caller's EXIT trap has to call clear_rtt, or the VMs keep the delay.
+# caller's EXIT trap has to call clear_rtt (or restore), or the VMs keep the
+# delay.
 
 SERVER=${SERVER:-aex2-eval1} SERVER_IP=${SERVER_IP:-192.168.100.207}
 CLIENT=${CLIENT:-aex2-eval2} CLIENT_IP=${CLIENT_IP:-192.168.101.235}
@@ -17,9 +18,7 @@ set_rtt() {
 # the same rate in series still pass that rate, and the link is only ever
 # measured in one direction anyway.
 #
-# Wanted because delay alone cannot answer what compression is for. This link
-# runs at 26 to 133 Gbit/s, so even at 50 ms of round trip an exact transfer
-# beats a compressed one; the trade only turns over on a narrow link.
+# Delay alone never makes compression pay on this link; a narrow cap does.
 set_rtt_rate() {
     local half rate=$2
     half=$(echo "$1 / 2" | bc -l)
@@ -60,6 +59,12 @@ set_buffers() {
         ssh "$h" "sudo sysctl -q -w net.ipv4.tcp_rmem='$rmem' net.ipv4.tcp_wmem='$wmem' \
             net.core.rmem_max=$core net.core.wmem_max=$core"
     done
+}
+
+# Undo set_rtt and set_buffers, for a sweep's `trap restore EXIT`.
+restore() {
+    clear_rtt
+    set_buffers default
 }
 
 # Cached ssthresh from the previous run would skip slow start.

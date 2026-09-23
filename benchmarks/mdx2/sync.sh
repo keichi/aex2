@@ -34,11 +34,8 @@ done
 # The server gets the hdf5 feature by default; the VMs have libhdf5 in
 # /usr/local.
 #
-# The two bindgen variables are for the sz and zfp features. The VMs have llvm-18's
-# runtime libclang but none of the clang dev packages, so libclang has to be
-# named by path, and it is then left without its own stddef.h and friends --
-# gcc's are lent to it instead, which is cheaper than installing a toolchain
-# on the VMs to build one crate.
+# LIBCLANG_PATH/BINDGEN_EXTRA_CLANG_ARGS (sz, zfp): the VMs have llvm-18's runtime
+# libclang but no clang headers, so bindgen borrows gcc's.
 build="cd aex2 &&
     export LIBCLANG_PATH=/usr/lib/llvm-18/lib &&
     export BINDGEN_EXTRA_CLANG_ARGS=\"-isystem \$(ls -d /usr/lib/gcc/*/*/include | tail -1)\" &&

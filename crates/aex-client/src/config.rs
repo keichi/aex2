@@ -31,9 +31,7 @@ pub struct ClientConfig {
     pub connect_timeout: Duration,
     /// Ceiling on one gRPC message. A fancy selection is the message that grows.
     pub max_message_bytes: usize,
-    /// How much of the logical byte stream one fetch asks for. 0 follows the
-    /// server's recommendation, which is the right answer unless a benchmark is
-    /// sweeping this.
+    /// Bytes one fetch asks for; 0 follows the server's recommendation.
     pub chunk_bytes: u64,
     /// Fetches one connection may have outstanding at once. Deeper hides more
     /// of the round trip on a long link, at the cost of more data to drain if
@@ -121,8 +119,6 @@ mod tests {
         assert_eq!(config.streams, DEFAULT_STREAMS);
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
         assert!(!config.client_name.is_empty());
-        // 0 means "whatever the server recommends", which is what an untuned
-        // client should be doing.
         assert_eq!(config.chunk_bytes, 0);
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.credit, DEFAULT_CREDIT);

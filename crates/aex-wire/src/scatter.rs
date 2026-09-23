@@ -22,10 +22,8 @@ use crate::error::{Result, WireError};
 
 /// An output buffer that hands out disjoint mutable ranges.
 ///
-/// The buffer it borrows outlives every slice taken from it, which is what
-/// keeps the receive path sound: the array is owned by the caller — from M3, a
-/// numpy array held alive by the binding — for as long as any connection might
-/// still write into it.
+/// The borrowed buffer (in practice a numpy array the binding keeps alive)
+/// outlives every slice taken from it, which keeps the receive path sound.
 pub struct ScatterBuffer<'a> {
     ptr: *mut u8,
     len: u64,

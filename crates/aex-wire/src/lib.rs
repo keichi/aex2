@@ -4,11 +4,6 @@
 //! mismatch is the worst bug a two-sided protocol can have, and sharing the
 //! definition rules it out by construction rather than by discipline.
 //!
-//! Three things live here: the handshake that opens a connection
-//! ([`handshake`]), the frames that travel on it ([`frame`]), and the receive
-//! buffer that lets several connections write into one array at once
-//! ([`scatter`]).
-//!
 //! Everything is little-endian, and every offset is a position in the logical
 //! byte stream of a transfer — not in the file, and not in the connection.
 

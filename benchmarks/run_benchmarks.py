@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Time whole-array transfers, with v1 or v2 on the same files.
 
-Ported from v1. The client API is the same in both, so this one script
-measures either: by default the installed aex (v2), or v1 with ``--v1 PATH``
-pointing at a v1 checkout. Run v1 in v1's own environment, since it needs grpcio:
+The client API is the same in v1 and v2, so this script measures either: by
+default the installed aex (v2), or v1 with ``--v1 PATH`` pointing at a v1
+checkout. Run v1 in v1's own environment, since it needs grpcio:
 
     # v2
     aex-server --root benchmarks/data &

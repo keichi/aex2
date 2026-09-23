@@ -5,11 +5,9 @@ HDF5 file, and AEX2's Python client against the same data on the same machine,
 in one loop with one timing, so that what is compared is the readers and not
 several benchmarks.
 
-Also the question this started as: is a reader's ceiling the machine, or one
-Python process? Each worker process reads its own disjoint slice. If N
-processes go N times faster, then neither the storage nor the codec was the
-limit -- one interpreter was. Sweeping past the core count shows where the
-machine takes over.
+Each worker reads a disjoint slice: if N processes go N times faster, one
+interpreter was the limit, not storage or codec. Sweeping past the core count
+shows where the machine takes over.
 
 Usage:
   python read-procs.py /mnt/aexram/mem.zarr                  # local, as before
@@ -70,14 +68,8 @@ def open_array(args, store=None, backend=None):
 
         import h5pyd
 
-        # The endpoint is the server, the path is the domain within it. The
-        # rest comes from the environment, which h5pyd only reads from a
-        # config file of its own.
-        #
-        # A standalone HSDS runs one service node, and everything a client
-        # reads passes through that one Python process. Several of them are
-        # started on consecutive ports to let it use the machine, and the
-        # readers are spread over them.
+        # h5pyd reads credentials only from its own config file, so pass them from env.
+        # Readers are spread over several HSDS servers (see hsds.sh).
         url = urllib.parse.urlsplit(store)
         host, _, port = url.netloc.partition(":")
         port = int(port) + args.rank % args.endpoints

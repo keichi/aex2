@@ -30,7 +30,6 @@ pub enum ErrorClass {
 }
 
 impl ErrorClass {
-    /// The wire representation.
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
@@ -52,7 +51,6 @@ impl ErrorClass {
     }
 }
 
-/// Result type for this crate.
 pub type Result<T> = std::result::Result<T, AexError>;
 
 /// Errors raised by the core layer.
@@ -135,7 +133,6 @@ impl From<hdf5::Error> for AexError {
 }
 
 impl AexError {
-    /// Map this error onto its wire class.
     pub fn class(&self) -> ErrorClass {
         match self {
             AexError::UnsupportedDType(_)

@@ -1,30 +1,8 @@
 #!/bin/bash
 #
-# SZ3 and ZFP side by side: which error-bounded codec wins where.
-#
-# sz-sweep.sh already settled the shape of the trade -- a compressed transfer
-# runs at a CPU-bound constant that moves with neither round trip nor
-# bandwidth, so the link speed at which compression starts to pay *is* that
-# constant -- and this sweep does not re-derive it. It measures each codec's
-# constant, and checks once on a narrow link that the constant really is one.
-#
-# Both codecs are measured in the same pass, alternately, because the numbers
-# in docs/benchmark-sz.md were taken on another day and this VM pair drifts
-# about 25 % over one (eval-mdx2.md). An SZ3 column here is a fresh
-# measurement, not a copy.
-#
-# Dropped from sz-sweep.sh, with reasons:
-#   - the RTT axis. Its 17 % droop comes from credit being counted in logical
-#     bytes, which is the client's accounting and not the codec's. One point
-#     at the end checks that it is the same droop for both.
-#   - three of the four bandwidth caps. The compressed row was flat across all
-#     four, so one cap tests that claim for ZFP and three more only repeat it.
-#   - streams 4 and 24. 4 only confirmed linearity and 24 was already flat.
-#
-# Note when reading ratios: zfp honours a bound by rounding it down to a power
-# of two, so at 1e-4, 1e-3, 1e-2 and 1e-1 it is compressing to a tighter bound
-# than SZ3 is. Every ZFP ratio here is therefore a lower bound on what it would
-# do at the same effective tolerance.
+# SZ3 and ZFP in the same pass, since the VMs drift ~25 % between days.
+# ZFP rounds its bound down to a power of two, so its ratios are lower bounds.
+# See docs/benchmark-zfp.md.
 #
 # Usage: benchmarks/mdx2/zfp-sweep.sh [reps]
 #   The server must be up with both codecs: aex.toml (50191).
@@ -53,10 +31,6 @@ DROOP_BOUND=0.001
 BYTES=$((1 << 30))
 PORT=50191    # aex.toml
 
-restore() {
-    clear_rtt
-    set_buffers default
-}
 trap restore EXIT
 
 # run <label> <aexbench flags...>
@@ -94,10 +68,7 @@ done
 
 set_buffers tuned
 for r in $(seq "$REPS"); do
-    # netem off first: these two blocks are after the ceiling the server's
-    # cores set, and a cap left over from the last rep would hide it. `replace`
-    # keeps whatever the previous call did not mention, so this is a teardown
-    # and not a tidy-up (see netem.sh).
+    # netem off first: a cap left from the last rep would hide the cores' ceiling (see netem.sh).
     clear_rtt
     for s in "${STREAMS[@]}"; do
         block "streams=$s" --streams "$s"

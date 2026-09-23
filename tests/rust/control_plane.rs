@@ -192,7 +192,6 @@ fn bad_requests_are_reported_as_such() {
     server.write_npy("a.npy", &[4]);
     let client = server.connect();
 
-    // A file that is not there.
     assert_eq!(error_class(client.open("absent.npy")), ErrorClass::Request);
     // A file outside the data roots.
     let outside = tempfile::tempdir().unwrap();

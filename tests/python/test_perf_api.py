@@ -13,9 +13,7 @@ def expected_ds1() -> np.ndarray:
     return (x + y * 200).astype(np.float32)
 
 
-# ============================================================
 # read_into
-# ============================================================
 
 
 @pytest.mark.parametrize("key", [np.s_[0:10], np.s_[5], np.s_[:, ::3], np.s_[[1, 7], 2:4]])
@@ -63,9 +61,7 @@ def test_read_into_refuses_a_read_only_buffer(array_proxy):
         array_proxy.read_into(out, np.s_[0:10])
 
 
-# ============================================================
 # gather
-# ============================================================
 
 
 def test_gather_matches_indexing_one_by_one(array_proxy):
@@ -96,9 +92,7 @@ def test_gather_raises_the_first_failure(array_proxy):
         array_proxy.gather([np.s_[0], np.s_[500], np.s_[600]])
 
 
-# ============================================================
 # get_async
-# ============================================================
 
 
 def test_get_async_gives_what_indexing_would(array_proxy):
@@ -123,9 +117,7 @@ def test_close_waits_for_pending_transfers(server, ds_paths):
         np.testing.assert_array_equal(future.result(timeout=0), expected_ds1())
 
 
-# ============================================================
 # at
-# ============================================================
 
 
 @pytest.mark.parametrize(
@@ -208,9 +200,7 @@ def test_at_accepts_both_error_bounds(array_proxy):
     }
 
 
-# ============================================================
 # stats
-# ============================================================
 
 
 def test_stats_count_what_was_transferred(client, ds_paths):

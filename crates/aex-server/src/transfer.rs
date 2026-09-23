@@ -5,25 +5,19 @@
 //! holds a lock while transferring: a thread takes its `Arc` out of the map and
 //! lets the map go.
 //!
-//! There is no RPC to release a plan. Releasing on the critical path would cost
-//! a round trip, and off it would only free memory slightly sooner; an entry is
-//! small — an `Arc` to the dataset and the resolved layout — and the count is
-//! capped per session. So plans go three ways: they expire, they are evicted
-//! when a session has too many, or the session ends.
+//! Plans are never released explicitly; they expire, are evicted past the
+//! per-session cap, or go with their session.
 //!
-//! The TTL is pushed out on every `FETCH` rather than fixed at issue. A fixed
-//! deadline would make a transfer that legitimately takes longer than the TTL —
-//! a large selection over a slow link, or off a cold cache — fail every single
-//! time. Extending it means a plan expires only when the client really did go
-//! quiet, which is what the setting is supposed to mean.
+//! The TTL counts idle time and is pushed out on every `FETCH`, so a long
+//! transfer never expires mid-flight.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use aex_core::{ArrayDataset, SelectionLayout};
 use aex_wire::Ticket;
-use dashmap::DashMap;
 
 use crate::config::ServerConfig;
 use crate::error::{Result, ServerError};
@@ -51,7 +45,6 @@ impl std::fmt::Debug for TransferEntry {
 }
 
 impl TransferEntry {
-    /// Identifies this transfer on the data plane.
     pub fn request_id(&self) -> u32 {
         self.request_id
     }
@@ -90,10 +83,9 @@ impl TransferEntry {
 /// Every live transfer plan.
 #[derive(Debug)]
 pub struct TransferRegistry {
-    entries: DashMap<u32, Arc<TransferEntry>>,
-    /// Which plans belong to which session, for the per-session cap and for
-    /// dropping them all when the session goes.
-    by_session: DashMap<SessionId, Vec<u32>>,
+    // ponytail: one lock for every plan; it is taken once per RPC or FETCH
+    // and held only for a map operation. Shard it if that ever shows up.
+    plans: Mutex<Plans>,
     next_id: AtomicU32,
     config: Arc<ServerConfig>,
     /// Plans are timed against a monotonic clock, so a wall-clock jump cannot
@@ -101,11 +93,20 @@ pub struct TransferRegistry {
     epoch: Instant,
 }
 
+/// The plans, and the index into them by session. One lock over both keeps
+/// them consistent.
+#[derive(Debug, Default)]
+struct Plans {
+    entries: HashMap<u32, Arc<TransferEntry>>,
+    /// Which plans belong to which session, for the per-session cap and for
+    /// dropping them all when the session goes.
+    by_session: HashMap<SessionId, Vec<u32>>,
+}
+
 impl TransferRegistry {
     pub fn new(config: Arc<ServerConfig>) -> Self {
         TransferRegistry {
-            entries: DashMap::new(),
-            by_session: DashMap::new(),
+            plans: Mutex::default(),
             // From 1: a request_id of 0 means "about the connection itself" on
             // the data plane, so no transfer may claim it.
             next_id: AtomicU32::new(1),
@@ -114,17 +115,16 @@ impl TransferRegistry {
         }
     }
 
+    fn plans(&self) -> MutexGuard<'_, Plans> {
+        self.plans.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
     }
 
     fn ttl_ms(&self) -> u64 {
         self.config.limits.transfer_ttl_sec.saturating_mul(1000)
-    }
-
-    /// How long from now a plan issued now would survive, in seconds.
-    pub fn ttl_secs(&self) -> u64 {
-        self.config.limits.transfer_ttl_sec
     }
 
     /// Register a resolved selection and mint its ticket.
@@ -153,22 +153,25 @@ impl TransferRegistry {
             last_used_ms: AtomicU64::new(now_ms),
         });
 
-        let mut ids = self.by_session.entry(session).or_default();
+        let mut plans = self.plans();
+        let Plans {
+            entries,
+            by_session,
+        } = &mut *plans;
+        let ids = by_session.entry(session).or_default();
         // Plans swept for age leave their ids behind; drop those before
         // deciding the session is at its limit.
-        ids.retain(|id| self.entries.contains_key(id));
+        ids.retain(|id| entries.contains_key(id));
         while ids.len() >= self.config.limits.max_transfers_per_session as usize {
-            let Some(position) = self.least_recently_used(&ids) else {
+            let Some(position) = least_recently_used(entries, ids) else {
                 break;
             };
             let evicted = ids.swap_remove(position);
-            self.entries.remove(&evicted);
+            entries.remove(&evicted);
             tracing::debug!(request_id = evicted, "evicted the oldest transfer plan");
         }
         ids.push(entry.request_id);
-        drop(ids);
-
-        self.entries.insert(entry.request_id, entry.clone());
+        entries.insert(entry.request_id, entry.clone());
         Ok(entry)
     }
 
@@ -186,9 +189,10 @@ impl TransferRegistry {
     ) -> Result<Arc<TransferEntry>> {
         let now_ms = self.now_ms();
         let entry = self
+            .plans()
             .entries
             .get(&request_id)
-            .map(|entry| entry.value().clone())
+            .cloned()
             .ok_or_else(|| {
                 ServerError::NoSuchPlan(format!(
                     "transfer {request_id} does not exist, or expired after {} seconds of \
@@ -224,8 +228,9 @@ impl TransferRegistry {
     }
 
     fn remove(&self, request_id: u32) {
-        if let Some((_, entry)) = self.entries.remove(&request_id) {
-            if let Some(mut ids) = self.by_session.get_mut(&entry.session) {
+        let mut plans = self.plans();
+        if let Some(entry) = plans.entries.remove(&request_id) {
+            if let Some(ids) = plans.by_session.get_mut(&entry.session) {
                 ids.retain(|id| *id != request_id);
             }
         }
@@ -233,57 +238,46 @@ impl TransferRegistry {
 
     /// Drop every plan of a session that has ended.
     pub fn remove_session(&self, session: &SessionId) -> usize {
-        let Some((_, ids)) = self.by_session.remove(session) else {
+        let mut plans = self.plans();
+        let Some(ids) = plans.by_session.remove(session) else {
             return 0;
         };
         for id in &ids {
-            self.entries.remove(id);
+            plans.entries.remove(id);
         }
         ids.len()
     }
 
-    /// Drop plans nobody has fetched within the TTL, and plans whose session is
-    /// gone.
-    ///
-    /// A session that timed out rather than disconnecting takes its plans with
-    /// it here, which is why this needs to be told which sessions are still
-    /// live.
+    /// Drop plans idle past the TTL, and plans whose session is gone (timed
+    /// out rather than disconnected).
     pub fn sweep(&self, is_live: impl Fn(&SessionId) -> bool) -> usize {
         self.sweep_at(self.now_ms(), is_live)
     }
 
     fn sweep_at(&self, now_ms: u64, is_live: impl Fn(&SessionId) -> bool) -> usize {
         let ttl_ms = self.ttl_ms();
-        let before = self.entries.len();
-        self.entries
-            .retain(|_, entry| !entry.is_expired(now_ms, ttl_ms) && is_live(&entry.session));
+        let mut plans = self.plans();
+        let Plans {
+            entries,
+            by_session,
+        } = &mut *plans;
+        let before = entries.len();
+        entries.retain(|_, entry| !entry.is_expired(now_ms, ttl_ms) && is_live(&entry.session));
 
         // Sessions whose plans have all gone leave an empty list behind.
-        self.by_session.retain(|session, ids| {
-            ids.retain(|id| self.entries.contains_key(id));
+        by_session.retain(|session, ids| {
+            ids.retain(|id| entries.contains_key(id));
             !ids.is_empty() && is_live(session)
         });
-        before - self.entries.len()
+        before - entries.len()
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.plans().entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Where in `ids` the plan nobody has touched for longest is.
-    fn least_recently_used(&self, ids: &[u32]) -> Option<usize> {
-        ids.iter()
-            .enumerate()
-            .filter_map(|(position, id)| {
-                let entry = self.entries.get(id)?;
-                Some((position, entry.last_used_ms()))
-            })
-            .min_by_key(|(_, last_used)| *last_used)
-            .map(|(position, _)| position)
+        self.plans().entries.is_empty()
     }
 
     /// The next identifier, never 0.
@@ -299,6 +293,15 @@ impl TransferRegistry {
             }
         }
     }
+}
+
+/// Where in `ids` the plan nobody has touched for longest is.
+fn least_recently_used(entries: &HashMap<u32, Arc<TransferEntry>>, ids: &[u32]) -> Option<usize> {
+    ids.iter()
+        .enumerate()
+        .filter_map(|(position, id)| Some((position, entries.get(id)?.last_used_ms())))
+        .min_by_key(|(_, last_used)| *last_used)
+        .map(|(position, _)| position)
 }
 
 /// Compare two tickets without leaking where they differ.

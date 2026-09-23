@@ -36,9 +36,7 @@ read -r -a CACHES <<< "${CACHES:-none blockcache background}"
 read -r -a PROCS <<< "${PROCS:-1 16}"
 # HSDS servers to spread the readers over; one of them stops at about 400 MiB/s.
 ENDPOINTS=${ENDPOINTS:-8}
-# Rows per h5pyd read. HSDS builds a whole selection in memory before it
-# answers, so a quarter of a gigabyte at a time from sixteen readers gets it
-# killed by the kernel; in 16 MiB pieces it is both alive and faster.
+# Rows per h5pyd read; see read() in read-procs.py for why.
 PIECE=${PIECE:-4194304}
 # Overridable so that the files on the virtio disk, which nginx serves under
 # /disk/, can be swept by the same script.
@@ -52,10 +50,6 @@ HS="HS_USERNAME=test HS_PASSWORD=test HS_BUCKET=${HS_BUCKET:-hsds}"
 PY=".venv/bin/python -u benchmarks/mdx2/read-procs.py"
 ELEMENTS=$((1 << 30))
 
-restore() {
-    clear_rtt
-    set_buffers default
-}
 trap restore EXIT
 
 set_buffers tuned

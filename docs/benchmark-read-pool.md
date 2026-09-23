@@ -40,6 +40,8 @@ M6 での既定値の決定は、「共有プールを作る」ではなく
 プロトコル処理 (FETCH の解釈、チケット検証、クライアントの受信) は含まない。
 値は中央値 (MiB/s)。環境は [mdx2 の測定](benchmark-mdx2.md#測定環境) と同じ。
 
+`poolbench` と掃引スクリプトは削除した。再現するときはコミット `7ff1f07` を checkout する。
+
 ```console
 $ poolbench sink                                               # eval-2
 $ poolbench send /mnt/aexram/mem.npy --to 192.168.101.235:50399 \

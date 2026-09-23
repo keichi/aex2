@@ -83,8 +83,7 @@ fn compress_as<T: Copy + Default>(
     if written == 0 {
         return Err(refused("compressing a block"));
     }
-    // Appends, which is what puts the stream straight after the block header
-    // the caller has already written.
+    // Appends after the caller's block header.
     dst.extend_from_slice(&as_bytes(words)[..written]);
     Ok(())
 }

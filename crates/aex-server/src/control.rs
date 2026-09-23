@@ -1,17 +1,10 @@
 //! The gRPC control plane.
 //!
-//! It decides *what* to send: sessions, files, metadata, and the resolution of
-//! a selection into a transfer plan. The bulk data never passes through here.
-//!
-//! A selection small enough to fit the inline limit is answered with its data
-//! attached instead of a plan. Without that path, a small interactive read
-//! would cost two round trips where v1 needed one, and making a small read
-//! slower in order to make a large one faster is the wrong trade for a system
-//! whose main complaint about v1 is latency.
+//! A selection under the inline limit is answered with its data attached, so a
+//! small interactive read costs one round trip, not two.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aex_core::{
     ArrayDataset, ArrayFile, AttrValue, Axis, Codec, Function, Item, NpyFile, NullFile, ReduceArgs,
@@ -180,13 +173,8 @@ impl ControlService {
         };
 
         let indices = indices_from_proto(&request.indices, self.config.limits.max_fancy_indices)?;
-        // What the client asked for, and what this server can actually do. The
-        // difference goes back in the plan rather than being an error, so that
-        // a newer client still gets its data.
         let mut requested = quality_from_proto(request.requested_quality.as_ref());
-        // The codec does not travel inside the proto QualitySpec; it has a
-        // field of its own, which is where a client names one of the several
-        // codecs that can carry an error bound.
+        // The codec has its own request field, outside QualitySpec.
         requested.codec = Codec::from_u32(request.requested_codec);
         let applied = requested.applied(dataset.dtype());
         // Which is RAW unless a codec this build has was named, and the same
@@ -209,13 +197,12 @@ impl ControlService {
             );
             // No request_id and no ticket: there is nothing left to fetch, and
             // a zero request_id is how the client knows that.
-            return plan_reply(&layout, codec, &applied, 0, Vec::new(), 0, inline_data);
+            return plan_reply(&layout, codec, &applied, 0, Vec::new(), inline_data);
         }
 
         let entry = self
             .transfers
             .insert(*session.id(), dataset.clone(), layout)?;
-        let expires = unix_ms_from_now(self.transfers.ttl_secs());
         tracing::debug!(
             session = %hex(session.id()),
             request_id = entry.request_id(),
@@ -229,7 +216,6 @@ impl ControlService {
             &applied,
             entry.request_id(),
             entry.ticket().to_vec(),
-            expires,
             Vec::new(),
         )
     }
@@ -265,9 +251,7 @@ impl AexControl for ControlService {
         Ok(Response::new(ConnectReply {
             session_id: session.id().to_vec(),
             session_token: session.token().to_vec(),
-            // One endpoint, and an empty host so the client reuses the address
-            // it already reached the control plane on. The server cannot know
-            // how the client addresses it through a NAT or a container.
+            // Empty host by default: the client reuses the control plane's address.
             endpoints: vec![DataEndpoint {
                 host: self.config.data_advertise_host.clone(),
                 port: self.data_port as u32,
@@ -434,7 +418,6 @@ impl AexControl for ControlService {
             dtype: reduced.dtype.as_i32(),
             shape: shape_to_proto(&reduced.shape)?,
             data: reduced.data,
-            plan: None,
         }))
     }
 }
@@ -465,7 +448,6 @@ fn plan_reply(
     applied: &aex_core::QualitySpec,
     request_id: u32,
     ticket: Vec<u8>,
-    expires_unix_ms: u64,
     inline_data: Vec<u8>,
 ) -> Result<TransferPlan> {
     Ok(TransferPlan {
@@ -476,21 +458,8 @@ fn plan_reply(
         total_bytes: layout.total_bytes,
         codec: codec.as_u32(),
         applied_quality: Some(quality_to_proto(applied)),
-        expires_unix_ms,
         inline_data,
     })
-}
-
-/// Wall-clock milliseconds `secs` from now.
-///
-/// Only the client reads this, and only to tell a user how long it has. The
-/// server times its own plans on a monotonic clock.
-fn unix_ms_from_now(secs: u64) -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or(0)
-        .saturating_add(secs.saturating_mul(1000))
 }
 
 impl ControlService {
@@ -599,7 +568,6 @@ fn dataset_to_proto(dataset: &dyn ArrayDataset) -> Result<Dataset> {
     let shape = shape_to_proto(dataset.shape())?;
     Ok(Dataset {
         dtype: dataset.dtype().as_i32(),
-        ndim: shape.len() as i32,
         shape,
     })
 }
@@ -669,7 +637,6 @@ mod tests {
             panic!("expected a dataset");
         };
         assert_eq!(dataset.dtype, DType::Float32.as_i32());
-        assert_eq!(dataset.ndim, 2);
         assert_eq!(dataset.shape, vec![1000, 200]);
     }
 
@@ -683,7 +650,6 @@ mod tests {
         let Some(aex_proto::item::Data::Dataset(dataset)) = item.data else {
             panic!("expected a dataset");
         };
-        assert_eq!(dataset.ndim, 0);
         assert!(dataset.shape.is_empty());
     }
 

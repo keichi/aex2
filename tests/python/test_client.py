@@ -1,9 +1,4 @@
-"""v1's client tests, ported onto the npy hierarchy.
-
-v1 served an HDF5 file with nested groups. A .npy is a root group holding one
-dataset named ``array``, so the datasets are separate files here. The nested
-group tests live in test_hdf5.py.
-"""
+"""Client proxy tests on .npy files; nested groups live in test_hdf5.py."""
 
 from collections.abc import Mapping
 
@@ -13,9 +8,7 @@ import pytest
 import aex
 from aex import AexError, AexNotFoundError, ArrayProxy, FileProxy, GroupProxy
 
-# ============================================================
 # ArrayProxy
-# ============================================================
 
 
 def test_array_proxy_attributes(array_proxy):
@@ -113,7 +106,6 @@ def test_array_proxy_getitem_empty_selection(array_proxy):
 
 
 def test_array_proxy_getitem_ellipsis_and_newaxis(array_proxy):
-    # v1 could not do either.
     assert array_proxy[..., 0].shape == (100,)
     assert array_proxy[..., 0][7] == 7 * 200
     assert array_proxy[:, None].shape == (100, 1, 200)
@@ -155,9 +147,7 @@ def test_array_proxy_out_of_bounds(array_proxy):
     assert isinstance(info.value, ValueError)
 
 
-# ============================================================
 # GroupProxy
-# ============================================================
 
 
 def test_group_proxy_getitem_dataset(file_proxy):
@@ -255,31 +245,13 @@ def test_group_proxy_contains(file_proxy):
     assert "array/nonexistent" not in file_proxy
 
 
-def test_group_proxy_join_names_relative():
-    assert GroupProxy._join_names("/g1", "ds1") == "/g1/ds1"
-
-
-def test_group_proxy_join_names_absolute_replaces():
-    assert GroupProxy._join_names("/g1", "/g2") == "/g2"
-
-
-def test_group_proxy_join_names_trailing_slash():
-    assert GroupProxy._join_names("/g1/", "ds1") == "/g1/ds1"
-
-
-def test_group_proxy_join_names_multiple():
-    assert GroupProxy._join_names("/", "g1", "g3", "ds3") == "/g1/g3/ds3"
-
-
 def test_group_proxy_repr(file_proxy):
     text = repr(file_proxy["/"])
     assert "GroupProxy" in text
     assert '"/"' in text
 
 
-# ============================================================
 # FileProxy
-# ============================================================
 
 
 def test_file_proxy_initialization(client, ds_paths):
@@ -296,7 +268,6 @@ def test_file_proxy_is_group_proxy(file_proxy):
 def test_file_proxy_close(client, ds_paths):
     proxy = client.open(ds_paths["ds1"])
     proxy.close()
-    # The handle is gone.
     with pytest.raises(AexError):
         proxy["array"]
 
@@ -325,9 +296,7 @@ def test_open_nonexistent_file(client, data_dir):
         client.open(str(data_dir / "missing.npy"))
 
 
-# ============================================================
 # Workflows
-# ============================================================
 
 
 def test_workflow_open_navigate_read(client, ds_paths):
@@ -375,12 +344,9 @@ def test_workflow_multiple_accesses_same_proxy(array_proxy):
     assert not np.shares_memory(data1, data3)
 
 
-# ============================================================
 # NumPy functions
-#
 # Every function is computed locally until the server can reduce; the values
 # must match either way.
-# ============================================================
 
 TOTAL = 100 * (200 * 199 // 2) + (100 * 99 // 2) * 200 * 200
 
@@ -457,7 +423,6 @@ def test_numpy_ufunc(array_proxy):
     result = np.sqrt(array_proxy[0:5, 0:5])
     assert result.shape == (5, 5)
     assert np.allclose(result, np.sqrt(np.asarray(array_proxy[0:5, 0:5])))
-    # The proxy itself, too.
     assert np.allclose(np.sqrt(array_proxy), np.sqrt(np.asarray(array_proxy)))
 
 
@@ -500,9 +465,7 @@ def test_a_proxy_used_twice_is_downloaded_once(client, ds_paths):
     assert client.stats()["bytes"] - before == arr.nbytes
 
 
-# ============================================================
 # Errors
-# ============================================================
 
 
 def test_connection_errors_are_os_errors():

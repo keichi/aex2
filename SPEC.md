@@ -306,7 +306,7 @@ enum DataType {
     COMPLEX64 = 11; COMPLEX128 = 12; BOOL = 13;
 }
 
-message Dataset { DataType dtype = 1; int32 ndim = 2; repeated int64 shape = 3; }
+message Dataset { DataType dtype = 1; reserved 2; repeated int64 shape = 3; }  // 2 は旧 ndim (shape の長さと重複)
 message Group   {}
 
 message AttrArray { DataType dtype = 1; repeated int64 shape = 2; bytes data = 3; }
@@ -349,8 +349,8 @@ message Index {
         Fancy  fancy    = 3;   // arr[[1, 5, 10]]
         bool   ellipsis = 4;   // arr[...]
         bool   newaxis  = 5;   // arr[None]
-        Fancy  mask_true_indices = 6;  // boolean mask をクライアントで展開して送る
     }
+    reserved 6;   // 旧 mask_true_indices。boolean mask はクライアントが展開して fancy で送る
 }
 ```
 
@@ -481,7 +481,7 @@ message TransferPlan {
     uint32 codec        = 6;   // 実際に使う codec
     QualitySpec applied_quality = 7;
 
-    uint64 expires_unix_ms = 8;   // この時刻まで plan は有効。FETCH のたびに延長される (§6.9)
+    reserved 8;   // 旧 expires_unix_ms。読むクライアントがなかった。期限は §6.9 のとおりサーバが管理する
 
     // total_bytes <= inline_limit_bytes のとき、データ本体をここに入れて返す。
     // データプレーンを使わずに 1 RTT で完結させるための経路 (§5.6.2)。
@@ -609,7 +609,7 @@ message ApplyFunctionReply {
     DataType dtype = 1;
     repeated int64 shape = 2;
     bytes data = 3;                   // 結果が inline_limit 以下ならここに入る
-    optional TransferPlan plan = 4;   // 超える場合はデータプレーン経由 (将来)
+    reserved 4;                       // 旧 plan (超える場合のデータプレーン経由)。一度も送られなかった
 }
 ```
 
@@ -973,7 +973,6 @@ ScatterBuffer { ptr, len }  ← 複数スレッドが非重複領域に書くた
 
 ```rust
 pub trait ArrayFile: Send + Sync {
-    fn contains(&self, path: &str) -> bool;
     fn get_item(&self, path: &str) -> Result<Item>;
     fn list_children(&self, path: &str) -> Result<Vec<(String, Item)>>;
 

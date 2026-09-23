@@ -27,7 +27,6 @@ aex-wire = { path = "crates/aex-wire" }
 clap = { version = "4", features = ["derive"] }
 # Zarr's crc32c codec. Pure Rust.
 crc32c = "0.6"
-dashmap = "6"
 # zlib-rs: pure Rust and faster than the default miniz_oxide.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 getrandom = "0.4"
@@ -43,7 +42,6 @@ socket2 = { version = "0.6", features = ["all"] }
 sz3 = "0.4"
 thiserror = "2"
 tokio = "1"
-tokio-stream = { version = "0.1", features = ["net"] }
 toml = "1"
 tonic = "0.14"
 tonic-prost = "0.14"

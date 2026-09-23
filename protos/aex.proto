@@ -7,22 +7,16 @@ package aex.v2;
 // The bulk data itself never passes through here; it goes over the data plane's
 // raw TCP protocol, keyed by the request_id and ticket a TransferPlan carries.
 service AexControl {
-    // --- Sessions ---
-
     // Establishes a session and returns the data plane endpoint and the token
     // used to authenticate data connections.
     rpc Connect(ConnectRequest) returns (ConnectReply);
     // Drops the session: its files, its transfer plans and its data connections.
     rpc Disconnect(DisconnectRequest) returns (DisconnectReply);
 
-    // --- Files and metadata ---
-
     rpc OpenFile(OpenFileRequest) returns (OpenFileReply);
     rpc CloseFile(CloseFileRequest) returns (CloseFileReply);
     rpc GetItem(GetItemRequest) returns (Item);
     rpc ListChildren(ListChildrenRequest) returns (ItemList);
-
-    // --- Transfers ---
 
     // Resolves a selection and returns a plan for fetching it. A selection small
     // enough to fit the inline limit comes back with its data attached, so that
@@ -35,15 +29,9 @@ service AexControl {
     // evicted by LRU. An explicit release would add a round trip without making
     // anything more correct.
 
-    // --- Server-side compute ---
-
     // Reductions produce a handful of bytes, so the result is returned inline.
     rpc ApplyFunction(ApplyFunctionRequest) returns (ApplyFunctionReply);
 }
-
-// ---------------------------------------------------------------------------
-// Sessions
-// ---------------------------------------------------------------------------
 
 message ConnectRequest {
     uint32 protocol_version = 1;  // Data plane frame version; 1 in this release
@@ -78,10 +66,6 @@ message ConnectReply {
 message DisconnectRequest { bytes session_id = 1; }
 message DisconnectReply   {}
 
-// ---------------------------------------------------------------------------
-// Files and metadata
-// ---------------------------------------------------------------------------
-
 // The 14 element types AEX transfers. Values are shared with DType in aex-core.
 enum DataType {
     INT8 = 0; INT16 = 1; INT32 = 2; INT64 = 3;
@@ -92,7 +76,7 @@ enum DataType {
 
 message Dataset {
     DataType dtype = 1;
-    int32 ndim = 2;
+    reserved 2;  // ndim, which shape already says
     repeated int64 shape = 3;
 }
 
@@ -139,8 +123,7 @@ message OpenFileRequest {
     string format     = 3;  // Empty = infer from the extension
 }
 
-// A handle is an integer rather than v1's UUID string: it is compared and
-// hashed on every request, and neither should allocate.
+// An integer: compared and hashed on every request, which must not allocate.
 message OpenFileReply  { uint64 handle = 1; }
 
 message CloseFileRequest { bytes session_id = 1; uint64 handle = 2; }
@@ -148,10 +131,6 @@ message CloseFileReply   {}
 
 message GetItemRequest      { bytes session_id = 1; uint64 handle = 2; string name = 3; }
 message ListChildrenRequest { bytes session_id = 1; uint64 handle = 2; string name = 3; }
-
-// ---------------------------------------------------------------------------
-// Selections
-// ---------------------------------------------------------------------------
 
 message Slice {
     optional int64 start = 1;
@@ -168,15 +147,10 @@ message Index {
         Fancy fancy    = 3;  // arr[[1, 5, 10]]
         bool  ellipsis = 4;  // arr[...]
         bool  newaxis  = 5;  // arr[None]
-        // A boolean mask is expanded to integer indices by the client: a sparse
-        // mask can be larger on the wire than the selection it describes.
-        Fancy mask_true_indices = 6;
     }
+    // mask_true_indices. A mask goes as the fancy index it expands to.
+    reserved 6;
 }
-
-// ---------------------------------------------------------------------------
-// Quality
-// ---------------------------------------------------------------------------
 
 enum Encoding {
     EXACT       = 0;  // Lossless, and what everything falls back to
@@ -193,10 +167,6 @@ message QualitySpec {
     optional double abs_error_bound = 3;   // For ERROR_BOUND
     optional double rel_error_bound = 4;
 }
-
-// ---------------------------------------------------------------------------
-// Transfers
-// ---------------------------------------------------------------------------
 
 message PrepareSelectionRequest {
     bytes  session_id = 1;
@@ -218,9 +188,7 @@ message TransferPlan {
     uint32 codec       = 6;
     QualitySpec applied_quality = 7;
 
-    // Valid until this instant. Every FETCH pushes it further out, so a plan
-    // expires only if the client really did go quiet.
-    uint64 expires_unix_ms = 8;
+    reserved 8;  // expires_unix_ms, which no client read
 
     // Set when total_bytes fits the server's inline limit. The client is then
     // done: no ticket is issued and the data plane is not used at all.
@@ -261,10 +229,6 @@ message PlanError {
     string message = 2;  // Diagnostics for a human; never branch on it
 }
 
-// ---------------------------------------------------------------------------
-// Server-side compute
-// ---------------------------------------------------------------------------
-
 message IntTuple { repeated int64 values = 1; }
 
 message FunctionArgument {
@@ -291,6 +255,6 @@ message ApplyFunctionRequest {
 message ApplyFunctionReply {
     DataType dtype = 1;
     repeated int64 shape = 2;
-    bytes data = 3;                 // Set when the result fits the inline limit
-    optional TransferPlan plan = 4; // For results that do not; unused so far
+    bytes data = 3;  // Set when the result fits the inline limit
+    reserved 4;      // plan, for results that do not; never sent
 }

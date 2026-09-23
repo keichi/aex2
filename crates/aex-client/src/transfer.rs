@@ -1,11 +1,8 @@
 //! What a transfer is, and what comes back from one.
 //!
-//! The plan the control plane returns is the whole description of a transfer:
-//! a length, and either the data itself for something small or the identifiers
-//! the data plane needs. From there the client decides on its own how to cut
-//! the logical byte stream into chunks — the server neither knows nor cares,
-//! because the information that decides a good chunk size (how many
-//! connections, what the round trip and the bandwidth are) is all on this side.
+//! The plan is the whole description of a transfer: a length, and either the
+//! data itself or the identifiers the data plane needs. Chunking is the
+//! client's choice.
 
 use std::time::Duration;
 
@@ -13,6 +10,7 @@ use aex_core::{Codec, DType, QualitySpec};
 use aex_proto::convert::quality_from_proto;
 use aex_wire::{Ticket, TICKET_LEN};
 
+use crate::client::{nbytes, shape_from_proto};
 use crate::error::{ClientError, Result};
 
 /// A resolved selection, ready to fetch.
@@ -47,21 +45,13 @@ impl std::fmt::Debug for Plan {
 }
 
 impl Plan {
-    /// Read a plan off the wire.
     pub(crate) fn from_proto(
         plan: aex_proto::TransferPlan,
         requested_quality: &QualitySpec,
     ) -> Result<Self> {
         let dtype =
             DType::from_i32(plan.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
-        let shape = plan
-            .shape
-            .iter()
-            .map(|&n| {
-                u64::try_from(n)
-                    .map_err(|_| ClientError::Protocol(format!("negative axis length {n}")))
-            })
-            .collect::<Result<Vec<u64>>>()?;
+        let shape = shape_from_proto(&plan.shape)?;
 
         // A zero request_id is how the server says the data is attached; only
         // then is there no ticket.
@@ -102,8 +92,7 @@ impl Plan {
 
     /// Reject a plan that does not describe itself consistently.
     fn check(&self) -> Result<()> {
-        let elements: u64 = self.shape.iter().copied().product();
-        let expected = elements.saturating_mul(self.dtype.itemsize());
+        let expected = nbytes(&self.shape, self.dtype);
         if expected != self.total_bytes {
             return Err(ClientError::Protocol(format!(
                 "a plan for {:?} of {} says it is {} bytes, not {expected}",
@@ -143,8 +132,7 @@ pub struct TransferResult {
     pub elapsed: Duration,
     /// 0 for a transfer answered inline.
     pub chunks: u32,
-    /// Connections used. 0 for a transfer answered inline, which never touches
-    /// the data plane at all.
+    /// Connections used; 0 when answered inline.
     pub streams: u32,
     /// Fetches that had to be repeated.
     pub retries: u32,
@@ -164,11 +152,7 @@ impl TransferResult {
 
     /// Throughput in mebibytes per second, for benchmarks.
     pub fn throughput_mib_per_sec(&self) -> f64 {
-        let seconds = self.elapsed.as_secs_f64();
-        if seconds <= 0.0 {
-            return 0.0;
-        }
-        self.bytes as f64 / seconds / (1024.0 * 1024.0)
+        mib_per_sec(self.bytes, self.elapsed)
     }
 }
 
@@ -195,12 +179,16 @@ impl ClientStats {
     }
 
     pub fn throughput_mib_per_sec(&self) -> f64 {
-        let seconds = self.elapsed.as_secs_f64();
-        if seconds <= 0.0 {
-            return 0.0;
-        }
-        self.bytes as f64 / seconds / (1024.0 * 1024.0)
+        mib_per_sec(self.bytes, self.elapsed)
     }
+}
+
+fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 {
+        return 0.0;
+    }
+    bytes as f64 / seconds / (1024.0 * 1024.0)
 }
 
 /// An array fetched from a server, as raw bytes.
@@ -233,8 +221,7 @@ mod sealed {
 /// over the elements, which is only sound for a type where every bit pattern is
 /// a value. `bool` is the counterexample — a byte other than 0 or 1 in a Rust
 /// `bool` is undefined behaviour — and `float16` and the complex types have no
-/// std type to be. Those go through [`ArrayData`], and through numpy once the
-/// Python bindings exist.
+/// std type to be. Those go through [`ArrayData`] or numpy.
 pub trait Element: sealed::Sealed + Copy + Default {
     const DTYPE: DType;
 }

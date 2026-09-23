@@ -14,8 +14,7 @@ use crate::error::{AexError, Result};
 const LEVEL: flate2::Compression = flate2::Compression::new(6);
 
 pub(super) fn compress(_spec: &BlockSpec, src: &[u8], dst: &mut Vec<u8>) -> Result<()> {
-    // Appends, which is what puts the stream straight after the block header
-    // the caller has already written.
+    // Appends after the caller's block header.
     let mut encoder = flate2::write::DeflateEncoder::new(dst, LEVEL);
     encoder.write_all(src).map_err(refused)?;
     encoder.finish().map_err(refused)?;

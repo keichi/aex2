@@ -113,7 +113,7 @@ impl DecodeCache {
     // Measured: with a chunk the size of one fetch it never happens, with a
     // chunk sixteen times larger it is most of the decoding. Wait on an
     // in-flight decode when that case is worth serving.
-    pub fn get_or_decode(
+    fn get_or_decode(
         &self,
         key: ChunkKey,
         decode: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
@@ -126,6 +126,21 @@ impl DecodeCache {
         let chunk = Arc::new(decode(self.take_spare())?);
         self.insert(key, chunk.clone());
         Ok(chunk)
+    }
+
+    /// Copy the decoded chunk at `key` from `start` into `out`, decoding it
+    /// with `decode` on a miss.
+    pub fn read_into(
+        &self,
+        key: ChunkKey,
+        start: u64,
+        out: &mut [u8],
+        decode: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        let decoded = self.get_or_decode(key, decode)?;
+        let start = start as usize;
+        out.copy_from_slice(&decoded[start..start + out.len()]);
+        Ok(())
     }
 
     /// A buffer for the next decode: an evicted chunk's, or a new one.

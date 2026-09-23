@@ -26,10 +26,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # protoc generates the control plane code; prost-build does not bundle it.
-      # libhdf5 is for the hdf5 feature; cmake, a C++ compiler and libclang are
-      # for the sz and zfp features, which build SZ3 and zfp from source.
-      # --all-features turns them all on. macOS gets libclang from the Xcode
-      # command line tools.
+      # libhdf5 for hdf5; cmake, a C++ compiler and libclang build SZ3/zfp for sz and zfp
+      # (macOS: libclang from the Xcode CLT).
       - name: install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |

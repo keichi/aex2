@@ -7,8 +7,8 @@
 //! We never `mmap`: it would turn a truncation mid-transfer into SIGBUS, and
 //! page faults cannot keep the I/O queue deep on a cold cache.
 //!
-//! A `.npy` holds one array, which [`NpyFile`] presents as the hierarchy v1
-//! used: a root group with a single dataset named `array`.
+//! A `.npy` holds one array, which [`NpyFile`] presents as a root group with one
+//! dataset named `array`, as v1 clients expect.
 
 use std::fs::File;
 use std::io::Seek;
@@ -21,7 +21,7 @@ use crate::dtype::DType;
 use crate::error::{AexError, Result};
 use crate::selection::SelectionLayout;
 
-/// Name of the one dataset in a `.npy`, as v1 exposed it.
+/// The name of the one dataset in a `.npy`.
 pub const DATASET_NAME: &str = "array";
 
 /// A `.npy` file opened for reading.
@@ -34,7 +34,6 @@ pub const DATASET_NAME: &str = "array";
 /// so many connection threads can read one file at once.
 #[derive(Debug)]
 pub struct NpyDataset {
-    /// Read with `pread`, never mapped.
     file: File,
     /// First byte after the header; the base for every `pread`.
     data_offset: u64,
@@ -117,12 +116,10 @@ impl NpyDataset {
         })
     }
 
-    /// The element type.
     pub fn dtype(&self) -> DType {
         self.dtype
     }
 
-    /// Length of each axis.
     pub fn shape(&self) -> &[u64] {
         &self.shape
     }
@@ -137,17 +134,14 @@ impl NpyDataset {
         self.num_elements
     }
 
-    /// Length of the logical byte stream.
     pub fn data_len(&self) -> u64 {
         self.data_len
     }
 
-    /// Offset in the file where the data begins.
     pub fn data_offset(&self) -> u64 {
         self.data_offset
     }
 
-    /// File length as of open.
     pub fn file_len(&self) -> u64 {
         self.file_len
     }
@@ -230,10 +224,6 @@ impl NpyFile {
 }
 
 impl ArrayFile for NpyFile {
-    fn contains(&self, path: &str) -> bool {
-        matches!(normalize_path(path), "" | DATASET_NAME)
-    }
-
     fn get_item(&self, path: &str) -> Result<Item> {
         match normalize_path(path) {
             "" => Ok(Item::Group),
@@ -627,7 +617,7 @@ mod tests {
 
         // v1 exposed the array under both spellings of the path.
         for name in [DATASET_NAME, "/array", "/array/"] {
-            assert!(file.contains(name), "{name} must exist");
+            assert!(file.get_item(name).is_ok(), "{name} must exist");
             let Item::Dataset(dataset) = file.get_item(name).expect(name) else {
                 panic!("{name} must be a dataset");
             };
@@ -639,7 +629,7 @@ mod tests {
         }
 
         for root in ["", "/"] {
-            assert!(file.contains(root));
+            assert!(file.get_item(root).is_ok());
             assert!(matches!(file.get_item(root), Ok(Item::Group)));
             let children = file.list_children(root).expect("list root");
             assert_eq!(children.len(), 1);
@@ -654,7 +644,7 @@ mod tests {
         let (_dir, path) = write_npy(&bytes);
         let file = NpyFile::open(&path).expect("open");
 
-        assert!(!file.contains("data"));
+        assert!(!file.get_item("data").is_ok());
         let err = file.get_item("data").unwrap_err();
         assert!(matches!(err, AexError::NotFound(_)), "{err}");
         // The message has to say where the array actually is: "data" is what
@@ -689,8 +679,7 @@ mod tests {
 
     #[test]
     fn concurrent_reads_from_one_file_agree() {
-        // Many connection threads read one dataset at once, which works because
-        // pread carries no shared file position and read_range takes &self.
+        // Concurrent reads of one dataset.
         let builder = NpyBuilder::new("<f4", &[256, 64]).filled_payload(4);
         let expected = builder.payload.clone();
         let (_dir, path) = write_npy(&builder.build());

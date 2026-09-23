@@ -170,6 +170,8 @@ FETCH の中で止めた版は 776〜839 で、**先読みなしより 3 割遅�
 
 ## 再現方法
 
+`poolbench` と掃引スクリプトは削除した。再現するときはコミット `7ff1f07` を checkout する。
+
 ```console
 $ benchmarks/mdx2/sync.sh
 $ benchmarks/mdx2/fadvise-sweep.sh 5  | tee ~/fadvise.txt

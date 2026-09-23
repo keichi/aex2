@@ -11,10 +11,7 @@
 //! The codecs a chunk went through are listed in the order they were applied,
 //! so decoding runs the bytes-to-bytes ones backwards.
 //!
-//! A sharded array puts many chunks in one file with an index of where each
-//! one sits. That is the same problem twice over — a shard is a chunk of the
-//! array, an inner chunk is a chunk of the shard — so the walk is the same
-//! one, called inside itself.
+//! Sharded arrays reuse the chunk walk nested inside itself (see `chunks.rs`).
 //!
 //! Every path read here — a node's metadata as much as a chunk — goes through
 //! [`StoreRoot::under`], which resolves symlinks and refuses anything that
@@ -160,10 +157,6 @@ impl ZarrFile {
 }
 
 impl ArrayFile for ZarrFile {
-    fn contains(&self, path: &str) -> bool {
-        matches!(self.node(normalize_path(path)), Ok(Some(_)))
-    }
-
     fn get_item(&self, path: &str) -> Result<Item> {
         let path = normalize_path(path);
         match self.node(path)? {
@@ -317,7 +310,7 @@ impl ZarrArray {
         let name = meta.data_type.as_str().ok_or_else(|| {
             AexError::UnsupportedZarr(format!("{prefix}: only the core data types are served"))
         })?;
-        let dtype = dtype_of(name).ok_or_else(|| {
+        let dtype = DType::from_name(name).ok_or_else(|| {
             AexError::UnsupportedDType(format!("{prefix}: Zarr data type {name:?}"))
         })?;
 
@@ -408,18 +401,14 @@ impl ZarrArray {
                 let mut coords = Vec::new();
                 grid.walk(at, dst, |chunk, start, out| {
                     let key = self.key_of(grid, chunk as u64, &mut coords);
-                    let decoded =
-                        self.cache
-                            .get_or_decode((self.cache_key, chunk as u64), |spare| {
-                                let Some(path) = self.root.under(&key)? else {
-                                    return Ok(self.fill_chunk(grid.chunk_bytes(), spare));
-                                };
-                                let bytes = std::fs::read(&path)?;
-                                undo(&key, codecs, bytes, grid.chunk_bytes(), spare)
-                            })?;
-                    let start = start as usize;
-                    out.copy_from_slice(&decoded[start..start + out.len()]);
-                    Ok(())
+                    self.cache
+                        .read_into((self.cache_key, chunk as u64), start, out, |spare| {
+                            let Some(path) = self.root.under(&key)? else {
+                                return Ok(self.fill_chunk(grid.chunk_bytes(), spare));
+                            };
+                            let bytes = std::fs::read(&path)?;
+                            undo(&key, codecs, bytes, grid.chunk_bytes(), spare)
+                        })
                 })
             }
             Store::Sharded(sharded) => {
@@ -431,27 +420,25 @@ impl ZarrArray {
                     let key = self.key_of(&sharded.shards, shard as u64, &mut Vec::new());
                     sharded.inner.walk(in_shard, out, |chunk, start, out| {
                         let n = shard as u64 * per_shard + chunk as u64;
-                        let decoded = self.cache.get_or_decode((self.cache_key, n), |spare| {
-                            let entry = index[n as usize];
-                            if entry.is_missing() {
-                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
-                            }
-                            let Some(path) = self.root.under(&key)? else {
-                                return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
-                            };
-                            let mut bytes = vec![0u8; entry.nbytes as usize];
-                            File::open(&path)?.read_exact_at(&mut bytes, entry.offset)?;
-                            undo(
-                                &key,
-                                &sharded.codecs,
-                                bytes,
-                                sharded.inner.chunk_bytes(),
-                                spare,
-                            )
-                        })?;
-                        let start = start as usize;
-                        out.copy_from_slice(&decoded[start..start + out.len()]);
-                        Ok(())
+                        self.cache
+                            .read_into((self.cache_key, n), start, out, |spare| {
+                                let entry = index[n as usize];
+                                if entry.is_missing() {
+                                    return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
+                                }
+                                let Some(path) = self.root.under(&key)? else {
+                                    return Ok(self.fill_chunk(sharded.inner.chunk_bytes(), spare));
+                                };
+                                let mut bytes = vec![0u8; entry.nbytes as usize];
+                                File::open(&path)?.read_exact_at(&mut bytes, entry.offset)?;
+                                undo(
+                                    &key,
+                                    &sharded.codecs,
+                                    bytes,
+                                    sharded.inner.chunk_bytes(),
+                                    spare,
+                                )
+                            })
                     })
                 })
             }
@@ -829,27 +816,6 @@ fn flatten<'a>(
         }
         _ => false,
     }
-}
-
-/// The AEX type of a Zarr core data type name.
-fn dtype_of(name: &str) -> Option<DType> {
-    Some(match name {
-        "bool" => DType::Bool,
-        "int8" => DType::Int8,
-        "int16" => DType::Int16,
-        "int32" => DType::Int32,
-        "int64" => DType::Int64,
-        "uint8" => DType::Uint8,
-        "uint16" => DType::Uint16,
-        "uint32" => DType::Uint32,
-        "uint64" => DType::Uint64,
-        "float16" => DType::Float16,
-        "float32" => DType::Float32,
-        "float64" => DType::Float64,
-        "complex64" => DType::Complex64,
-        "complex128" => DType::Complex128,
-        _ => return None,
-    })
 }
 
 fn key_encoding(prefix: &str, named: &Option<Named>) -> Result<KeyEncoding> {
@@ -1948,7 +1914,7 @@ mod tests {
         let file = store.open().expect("open");
 
         // A name that walks out of the store never reaches the filesystem.
-        assert!(!file.contains("../../etc/passwd"));
+        assert!(!file.get_item("../../etc/passwd").is_ok());
         let err = file.get_item("../secret").expect_err("traversal");
         assert!(matches!(err, AexError::MalformedZarr(_)), "{err}");
 
@@ -1998,9 +1964,9 @@ mod tests {
         std::fs::create_dir_all(store.path().join("g1/loose")).expect("mkdir");
 
         let file = store.open().expect("open");
-        assert!(file.contains("g1/g2/deep"));
-        assert!(file.contains("/g1/g2/deep/"));
-        assert!(!file.contains("g1/loose"));
+        assert!(file.get_item("g1/g2/deep").is_ok());
+        assert!(file.get_item("/g1/g2/deep/").is_ok());
+        assert!(!file.get_item("g1/loose").is_ok());
         assert!(matches!(file.get_item("g1").expect("group"), Item::Group));
 
         let names: Vec<String> = file

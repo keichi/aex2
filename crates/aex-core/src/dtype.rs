@@ -46,7 +46,6 @@ pub const ALL_DTYPES: [DType; 14] = [
 ];
 
 impl DType {
-    /// Size of one element in bytes.
     pub const fn itemsize(self) -> u64 {
         match self {
             DType::Int8 | DType::Uint8 | DType::Bool => 1,
@@ -79,7 +78,6 @@ impl DType {
         }
     }
 
-    /// To the wire `DataType` value.
     pub const fn as_i32(self) -> i32 {
         self as i32
     }
@@ -103,6 +101,30 @@ impl DType {
             AexError::UnsupportedDType(format!("cannot parse descr {descr:?}: {e}"))
         })?;
         Self::from_type_str(&ts)
+    }
+
+    /// From numpy's name for the type, which is also Zarr's.
+    ///
+    /// Spelled out rather than a `descr`, where `i8` means eight bytes and not
+    /// eight bits.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "bool" => DType::Bool,
+            "int8" => DType::Int8,
+            "int16" => DType::Int16,
+            "int32" => DType::Int32,
+            "int64" => DType::Int64,
+            "uint8" => DType::Uint8,
+            "uint16" => DType::Uint16,
+            "uint32" => DType::Uint32,
+            "uint64" => DType::Uint64,
+            "float16" => DType::Float16,
+            "float32" => DType::Float32,
+            "float64" => DType::Float64,
+            "complex64" => DType::Complex64,
+            "complex128" => DType::Complex128,
+            _ => return None,
+        })
     }
 
     /// From an npyz type string.

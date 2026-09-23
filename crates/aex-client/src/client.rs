@@ -1,8 +1,5 @@
-//! The client.
-//!
-//! The API is blocking, with a tokio runtime kept inside. Callers are analysis
-//! code and, later, Python: neither wants to own a runtime, and the Python
-//! bindings will release the GIL around exactly these blocking calls.
+//! Blocking, with a tokio runtime kept inside: neither analysis code nor the
+//! Python bindings (which release the GIL around these calls) want to own one.
 //!
 //! Reading a selection costs one round trip when it is small enough to come
 //! back with its plan, and two when it is not. The second is the data plane,
@@ -32,8 +29,9 @@ use crate::error::{ClientError, Result};
 use crate::pool::{ConnSettings, DataPool, FetchPart, FetchSpec};
 use crate::transfer::{ArrayData, ClientStats, Element, Plan, TransferResult, TypedArray};
 
-/// The data plane frame version this client speaks.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The data plane frame version this client speaks, widened to the control
+/// plane's u32.
+pub const PROTOCOL_VERSION: u32 = aex_wire::PROTOCOL_VERSION as u32;
 
 /// A file opened on the server.
 ///
@@ -169,8 +167,7 @@ impl std::fmt::Debug for SessionInfo {
     }
 }
 
-/// Renders bytes as hex in debug output.
-struct HexBytes<'a>(&'a [u8]);
+pub(crate) struct HexBytes<'a>(pub(crate) &'a [u8]);
 
 impl std::fmt::Debug for HexBytes<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -181,8 +178,6 @@ impl std::fmt::Debug for HexBytes<'_> {
     }
 }
 
-/// A connected client.
-///
 /// Dropping one does not tell the server: a disconnect on a dead connection
 /// would block, and the session expires on its own idle timeout anyway. Call
 /// [`Client::disconnect`] to release it now.
@@ -283,9 +278,6 @@ impl Client {
             max_fancy_indices: aex_proto::convert::DEFAULT_MAX_FANCY_INDICES,
         };
 
-        // Opened now rather than at the first transfer, so that a data plane
-        // which cannot be reached is reported here, and so that the first large
-        // read does not pay for a handshake.
         let pool = DataPool::connect(
             ConnSettings {
                 host: session.data_endpoint.0.clone(),
@@ -385,12 +377,8 @@ impl Client {
         reply.items.iter().map(item_from_proto).collect()
     }
 
-    /// Read a selection into a buffer the caller owns.
-    ///
-    /// `dst` has to be exactly the length of the selection, which the caller
-    /// learns from the metadata or from a previous read. Taking the buffer
-    /// rather than returning one is the point: it is what lets the bytes go
-    /// from the kernel into a numpy array with nothing in between.
+    /// Read a selection into a buffer the caller owns, exactly the selection's
+    /// length.
     pub fn read_selection_into(
         &self,
         handle: FileHandle,
@@ -403,9 +391,6 @@ impl Client {
     }
 
     /// Read a selection, allocating for it.
-    ///
-    /// The bytes are the logical byte stream: C order, little-endian, exactly
-    /// as they travelled.
     pub fn read_selection(
         &self,
         handle: FileHandle,
@@ -460,9 +445,6 @@ impl Client {
     }
 
     /// Ask the server to resolve a selection, in one round trip.
-    ///
-    /// The plan says what the result will be, so the caller can allocate for
-    /// it before [`Client::fill`].
     pub fn prepare(&self, handle: FileHandle, name: &str, indices: &[Index]) -> Result<Plan> {
         self.prepare_selection(&Selection::exact(handle, name, indices))
     }
@@ -470,8 +452,6 @@ impl Client {
     /// [`Client::prepare`] with a quality to ask for. The plan says what the
     /// server applied.
     pub fn prepare_selection(&self, selection: &Selection<'_>) -> Result<Plan> {
-        // Checked here so that a selection too large to travel does not cost a
-        // round trip to be told so.
         check_fancy_limit(selection.indices, self.session.max_fancy_indices)
             .map_err(|e| ClientError::BadRequest(e.to_string()))?;
 
@@ -559,16 +539,8 @@ impl Client {
 
         let dtype =
             DType::from_i32(reply.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
-        let shape = reply
-            .shape
-            .iter()
-            .map(|&n| {
-                u64::try_from(n)
-                    .map_err(|_| ClientError::Protocol(format!("negative axis length {n}")))
-            })
-            .collect::<Result<Vec<u64>>>()?;
-        let expected = shape.iter().product::<u64>() * dtype.itemsize();
-        if reply.data.len() as u64 != expected {
+        let shape = shape_from_proto(&reply.shape)?;
+        if reply.data.len() as u64 != nbytes(&shape, dtype) {
             return Err(ClientError::Protocol(format!(
                 "a {dtype} result of shape {shape:?} came back as {} bytes",
                 reply.data.len()
@@ -581,12 +553,8 @@ impl Client {
         })
     }
 
-    /// Fill `dst` from a plan, preparing again once if the plan has gone.
-    ///
-    /// `dst` has to be exactly `plan.total_bytes` long. The selection is taken
-    /// again because a plan can be evicted while the client is still working
-    /// through its chunks, and then the client just asks for another one;
-    /// twice in a row would mean something other than eviction.
+    /// Fill `dst` (exactly `plan.total_bytes` long) from a plan. A plan evicted
+    /// mid-transfer is prepared again once; twice in a row is not eviction.
     pub fn fill(
         &self,
         plan: &Plan,
@@ -818,7 +786,6 @@ fn split_for_streams(chunk_bytes: u64, total_bytes: u64, streams: u32) -> u64 {
         .min(chunk_bytes)
 }
 
-/// Convert one item off the wire.
 fn item_from_proto(item: &aex_proto::Item) -> Result<(String, Item)> {
     let data = item
         .data
@@ -837,14 +804,6 @@ fn item_from_proto(item: &aex_proto::Item) -> Result<(String, Item)> {
             let dtype =
                 DType::from_i32(dataset.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
             let shape = shape_from_proto(&dataset.shape)?;
-            if dataset.ndim as usize != shape.len() {
-                return Err(ClientError::Protocol(format!(
-                    "dataset {:?} says it has {} dimensions but its shape has {}",
-                    item.name,
-                    dataset.ndim,
-                    shape.len()
-                )));
-            }
             Item::Dataset(DatasetInfo {
                 dtype,
                 shape,
@@ -855,7 +814,6 @@ fn item_from_proto(item: &aex_proto::Item) -> Result<(String, Item)> {
     Ok((item.name.clone(), converted))
 }
 
-/// Convert one attribute off the wire.
 fn attr_from_proto(attr: &aex_proto::Attribute) -> Result<(String, AttrValue)> {
     let value = attr
         .value
@@ -869,7 +827,7 @@ fn attr_from_proto(attr: &aex_proto::Attribute) -> Result<(String, AttrValue)> {
             let shape = shape_from_proto(&array.shape)?;
             // Nothing downstream can recover from a length that disagrees with
             // the type, so it is caught where the bytes arrive.
-            let expected = shape.iter().product::<u64>() * dtype.itemsize();
+            let expected = nbytes(&shape, dtype);
             if array.data.len() as u64 != expected {
                 return Err(ClientError::Protocol(format!(
                     "attribute {:?} is {} bytes, but {shape:?} of {dtype} is {expected}",
@@ -888,7 +846,7 @@ fn attr_from_proto(attr: &aex_proto::Attribute) -> Result<(String, AttrValue)> {
 }
 
 /// The wire carries shapes as int64, as numpy does.
-fn shape_from_proto(shape: &[i64]) -> Result<Vec<u64>> {
+pub(crate) fn shape_from_proto(shape: &[i64]) -> Result<Vec<u64>> {
     shape
         .iter()
         .map(|&n| {
@@ -898,7 +856,14 @@ fn shape_from_proto(shape: &[i64]) -> Result<Vec<u64>> {
         .collect()
 }
 
-/// Read a 16-byte identifier out of what the server sent.
+/// Bytes in an array of `shape` and `dtype`. Saturates rather than overflows,
+/// so a shape from a broken server is a length mismatch and not a panic.
+pub(crate) fn nbytes(shape: &[u64], dtype: DType) -> u64 {
+    shape
+        .iter()
+        .fold(dtype.itemsize(), |n, &axis| n.saturating_mul(axis))
+}
+
 fn as_16_bytes(bytes: &[u8], what: &str) -> Result<[u8; 16]> {
     bytes
         .try_into()
@@ -936,7 +901,6 @@ mod tests {
             name: "array".to_string(),
             data: Some(aex_proto::item::Data::Dataset(aex_proto::Dataset {
                 dtype: dtype.as_i32(),
-                ndim: shape.len() as i32,
                 shape,
             })),
             attrs: Vec::new(),
@@ -1084,16 +1048,6 @@ mod tests {
             item_from_proto(&dataset(DType::Int8, vec![-1])),
             Err(ClientError::Protocol(_))
         ));
-
-        // ndim disagreeing with the shape means the two were built separately.
-        let mut inconsistent = dataset(DType::Int8, vec![2, 3]);
-        if let Some(aex_proto::item::Data::Dataset(d)) = inconsistent.data.as_mut() {
-            d.ndim = 3;
-        }
-        assert!(matches!(
-            item_from_proto(&inconsistent),
-            Err(ClientError::Protocol(_))
-        ));
     }
 
     #[test]
@@ -1111,6 +1065,18 @@ mod tests {
             max_fancy_indices: 262_144,
         };
         let rendered = format!("{session:?}");
+        assert!(rendered.contains("abababab"), "{rendered}");
+        assert!(!rendered.contains("cdcdcdcd"), "{rendered}");
+        assert!(!rendered.contains("205"), "{rendered}");
+
+        let settings = ConnSettings {
+            host: "127.0.0.1".to_string(),
+            port: 50052,
+            session_id: [0xab; 16],
+            session_token: [0xcd; 16],
+            connect_timeout: std::time::Duration::from_secs(1),
+        };
+        let rendered = format!("{settings:?}");
         assert!(rendered.contains("abababab"), "{rendered}");
         assert!(!rendered.contains("cdcdcdcd"), "{rendered}");
         assert!(!rendered.contains("205"), "{rendered}");

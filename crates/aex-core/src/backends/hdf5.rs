@@ -108,11 +108,6 @@ impl std::fmt::Debug for Hdf5File {
 }
 
 impl ArrayFile for Hdf5File {
-    fn contains(&self, path: &str) -> bool {
-        let path = normalize_path(path);
-        path.is_empty() || self.file.loc_info_by_name(path).is_ok()
-    }
-
     fn get_item(&self, path: &str) -> Result<Item> {
         self.item(normalize_path(path))
     }
@@ -519,13 +514,10 @@ impl Chunked {
             } else if self.filters.is_empty() {
                 dataset.raw.read_exact_at(out, entry.addr + start)?;
             } else {
-                let decoded = self
-                    .cache
-                    .get_or_decode((self.cache_key, chunk as u64), |spare| {
+                self.cache
+                    .read_into((self.cache_key, chunk as u64), start, out, |spare| {
                         self.decode(&dataset.raw, entry, spare)
                     })?;
-                let start = start as usize;
-                out.copy_from_slice(&decoded[start..start + out.len()]);
             }
             Ok(())
         })
@@ -734,13 +726,8 @@ mod tests {
     use crate::quality::QualitySpec;
     use crate::selection::{Index, LayoutKind};
 
-    /// Open a fixture, retrying a refused file lock.
-    ///
-    /// libhdf5 takes a file lock when it opens a file. On macOS, with these
-    /// tests running in parallel, the lock is now and then still refused a
-    /// fraction of a millisecond after the writer closed its file — no other
-    /// process or descriptor holds it by then, and the next attempt succeeds.
-    /// Nothing outside the tests waits on it, so the retry lives here.
+    /// Open a fixture, retrying a file lock macOS now and then refuses just
+    /// after the writer closed, with tests in parallel.
     fn open(path: impl AsRef<Path>) -> Result<Hdf5File> {
         open_with(path, Arc::new(DecodeCache::new(1 << 20)))
     }
@@ -943,9 +930,9 @@ mod tests {
 
         let file = open(&path).unwrap();
         for p in ["", "/", "outer", "/outer/inner/", "outer/inner/a", "alias"] {
-            assert!(file.contains(p), "{p}");
+            assert!(file.get_item(p).is_ok(), "{p}");
         }
-        assert!(!file.contains("outer/missing"));
+        assert!(!file.get_item("outer/missing").is_ok());
         assert!(matches!(file.get_item("/outer").unwrap(), Item::Group));
         assert_eq!(read_all(&*dataset(&file, "/alias"), &[]).1, [3]);
 
@@ -1001,7 +988,7 @@ mod tests {
         assert!(status.success());
 
         let file = open(dir.path().join("t.h5")).unwrap();
-        assert!(!file.contains("leak"));
+        assert!(!file.get_item("leak").is_ok());
         assert!(matches!(
             file.get_item("leak").unwrap_err(),
             AexError::NotFound(_)
@@ -1317,7 +1304,7 @@ mod tests {
             .write_raw(&values)
             .unwrap();
 
-        // Both formats' first chunk used to be key (0, 0) in one cache.
+        // Each format's first chunk is its chunk 0; they must not share a cache key.
         let cache = Arc::new(DecodeCache::new(1 << 20));
         let zarr = crate::ZarrFile::open(&store, cache.clone()).unwrap();
         let file = open_with(&path, cache).unwrap();
@@ -1457,10 +1444,8 @@ mod tests {
             .unwrap();
         // A compound type has no dtype of ours, unless it is a complex number.
         attr(&ds, "pair", Pair { a: 1, b: 2.0 });
-        // Over the per-attribute cap. An attribute this big does not fit a
-        // default object header, and libhdf5 1.14 refuses to create one at
-        // all, so the cap goes unexercised wherever that is the case rather
-        // than failing a test over the writer's limits.
+        // Over the per-attribute cap. libhdf5 1.14 may refuse to write one this
+        // big, so it is skipped there.
         let huge = MAX_ATTR_BYTES as usize + 1;
         if let Ok(attr) = ds.new_attr::<u8>().shape([huge]).create("huge") {
             attr.write_raw(&vec![0u8; huge]).unwrap();

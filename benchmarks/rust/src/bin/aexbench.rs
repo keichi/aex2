@@ -137,9 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ratio = 0.0;
     let mut runs = Vec::with_capacity(cli.reps);
     for _ in 0..cli.reps {
-        // The prepare is inside the timing, as it was when this called
-        // read_selection_into, so the numbers stay comparable with the ones
-        // already in docs/.
+        // Prepare is timed too, to stay comparable with the numbers in docs/.
         let cpu = cpu_seconds();
         let started = Instant::now();
         let plan = client.prepare_selection(&selection)?;
@@ -225,8 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &runs,
     );
     if cli.abs_error > 0.0 {
-        // Printed only when something was compressed, so every existing sweep
-        // produces exactly the output it did before.
+        // Only when compressed, so exact sweeps keep their output format.
         println!(
             "  codec={:?} abs_error={} compressed {ratio:.2}x ({} -> {wire_bytes} bytes on the wire)",
             cli.codec, cli.abs_error, cli.bytes

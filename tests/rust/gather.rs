@@ -15,7 +15,6 @@ use support::{Fault, Proxy, TestServer};
 
 const ROW: usize = 2000;
 
-/// Rows `start..stop` of the counting grid.
 fn rows(start: i64, stop: i64) -> Vec<Index> {
     vec![Index::range(start, stop)]
 }

@@ -198,9 +198,7 @@ def test_threads_share_a_client(client, large):
     assert not errors
 
 
-# ============================================================
 # Fallback policy
-# ============================================================
 
 
 @pytest.fixture
@@ -247,9 +245,7 @@ def test_unknown_policy_is_rejected(policy):
         policy.set_fallback_policy("sometimes")
 
 
-# ============================================================
 # The buffer the extension writes into
-# ============================================================
 
 
 @pytest.fixture

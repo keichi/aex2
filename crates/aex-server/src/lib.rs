@@ -4,11 +4,6 @@
 //! meet at the transfer registry, which one writes and the other reads, and
 //! nowhere else. That separation is what keeps the bulk data out of protobuf
 //! encoding entirely.
-//!
-//! [`Server::bind`] takes both sockets before serving so that a caller — an
-//! integration test, say — can ask for port 0 and still learn where to connect.
-//! The data port is also what the control plane advertises, so binding it first
-//! is what lets that advertisement be true.
 
 pub mod config;
 pub mod control;
@@ -26,8 +21,7 @@ use std::time::Duration;
 
 use aex_proto::aex_control_server::AexControlServer;
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
-use tokio_stream::StreamExt;
+use tonic::transport::server::TcpIncoming;
 
 pub use crate::config::ServerConfig;
 use crate::control::ControlService;
@@ -135,18 +129,9 @@ impl Server {
             .max_decoding_message_size(config.limits.grpc_max_message_bytes)
             .max_encoding_message_size(config.limits.grpc_max_message_bytes);
 
-        // The listener is ours, so tonic's own tcp_nodelay never reaches these
-        // sockets and Nagle holds the tail of a reply until the client's ACK.
-        // That costs every selection answered inline a second round trip,
-        // which is the one thing the inline path exists to avoid.
-        let incoming = TcpListenerStream::new(control).map(|accepted| {
-            if let Ok(stream) = &accepted {
-                if let Err(e) = stream.set_nodelay(true) {
-                    tracing::warn!("cannot disable Nagle on a control connection: {e}");
-                }
-            }
-            accepted
-        });
+        // Our own listener bypasses the builder's tcp_nodelay; without it
+        // Nagle adds a round trip to every inline reply.
+        let incoming = TcpIncoming::from(control).with_nodelay(Some(true));
 
         let result = tonic::transport::Server::builder()
             .add_service(service)
