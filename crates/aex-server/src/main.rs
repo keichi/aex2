@@ -1,5 +1,3 @@
-//! The `aex-server` binary.
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 

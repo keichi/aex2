@@ -7,22 +7,16 @@ package aex.v2;
 // The bulk data itself never passes through here; it goes over the data plane's
 // raw TCP protocol, keyed by the request_id and ticket a TransferPlan carries.
 service AexControl {
-    // --- Sessions ---
-
     // Establishes a session and returns the data plane endpoint and the token
     // used to authenticate data connections.
     rpc Connect(ConnectRequest) returns (ConnectReply);
     // Drops the session: its files, its transfer plans and its data connections.
     rpc Disconnect(DisconnectRequest) returns (DisconnectReply);
 
-    // --- Files and metadata ---
-
     rpc OpenFile(OpenFileRequest) returns (OpenFileReply);
     rpc CloseFile(CloseFileRequest) returns (CloseFileReply);
     rpc GetItem(GetItemRequest) returns (Item);
     rpc ListChildren(ListChildrenRequest) returns (ItemList);
-
-    // --- Transfers ---
 
     // Resolves a selection and returns a plan for fetching it. A selection small
     // enough to fit the inline limit comes back with its data attached, so that
@@ -35,15 +29,9 @@ service AexControl {
     // evicted by LRU. An explicit release would add a round trip without making
     // anything more correct.
 
-    // --- Server-side compute ---
-
     // Reductions produce a handful of bytes, so the result is returned inline.
     rpc ApplyFunction(ApplyFunctionRequest) returns (ApplyFunctionReply);
 }
-
-// ---------------------------------------------------------------------------
-// Sessions
-// ---------------------------------------------------------------------------
 
 message ConnectRequest {
     uint32 protocol_version = 1;  // Data plane frame version; 1 in this release
@@ -77,10 +65,6 @@ message ConnectReply {
 
 message DisconnectRequest { bytes session_id = 1; }
 message DisconnectReply   {}
-
-// ---------------------------------------------------------------------------
-// Files and metadata
-// ---------------------------------------------------------------------------
 
 // The 14 element types AEX transfers. Values are shared with DType in aex-core.
 enum DataType {
@@ -139,8 +123,7 @@ message OpenFileRequest {
     string format     = 3;  // Empty = infer from the extension
 }
 
-// A handle is an integer rather than v1's UUID string: it is compared and
-// hashed on every request, and neither should allocate.
+// An integer: compared and hashed on every request, which must not allocate.
 message OpenFileReply  { uint64 handle = 1; }
 
 message CloseFileRequest { bytes session_id = 1; uint64 handle = 2; }
@@ -148,10 +131,6 @@ message CloseFileReply   {}
 
 message GetItemRequest      { bytes session_id = 1; uint64 handle = 2; string name = 3; }
 message ListChildrenRequest { bytes session_id = 1; uint64 handle = 2; string name = 3; }
-
-// ---------------------------------------------------------------------------
-// Selections
-// ---------------------------------------------------------------------------
 
 message Slice {
     optional int64 start = 1;
@@ -173,10 +152,6 @@ message Index {
     reserved 6;
 }
 
-// ---------------------------------------------------------------------------
-// Quality
-// ---------------------------------------------------------------------------
-
 enum Encoding {
     EXACT       = 0;  // Lossless, and what everything falls back to
     DTYPE_CAST  = 1;  // float64 -> float32, or float32 -> float16
@@ -192,10 +167,6 @@ message QualitySpec {
     optional double abs_error_bound = 3;   // For ERROR_BOUND
     optional double rel_error_bound = 4;
 }
-
-// ---------------------------------------------------------------------------
-// Transfers
-// ---------------------------------------------------------------------------
 
 message PrepareSelectionRequest {
     bytes  session_id = 1;
@@ -257,10 +228,6 @@ message PlanError {
     ErrorClass klass = 1;
     string message = 2;  // Diagnostics for a human; never branch on it
 }
-
-// ---------------------------------------------------------------------------
-// Server-side compute
-// ---------------------------------------------------------------------------
 
 message IntTuple { repeated int64 values = 1; }
 

@@ -26,7 +26,6 @@ use aex_core::{Codec, Encoding, ErrorClass};
 
 use crate::error::{Result, WireError};
 
-/// Size of every frame header.
 pub const HEADER_LEN: usize = 32;
 
 /// Size of the ticket a `FETCH` carries as its payload.
@@ -73,7 +72,6 @@ impl FrameType {
     }
 }
 
-/// The header every frame starts with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     pub frame_type: FrameType,
@@ -279,7 +277,6 @@ pub fn write_frame(w: &mut impl Write, header: &FrameHeader, payload: &[u8]) -> 
     Ok(())
 }
 
-/// Read one header.
 pub fn read_frame_header(r: &mut impl Read) -> Result<FrameHeader> {
     let mut bytes = [0u8; HEADER_LEN];
     r.read_exact(&mut bytes)?;

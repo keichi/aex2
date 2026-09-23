@@ -24,10 +24,8 @@ pub const MAGIC: [u8; 8] = *b"AEXDATA\x01";
 /// The data plane protocol version this build speaks.
 pub const PROTOCOL_VERSION: u16 = 2;
 
-/// Size of a `HELLO`.
 pub const HELLO_LEN: usize = 48;
 
-/// Size of a `READY`.
 pub const READY_LEN: usize = 16;
 
 /// Client to server, once per connection.

@@ -4,11 +4,6 @@
 //! meet at the transfer registry, which one writes and the other reads, and
 //! nowhere else. That separation is what keeps the bulk data out of protobuf
 //! encoding entirely.
-//!
-//! [`Server::bind`] takes both sockets before serving so that a caller — an
-//! integration test, say — can ask for port 0 and still learn where to connect.
-//! The data port is also what the control plane advertises, so binding it first
-//! is what lets that advertisement be true.
 
 pub mod config;
 pub mod control;
@@ -134,10 +129,8 @@ impl Server {
             .max_decoding_message_size(config.limits.grpc_max_message_bytes)
             .max_encoding_message_size(config.limits.grpc_max_message_bytes);
 
-        // The listener is ours, so the builder's tcp_nodelay never reaches
-        // these sockets and Nagle holds the tail of a reply until the client's
-        // ACK. That costs every selection answered inline a second round trip,
-        // which is the one thing the inline path exists to avoid.
+        // Our own listener bypasses the builder's tcp_nodelay; without it
+        // Nagle adds a round trip to every inline reply.
         let incoming = TcpIncoming::from(control).with_nodelay(Some(true));
 
         let result = tonic::transport::Server::builder()

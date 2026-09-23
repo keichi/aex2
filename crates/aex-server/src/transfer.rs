@@ -5,17 +5,11 @@
 //! holds a lock while transferring: a thread takes its `Arc` out of the map and
 //! lets the map go.
 //!
-//! There is no RPC to release a plan. Releasing on the critical path would cost
-//! a round trip, and off it would only free memory slightly sooner; an entry is
-//! small — an `Arc` to the dataset and the resolved layout — and the count is
-//! capped per session. So plans go three ways: they expire, they are evicted
-//! when a session has too many, or the session ends.
+//! Plans are never released explicitly; they expire, are evicted past the
+//! per-session cap, or go with their session.
 //!
-//! The TTL is pushed out on every `FETCH` rather than fixed at issue. A fixed
-//! deadline would make a transfer that legitimately takes longer than the TTL —
-//! a large selection over a slow link, or off a cold cache — fail every single
-//! time. Extending it means a plan expires only when the client really did go
-//! quiet, which is what the setting is supposed to mean.
+//! The TTL counts idle time and is pushed out on every `FETCH`, so a long
+//! transfer never expires mid-flight.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -51,7 +45,6 @@ impl std::fmt::Debug for TransferEntry {
 }
 
 impl TransferEntry {
-    /// Identifies this transfer on the data plane.
     pub fn request_id(&self) -> u32 {
         self.request_id
     }
@@ -255,12 +248,8 @@ impl TransferRegistry {
         ids.len()
     }
 
-    /// Drop plans nobody has fetched within the TTL, and plans whose session is
-    /// gone.
-    ///
-    /// A session that timed out rather than disconnecting takes its plans with
-    /// it here, which is why this needs to be told which sessions are still
-    /// live.
+    /// Drop plans idle past the TTL, and plans whose session is gone (timed
+    /// out rather than disconnected).
     pub fn sweep(&self, is_live: impl Fn(&SessionId) -> bool) -> usize {
         self.sweep_at(self.now_ms(), is_live)
     }

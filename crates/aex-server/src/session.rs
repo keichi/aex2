@@ -2,7 +2,7 @@
 //!
 //! A session is what a client authenticates with, what its data connections
 //! will present a token for, and what bounds the server's memory: every file
-//! handle and, from M2, every transfer plan hangs off one.
+//! handle and transfer plan hangs off one.
 //!
 //! Idle sessions are collected two ways. A request that names an expired
 //! session fails on the spot, and a sweep drops the ones nobody asks about, so
@@ -18,16 +18,12 @@ use aex_core::ArrayFile;
 use crate::config::{ServerConfig, DEFAULT_STREAMS};
 use crate::error::{Result, ServerError};
 
-/// A session identifier: 16 bytes, as on the wire.
 pub type SessionId = [u8; 16];
 
 /// Authenticates a data connection as belonging to a session.
 pub type SessionToken = [u8; 16];
 
 /// The files one session has open.
-///
-/// Handles are integers rather than v1's UUID strings: they are hashed and
-/// compared on every request, and neither should allocate.
 pub struct FileRegistry {
     files: Mutex<HashMap<u64, Arc<dyn ArrayFile>>>,
     next_handle: AtomicU64,
@@ -55,14 +51,12 @@ impl FileRegistry {
         self.files.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Register an open file and return its handle.
     pub fn insert(&self, file: Arc<dyn ArrayFile>) -> u64 {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.files().insert(handle, file);
         handle
     }
 
-    /// The file behind a handle.
     pub fn get(&self, handle: u64) -> Result<Arc<dyn ArrayFile>> {
         self.files()
             .get(&handle)
@@ -88,7 +82,6 @@ impl FileRegistry {
     }
 }
 
-/// One client's session.
 #[derive(Debug)]
 pub struct Session {
     id: SessionId,
@@ -125,10 +118,8 @@ impl Session {
     }
 
     /// Count a data connection in, refusing one past what was granted.
-    ///
-    /// A client that opens more than it was told it may is not malicious so
-    /// much as mistaken, and the condition clears as its other connections
-    /// close, so this is reported as temporary rather than as a refusal.
+    /// Reported as transient: it clears as the session's other connections
+    /// close.
     pub fn open_data_conn(&self) -> Result<()> {
         let mut open = self.data_conns.load(Ordering::Relaxed);
         loop {
@@ -155,7 +146,6 @@ impl Session {
         self.data_conns.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Data connections currently open.
     pub fn data_conns(&self) -> u32 {
         self.data_conns.load(Ordering::Relaxed)
     }

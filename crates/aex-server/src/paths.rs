@@ -42,7 +42,6 @@ impl PathPolicy {
         Ok(PathPolicy { roots: resolved })
     }
 
-    /// The resolved roots.
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
     }

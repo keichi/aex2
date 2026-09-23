@@ -1,4 +1,4 @@
-//! The data plane: raw TCP, two dedicated threads per connection.
+//! The data plane: raw TCP, one dedicated thread per connection.
 //!
 //! Reading a regular file has no true asynchronous form on Linux or macOS —
 //! `O_NONBLOCK` does not apply to it, and epoll and kqueue always report it
@@ -6,19 +6,9 @@
 //! An async runtime here would therefore not save a thread, so the connections
 //! get real ones and the control plane keeps tokio to itself.
 //!
-//! Each connection has two: one reading ([`crate::reader`]) and one writing.
-//! Doing both in turn on one thread leaves the disk idle while the socket works
-//! and the socket idle while the disk works, and for data that does not fit in
-//! memory that is most of the throughput.
-//!
 //! A connection carries no state past the handshake. Any connection may serve
 //! any fetch of its session, which is what later makes work stealing, parallel
 //! streams and re-fetching a lost chunk all fall out for free.
-//!
-//! Nothing is encrypted and no user is identified here. The session token
-//! proves which session a connection belongs to, and the ticket in each `FETCH`
-//! proves which transfers it may read; who may open which file was settled by
-//! the control plane before any of this existed.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -55,7 +45,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What to do after handling a frame.
 enum Disposition {
-    /// Keep serving this connection.
     Continue,
     /// Hang up. Used where continuing would mean talking to a peer that has
     /// already proved it is not following the protocol.
@@ -77,10 +66,8 @@ struct Context {
 }
 
 impl DataPlane {
-    /// Take the socket.
-    ///
-    /// Separate from serving so that a caller can bind port 0 and still learn
-    /// where to connect, which is also what the control plane advertises.
+    /// Take the socket; separate from serving so a caller binding port 0
+    /// learns the real port before advertising it.
     pub fn bind(
         config: Arc<ServerConfig>,
         sessions: Arc<SessionRegistry>,
@@ -335,8 +322,6 @@ fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) 
             }
         };
 
-        // Any activity keeps the session alive, so a transfer in progress
-        // cannot be cut off by the control plane's idle timeout.
         context.sessions.touch(session);
 
         match handle_frame(stream, &header, session, context, &mut reader, &mut packed)? {
@@ -363,10 +348,8 @@ fn handle_frame(
         // A reply to a ping this server sent. Nothing to do but note that the
         // peer is alive, which reading the frame already did.
         FrameType::Pong => Ok(Disposition::Continue),
-        // Server-to-client frames arriving from a client mean the two
-        // implementations disagree about who says what. That is wrong with the
-        // connection rather than with any one fetch, so it is reported against
-        // no transfer at all.
+        // A server-to-client frame from a client: the connection is at fault,
+        // not a fetch.
         other => {
             let e = ServerError::Protocol(format!("{other:?} is not a frame a client may send"));
             send_error(stream, None, ErrorClass::Protocol, &e)?;
@@ -450,8 +433,6 @@ fn handle_fetch(
         return Ok(Disposition::Continue);
     }
 
-    // The pieces go as separate DATA frames; a fetch and a frame were never
-    // required to be the same size, and this is what that is for.
     let served = reader.serve(
         &entry,
         header.offset,
@@ -514,13 +495,9 @@ fn send_piece(
     Ok(())
 }
 
-/// Report a failure against the fetch that caused it, or against the
-/// connection when no fetch can be blamed.
-///
-/// The reply names that fetch — its transfer, offset and length — so that the
-/// client can put exactly that chunk back on its queue rather than starting the
-/// transfer again. A transfer is numbered from 1, so 0 says the trouble is with
-/// the connection itself rather than with anything that was asked for.
+/// Report a failure against the fetch that caused it, so the client can
+/// requeue just that chunk, or against the connection (request 0) when no
+/// fetch is to blame.
 fn send_error(
     stream: &mut TcpStream,
     fetch: Option<&FrameHeader>,

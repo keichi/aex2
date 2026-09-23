@@ -1,13 +1,7 @@
 //! The gRPC control plane.
 //!
-//! It decides *what* to send: sessions, files, metadata, and the resolution of
-//! a selection into a transfer plan. The bulk data never passes through here.
-//!
-//! A selection small enough to fit the inline limit is answered with its data
-//! attached instead of a plan. Without that path, a small interactive read
-//! would cost two round trips where v1 needed one, and making a small read
-//! slower in order to make a large one faster is the wrong trade for a system
-//! whose main complaint about v1 is latency.
+//! A selection under the inline limit is answered with its data attached, so a
+//! small interactive read costs one round trip, not two.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -179,13 +173,8 @@ impl ControlService {
         };
 
         let indices = indices_from_proto(&request.indices, self.config.limits.max_fancy_indices)?;
-        // What the client asked for, and what this server can actually do. The
-        // difference goes back in the plan rather than being an error, so that
-        // a newer client still gets its data.
         let mut requested = quality_from_proto(request.requested_quality.as_ref());
-        // The codec does not travel inside the proto QualitySpec; it has a
-        // field of its own, which is where a client names one of the several
-        // codecs that can carry an error bound.
+        // The codec has its own request field, outside QualitySpec.
         requested.codec = Codec::from_u32(request.requested_codec);
         let applied = requested.applied(dataset.dtype());
         // Which is RAW unless a codec this build has was named, and the same
@@ -262,9 +251,7 @@ impl AexControl for ControlService {
         Ok(Response::new(ConnectReply {
             session_id: session.id().to_vec(),
             session_token: session.token().to_vec(),
-            // One endpoint, and an empty host so the client reuses the address
-            // it already reached the control plane on. The server cannot know
-            // how the client addresses it through a NAT or a container.
+            // Empty host by default: the client reuses the control plane's address.
             endpoints: vec![DataEndpoint {
                 host: self.config.data_advertise_host.clone(),
                 port: self.data_port as u32,

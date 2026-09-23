@@ -1,14 +1,4 @@
 //! Between the generated types and the core ones.
-//!
-//! Both sides of the control plane convert the same things in opposite
-//! directions, so the mapping lives once and is tested once. Two independent
-//! copies of it is how a client comes to send what a server reads as something
-//! else.
-//!
-//! Quality is the asymmetric part. A client asks for an encoding; a server that
-//! cannot produce it falls back to `EXACT` and reports what it applied. So an
-//! encoding this build cannot even name is read as `EXACT` rather than
-//! refused — it could not have been applied either way, and the reply says so.
 
 use aex_core::{AexError, DType, Encoding, Index, QualitySpec, Result};
 
@@ -21,16 +11,11 @@ use crate::{index, Fancy, Slice};
 /// refuses what is over its own limit.
 pub const DEFAULT_MAX_FANCY_INDICES: u64 = 262_144;
 
-/// Convert a selection for the wire.
 pub fn indices_to_proto(indices: &[Index]) -> Vec<crate::Index> {
     indices.iter().map(index_to_proto).collect()
 }
 
 /// Convert a selection off the wire, refusing one bigger than `max_fancy`.
-///
-/// The limit is checked on both sides: the server has to enforce it, and the
-/// client checks before sending so that an oversized selection does not cost a
-/// round trip to find out.
 pub fn indices_from_proto(indices: &[crate::Index], max_fancy: u64) -> Result<Vec<Index>> {
     indices
         .iter()
