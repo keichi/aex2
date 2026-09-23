@@ -48,10 +48,6 @@ STREAMS=(4 8 16 24)
 BYTES=$((1 << 30))
 PORT=50191    # aex.toml
 
-restore() {
-    clear_rtt
-    set_buffers default
-}
 trap restore EXIT
 
 # run <label> <aexbench flags...>

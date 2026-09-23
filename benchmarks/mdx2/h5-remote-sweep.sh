@@ -52,10 +52,6 @@ HS="HS_USERNAME=test HS_PASSWORD=test HS_BUCKET=${HS_BUCKET:-hsds}"
 PY=".venv/bin/python -u benchmarks/mdx2/read-procs.py"
 ELEMENTS=$((1 << 30))
 
-restore() {
-    clear_rtt
-    set_buffers default
-}
 trap restore EXIT
 
 set_buffers tuned

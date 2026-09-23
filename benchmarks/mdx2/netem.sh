@@ -2,7 +2,8 @@
 #
 # Half the delay goes on each side, so ACKs are late too, and only traffic to
 # the peer is delayed, so ssh stays fast. Source this, then call set_rtt; the
-# caller's EXIT trap has to call clear_rtt, or the VMs keep the delay.
+# caller's EXIT trap has to call clear_rtt (or restore), or the VMs keep the
+# delay.
 
 SERVER=${SERVER:-aex2-eval1} SERVER_IP=${SERVER_IP:-192.168.100.207}
 CLIENT=${CLIENT:-aex2-eval2} CLIENT_IP=${CLIENT_IP:-192.168.101.235}
@@ -60,6 +61,12 @@ set_buffers() {
         ssh "$h" "sudo sysctl -q -w net.ipv4.tcp_rmem='$rmem' net.ipv4.tcp_wmem='$wmem' \
             net.core.rmem_max=$core net.core.wmem_max=$core"
     done
+}
+
+# Undo set_rtt and set_buffers, for a sweep's `trap restore EXIT`.
+restore() {
+    clear_rtt
+    set_buffers default
 }
 
 # Cached ssthresh from the previous run would skip slow start.

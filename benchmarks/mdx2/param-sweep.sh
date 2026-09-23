@@ -33,10 +33,6 @@ CREDITS=(1 2 4 8 16 64)
 BYTES=$((4 << 30))
 PORT_DEFAULT=50191    # aex.toml
 
-restore() {
-    clear_rtt
-    set_buffers default
-}
 trap restore EXIT
 
 # run <port> <label> <aexbench flags...>

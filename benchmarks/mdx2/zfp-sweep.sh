@@ -53,10 +53,6 @@ DROOP_BOUND=0.001
 BYTES=$((1 << 30))
 PORT=50191    # aex.toml
 
-restore() {
-    clear_rtt
-    set_buffers default
-}
 trap restore EXIT
 
 # run <label> <aexbench flags...>

@@ -23,10 +23,6 @@ RTTS=(0 5 25 100)
 STORES=(mem.npy mem-noisy.zarr mem.zarr)
 . "$(dirname "$0")/netem.sh"
 
-restore() {
-    clear_rtt
-    set_buffers default
-}
 trap restore EXIT
 
 set_buffers tuned

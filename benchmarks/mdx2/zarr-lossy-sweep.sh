@@ -46,10 +46,6 @@ ELEMENTS=${ELEMENTS:-$((1 << 28))}    # 1 GiB, as the SZ3 measurement used
 # 1.0 is coarse and 1e-3 is not.
 IFS="|" read -r -a QUALITIES <<< "${QUALITIES:-|--codec gzip|--abs-error 0.001|--abs-error 0.01|--abs-error 1.0}"
 
-restore() {
-    clear_rtt
-    set_buffers default
-}
 trap restore EXIT
 
 point() {
