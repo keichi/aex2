@@ -36,7 +36,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::config::ServerConfig;
 use crate::error::{Result, ServerError};
-use crate::reader::{Piece, ReadPipeline};
+use crate::reader::FetchReader;
 use crate::session::{Session, SessionId, SessionRegistry};
 use crate::transfer::TransferRegistry;
 
@@ -317,7 +317,7 @@ fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) 
     let idle = Duration::from_secs(context.config.limits.data_conn_idle_timeout_sec);
     // The buffer is allocated here and reused for the life of the connection,
     // so a transfer in progress allocates nothing.
-    let pipeline = ReadPipeline::start(context.config.transfer.read_buffer_bytes as usize);
+    let mut reader = FetchReader::new(context.config.transfer.read_buffer_bytes as usize);
     // Where a block is compressed before it goes out. Empty for a transfer
     // that is not encoded, and reused for the life of the connection.
     let mut packed = Vec::new();
@@ -339,7 +339,7 @@ fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) 
         // cannot be cut off by the control plane's idle timeout.
         context.sessions.touch(session);
 
-        match handle_frame(stream, &header, session, context, &pipeline, &mut packed)? {
+        match handle_frame(stream, &header, session, context, &mut reader, &mut packed)? {
             Disposition::Continue => {}
             Disposition::Close => return Ok(()),
         }
@@ -351,11 +351,11 @@ fn handle_frame(
     header: &FrameHeader,
     session: &SessionId,
     context: &Context,
-    pipeline: &ReadPipeline,
+    reader: &mut FetchReader,
     packed: &mut Vec<u8>,
 ) -> Result<Disposition> {
     match header.frame_type {
-        FrameType::Fetch => handle_fetch(stream, header, session, context, pipeline, packed),
+        FrameType::Fetch => handle_fetch(stream, header, session, context, reader, packed),
         FrameType::Ping => {
             write_frame(stream, &FrameHeader::bare(FrameType::Pong), &[])?;
             Ok(Disposition::Continue)
@@ -380,7 +380,7 @@ fn handle_fetch(
     header: &FrameHeader,
     session: &SessionId,
     context: &Context,
-    pipeline: &ReadPipeline,
+    reader: &mut FetchReader,
     packed: &mut Vec<u8>,
 ) -> Result<Disposition> {
     if header.wire_len != TICKET_LEN as u64 {
@@ -450,37 +450,32 @@ fn handle_fetch(
         return Ok(Disposition::Continue);
     }
 
-    // Hand the range to the reader and write out each piece as it arrives. The
-    // pieces go as separate DATA frames; a fetch and a frame were never
+    // The pieces go as separate DATA frames; a fetch and a frame were never
     // required to be the same size, and this is what that is for.
-    pipeline.request(entry.clone(), header.offset, header.logical_len);
-    loop {
-        match pipeline.next_piece() {
-            Piece::Data { offset, bytes, len } => {
-                let sent = send_piece(
-                    stream,
-                    header.request_id,
-                    entry.layout(),
-                    offset,
-                    &bytes[..len],
-                    packed,
-                );
-                pipeline.recycle(bytes);
-                sent?;
-            }
-            Piece::Done => break,
-            Piece::Failed(e) => {
-                // Whatever went out before this stands; the client abandons the
-                // fetch on the error and asks for the same range again, which
-                // is always safe because a fetch names what it wants.
-                let class = e.class();
-                send_error(stream, header, class, &e)?;
-                return Ok(Disposition::Continue);
-            }
-        }
-        // A large fetch off a cold cache takes a while, and the plan must not
-        // expire out from under the reply it is still sending.
-        context.transfers.touch(&entry);
+    let served = reader.serve(
+        &entry,
+        header.offset,
+        header.logical_len,
+        |offset, bytes| {
+            send_piece(
+                stream,
+                header.request_id,
+                entry.layout(),
+                offset,
+                bytes,
+                packed,
+            )?;
+            // A large fetch off a cold cache takes a while, and the plan must not
+            // expire out from under the reply it is still sending.
+            context.transfers.touch(&entry);
+            Ok::<_, ServerError>(())
+        },
+    )?;
+    if let Err(e) = served {
+        // Whatever went out before this stands; the client abandons the fetch
+        // on the error and asks for the same range again, which is always safe
+        // because a fetch names what it wants.
+        send_error(stream, header, e.class(), &e)?;
     }
 
     Ok(Disposition::Continue)

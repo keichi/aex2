@@ -18,47 +18,9 @@
 //! exactly this reason: what a fetch asks for and what one frame carries were
 //! never required to be the same thing.
 
-use std::cell::RefCell;
-use std::sync::Arc;
-
 use aex_core::{AexError, SelectionLayout};
 
 use crate::transfer::TransferEntry;
-
-/// A range of one transfer, for the reader to produce.
-///
-/// The offset and the length are walked forward as pieces come out of it.
-struct ReadRequest {
-    entry: Arc<TransferEntry>,
-    offset: u64,
-    len: u64,
-}
-
-/// What comes back from the reader.
-pub enum Piece {
-    /// The first `len` bytes of `bytes` are the logical byte stream from
-    /// `offset`. The buffer keeps its full size whatever the piece holds, so
-    /// that nothing ever has to be zeroed to make it fit.
-    Data {
-        offset: u64,
-        bytes: Vec<u8>,
-        len: usize,
-    },
-    /// The request is complete.
-    Done,
-    /// The read failed. Nothing further arrives for this request.
-    Failed(AexError),
-}
-
-/// Reading on the caller's thread, one piece at a time.
-struct Inline {
-    /// Taken by `next_piece` and put back by `recycle`.
-    buffer: Option<Vec<u8>>,
-    /// What is left of the range being served.
-    pending: Option<ReadRequest>,
-    /// How far into the logical stream the storage has been asked to read.
-    hinted: u64,
-}
 
 /// How far ahead of the piece being read the storage is asked to fetch.
 ///
@@ -69,108 +31,73 @@ struct Inline {
 const READ_AHEAD_BYTES: u64 = 4 << 20;
 
 /// How a connection reads what it is asked to send.
-pub struct ReadPipeline {
-    inline: RefCell<Inline>,
-    piece_bytes: usize,
+pub struct FetchReader {
+    /// Allocated once and reused, so a transfer in progress never asks the
+    /// allocator for anything. It keeps its full size whatever a piece holds,
+    /// so that nothing ever has to be zeroed to make it fit.
+    buffer: Vec<u8>,
+    /// How far into the logical stream the storage has been asked to read.
+    hinted: u64,
 }
 
-impl ReadPipeline {
-    /// Start a reader with one buffer of `piece_bytes`.
-    ///
-    /// Allocated once and reused, so a transfer in progress never asks the
-    /// allocator for anything.
-    pub fn start(piece_bytes: usize) -> Self {
-        ReadPipeline {
-            inline: RefCell::new(Inline {
-                buffer: Some(vec![0u8; piece_bytes]),
-                pending: None,
-                hinted: 0,
-            }),
-            piece_bytes,
+impl FetchReader {
+    /// A reader whose pieces are at most `piece_bytes`.
+    pub fn new(piece_bytes: usize) -> Self {
+        FetchReader {
+            buffer: vec![0u8; piece_bytes],
+            hinted: 0,
         }
     }
 
-    /// How much of a fetch one piece carries.
-    pub fn piece_bytes(&self) -> usize {
-        self.piece_bytes
-    }
-
-    /// Ask for a range. The pieces of it come back from [`Self::next_piece`].
-    pub fn request(&self, entry: Arc<TransferEntry>, offset: u64, len: u64) {
-        let mut inline = self.inline.borrow_mut();
+    /// Read `[offset, offset + len)` of a transfer in pieces, handing each to
+    /// `send` with its offset.
+    ///
+    /// A failed read stops the range and comes back as `Ok(Err(_))`, since
+    /// the connection survives it; a failed `send` comes back as it is.
+    pub fn serve<E>(
+        &mut self,
+        entry: &TransferEntry,
+        mut offset: u64,
+        mut len: u64,
+        mut send: impl FnMut(u64, &[u8]) -> Result<(), E>,
+    ) -> Result<Result<(), AexError>, E> {
+        let layout = entry.layout();
         // A fetch that carries on from where the last window reached keeps it;
         // one that jumps somewhere else starts again. Fetches are what the
         // client chose to cut the stream into, and the storage does not care
         // where one ends.
-        let carries_on = offset <= inline.hinted && inline.hinted - offset <= READ_AHEAD_BYTES;
+        let carries_on = offset <= self.hinted && self.hinted - offset <= READ_AHEAD_BYTES;
         if !carries_on {
-            inline.hinted = offset;
-        }
-        inline.pending = Some(ReadRequest { entry, offset, len });
-    }
-
-    /// The next piece of the range that was asked for.
-    pub fn next_piece(&self) -> Piece {
-        self.inline.borrow_mut().next(self.piece_bytes)
-    }
-
-    /// Give a buffer back once it has been written out.
-    pub fn recycle(&self, bytes: Vec<u8>) {
-        self.inline.borrow_mut().buffer = Some(bytes);
-    }
-}
-
-impl Inline {
-    fn next(&mut self, piece_bytes: usize) -> Piece {
-        let Some(request) = self.pending.as_mut() else {
-            return Piece::Done;
-        };
-        if request.len == 0 {
-            self.pending = None;
-            return Piece::Done;
+            self.hinted = offset;
         }
 
-        // Only missing if the caller dropped a buffer rather than recycling it,
-        // which happens on the error path and costs one allocation.
-        let mut bytes = self.buffer.take().unwrap_or_else(|| vec![0u8; piece_bytes]);
-        let piece = request.len.min(bytes.len() as u64);
-        let piece = row_aligned(request.entry.layout(), request.offset, piece) as usize;
-        let at = request.offset;
+        while len > 0 {
+            let piece = len.min(self.buffer.len() as u64);
+            let piece = row_aligned(layout, offset, piece) as usize;
 
-        // Ask for what comes after this piece before blocking on this one, so
-        // that a cold read is already under way by the time it is wanted. The
-        // window runs past the end of this fetch, into the rest of the
-        // selection: stopping at the fetch boundary leaves the storage idle
-        // for the whole of the last piece's send.
-        let window = at
-            .saturating_add(READ_AHEAD_BYTES)
-            .min(request.entry.layout().total_bytes);
-        if window > self.hinted {
-            let from = self.hinted.max(at);
-            request
-                .entry
-                .dataset()
-                .will_need(request.entry.layout(), from, window - from);
-            self.hinted = window;
-        }
-        if let Err(e) =
-            request
-                .entry
-                .dataset()
-                .read_range(request.entry.layout(), at, &mut bytes[..piece])
-        {
-            self.buffer = Some(bytes);
-            self.pending = None;
-            return Piece::Failed(e);
-        }
+            // Ask for what comes after this piece before blocking on this one,
+            // so that a cold read is already under way by the time it is
+            // wanted. The window runs past the end of this fetch, into the rest
+            // of the selection: stopping at the fetch boundary leaves the
+            // storage idle for the whole of the last piece's send.
+            let window = offset
+                .saturating_add(READ_AHEAD_BYTES)
+                .min(layout.total_bytes);
+            if window > self.hinted {
+                let from = self.hinted.max(offset);
+                entry.dataset().will_need(layout, from, window - from);
+                self.hinted = window;
+            }
+            let bytes = &mut self.buffer[..piece];
+            if let Err(e) = entry.dataset().read_range(layout, offset, bytes) {
+                return Ok(Err(e));
+            }
+            send(offset, bytes)?;
 
-        request.offset += piece as u64;
-        request.len -= piece as u64;
-        Piece::Data {
-            offset: at,
-            bytes,
-            len: piece,
+            offset += piece as u64;
+            len -= piece as u64;
         }
+        Ok(Ok(()))
     }
 }
 
@@ -204,6 +131,7 @@ fn row_aligned(layout: &SelectionLayout, offset: u64, piece: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     use aex_core::{ArrayDataset, DType, QualitySpec, SelectionLayout};
 
@@ -319,53 +247,49 @@ mod tests {
         (entry, dataset)
     }
 
-    /// Drain a request, returning what came back in order.
-    fn drain(pipeline: &ReadPipeline) -> (Vec<(u64, Vec<u8>)>, Option<AexError>) {
-        let mut data = Vec::new();
-        loop {
-            match pipeline.next_piece() {
-                Piece::Data { offset, bytes, len } => {
-                    data.push((offset, bytes[..len].to_vec()));
-                    pipeline.recycle(bytes);
-                }
-                Piece::Done => return (data, None),
-                Piece::Failed(e) => return (data, Some(e)),
-            }
-        }
+    /// Serve a range, returning what came back in order.
+    fn drain(
+        reader: &mut FetchReader,
+        entry: &TransferEntry,
+        offset: u64,
+        len: u64,
+    ) -> (Vec<(u64, Vec<u8>)>, Option<AexError>) {
+        let mut pieces = Vec::new();
+        let Ok(served) = reader.serve(entry, offset, len, |at, bytes| {
+            pieces.push((at, bytes.to_vec()));
+            Ok::<_, std::convert::Infallible>(())
+        });
+        (pieces, served.err())
     }
 
     #[test]
-    fn reading_inline_asks_for_the_pieces_after_the_one_it_is_reading() {
+    fn a_piece_asks_for_the_pieces_after_it_before_it_is_read() {
         let len = 4 * READ_AHEAD_BYTES;
         let (entry, dataset) = entry_of(len, None);
-        let pipeline = ReadPipeline::start(4096);
-        pipeline.request(entry, 0, len);
+        let mut reader = FetchReader::new(4096);
 
-        let Piece::Data { bytes, .. } = pipeline.next_piece() else {
-            panic!("the first piece is data");
-        };
-        assert_eq!(
-            dataset.hinted.load(Ordering::Relaxed),
-            READ_AHEAD_BYTES,
-            "the first piece read should have asked for a window past itself"
-        );
-        assert_eq!(dataset.reads.load(Ordering::Relaxed), 1, "one piece read");
-        pipeline.recycle(bytes);
-
+        let mut first = true;
+        let Ok(served) = reader.serve(&entry, 0, len, |_, _| {
+            if first {
+                assert_eq!(
+                    dataset.hinted.load(Ordering::Relaxed),
+                    READ_AHEAD_BYTES,
+                    "the first piece read should have asked for a window past itself"
+                );
+                assert_eq!(dataset.reads.load(Ordering::Relaxed), 1, "one piece read");
+                first = false;
+            }
+            Ok::<_, std::convert::Infallible>(())
+        });
+        served.expect("served");
         // The window slides rather than being asked for again from the start.
-        while let Piece::Data { bytes, .. } = pipeline.next_piece() {
-            pipeline.recycle(bytes);
-        }
         assert_eq!(dataset.hinted.load(Ordering::Relaxed), len);
     }
 
     #[test]
-    fn a_request_comes_back_in_pieces_that_cover_it_exactly() {
+    fn a_range_comes_back_in_pieces_that_cover_it_exactly() {
         let (entry, _) = entry_of(1000, None);
-        let pipeline = ReadPipeline::start(256);
-        pipeline.request(entry, 0, 1000);
-
-        let (pieces, failure) = drain(&pipeline);
+        let (pieces, failure) = drain(&mut FetchReader::new(256), &entry, 0, 1000);
         assert!(failure.is_none());
         assert_eq!(pieces.len(), 4, "1000 bytes in 256 byte pieces");
 
@@ -384,12 +308,9 @@ mod tests {
     }
 
     #[test]
-    fn a_request_from_an_offset_starts_and_ends_where_it_was_asked_to() {
+    fn a_range_from_an_offset_starts_and_ends_where_it_was_asked_to() {
         let (entry, _) = entry_of(600, None);
-        let pipeline = ReadPipeline::start(256);
-        pipeline.request(entry, 100, 400);
-
-        let (pieces, failure) = drain(&pipeline);
+        let (pieces, failure) = drain(&mut FetchReader::new(256), &entry, 100, 400);
         assert!(failure.is_none());
         assert_eq!(
             pieces.iter().map(|(_, b)| b.len()).sum::<usize>(),
@@ -400,48 +321,38 @@ mod tests {
     }
 
     #[test]
-    fn a_read_that_fails_stops_the_request_and_says_so() {
+    fn a_read_that_fails_stops_the_range_and_says_so() {
         let (entry, dataset) = entry_of(1000, Some(512));
-        let pipeline = ReadPipeline::start(256);
-        pipeline.request(entry, 0, 1000);
-
-        let (pieces, failure) = drain(&pipeline);
+        let mut reader = FetchReader::new(256);
+        let (pieces, failure) = drain(&mut reader, &entry, 0, 1000);
         assert!(failure.is_some(), "the failure has to reach the caller");
         assert_eq!(pieces.len(), 2, "nothing past the piece that failed");
         // The reader stopped rather than carrying on through the range.
         assert_eq!(dataset.reads.load(Ordering::Relaxed), 3);
-    }
 
-    #[test]
-    fn failed_reads_do_not_use_up_the_buffers() {
-        let (entry, _) = entry_of(1000, Some(0));
-        let pipeline = ReadPipeline::start(256);
-        // More failures than there are buffers; a leak would hang here.
-        for _ in 0..5 {
-            pipeline.request(entry.clone(), 0, 100);
-            assert!(drain(&pipeline).1.is_some());
-        }
-        pipeline.request(entry, 256, 600);
-        let (pieces, failure) = drain(&pipeline);
+        // And the next range is served as usual.
+        let (pieces, failure) = drain(&mut reader, &entry, 0, 512);
         assert!(failure.is_none());
-        assert_eq!(pieces.len(), 3);
+        assert_eq!(pieces.len(), 2);
     }
 
     #[test]
-    fn the_reader_serves_one_request_after_another() {
+    fn a_send_that_fails_stops_the_range() {
+        let (entry, dataset) = entry_of(1000, None);
+        let served = FetchReader::new(256).serve(&entry, 0, 1000, |_, _| Err("gone"));
+        assert!(matches!(served, Err("gone")));
+        assert_eq!(dataset.reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_reader_serves_one_range_after_another() {
         let (entry, _) = entry_of(1000, None);
-        let pipeline = ReadPipeline::start(512);
+        let mut reader = FetchReader::new(512);
         for offset in [0u64, 200, 400] {
-            pipeline.request(entry.clone(), offset, 100);
-            let (pieces, failure) = drain(&pipeline);
+            let (pieces, failure) = drain(&mut reader, &entry, offset, 100);
             assert!(failure.is_none());
             assert_eq!(pieces.len(), 1);
             assert_eq!(pieces[0].0, offset);
         }
-    }
-
-    #[test]
-    fn the_piece_size_is_what_it_was_started_with() {
-        assert_eq!(ReadPipeline::start(64).piece_bytes(), 64);
     }
 }
