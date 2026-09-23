@@ -8,12 +8,12 @@
 //! session fails on the spot, and a sweep drops the ones nobody asks about, so
 //! that a client which simply vanished does not pin its files open forever.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use aex_core::ArrayFile;
-use dashmap::DashMap;
 
 use crate::config::{ServerConfig, DEFAULT_STREAMS};
 use crate::error::{Result, ServerError};
@@ -29,14 +29,14 @@ pub type SessionToken = [u8; 16];
 /// Handles are integers rather than v1's UUID strings: they are hashed and
 /// compared on every request, and neither should allocate.
 pub struct FileRegistry {
-    files: DashMap<u64, Arc<dyn ArrayFile>>,
+    files: Mutex<HashMap<u64, Arc<dyn ArrayFile>>>,
     next_handle: AtomicU64,
 }
 
 impl std::fmt::Debug for FileRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileRegistry")
-            .field("open", &self.files.len())
+            .field("open", &self.len())
             .finish()
     }
 }
@@ -44,43 +44,47 @@ impl std::fmt::Debug for FileRegistry {
 impl FileRegistry {
     fn new() -> Self {
         FileRegistry {
-            files: DashMap::new(),
+            files: Mutex::default(),
             // Start at 1: a zero handle is then always a client-side mistake
             // rather than a valid reference to whatever opened first.
             next_handle: AtomicU64::new(1),
         }
     }
 
+    fn files(&self) -> MutexGuard<'_, HashMap<u64, Arc<dyn ArrayFile>>> {
+        self.files.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Register an open file and return its handle.
     pub fn insert(&self, file: Arc<dyn ArrayFile>) -> u64 {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.files.insert(handle, file);
+        self.files().insert(handle, file);
         handle
     }
 
     /// The file behind a handle.
     pub fn get(&self, handle: u64) -> Result<Arc<dyn ArrayFile>> {
-        self.files
+        self.files()
             .get(&handle)
-            .map(|entry| entry.value().clone())
+            .cloned()
             .ok_or_else(|| ServerError::BadRequest(format!("unknown file handle {handle}")))
     }
 
     /// Forget a handle. Closing one twice is an error: it usually means the
     /// client is using a handle it already dropped.
     pub fn remove(&self, handle: u64) -> Result<()> {
-        self.files
+        self.files()
             .remove(&handle)
             .map(|_| ())
             .ok_or_else(|| ServerError::BadRequest(format!("unknown file handle {handle}")))
     }
 
     pub fn len(&self) -> usize {
-        self.files.len()
+        self.files().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.files().is_empty()
     }
 }
 
@@ -168,7 +172,7 @@ impl Session {
 /// Every live session.
 #[derive(Debug)]
 pub struct SessionRegistry {
-    sessions: DashMap<SessionId, Arc<Session>>,
+    sessions: Mutex<HashMap<SessionId, Arc<Session>>>,
     config: Arc<ServerConfig>,
     /// Sessions are timed against a monotonic clock, so a wall-clock jump
     /// cannot expire them all at once.
@@ -178,10 +182,14 @@ pub struct SessionRegistry {
 impl SessionRegistry {
     pub fn new(config: Arc<ServerConfig>) -> Self {
         SessionRegistry {
-            sessions: DashMap::new(),
+            sessions: Mutex::default(),
             config,
             epoch: Instant::now(),
         }
+    }
+
+    fn sessions(&self) -> MutexGuard<'_, HashMap<SessionId, Arc<Session>>> {
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn now_ms(&self) -> u64 {
@@ -208,7 +216,7 @@ impl SessionRegistry {
         desired_streams: u32,
         now_ms: u64,
     ) -> Result<Arc<Session>> {
-        if self.sessions.len() >= self.config.limits.max_sessions as usize {
+        if self.sessions().len() >= self.config.limits.max_sessions as usize {
             return Err(ServerError::Exhausted(format!(
                 "server is at its limit of {} sessions",
                 self.config.limits.max_sessions
@@ -231,7 +239,7 @@ impl SessionRegistry {
             data_conns: AtomicU32::new(0),
             last_seen_ms: AtomicU64::new(now_ms),
         });
-        self.sessions.insert(session.id, session.clone());
+        self.sessions().insert(session.id, session.clone());
         Ok(session)
     }
 
@@ -250,13 +258,13 @@ impl SessionRegistry {
         })?;
 
         let session = self
-            .sessions
+            .sessions()
             .get(&id)
-            .map(|entry| entry.value().clone())
+            .cloned()
             .ok_or_else(|| ServerError::Auth("no such session".to_string()))?;
 
         if session.is_expired(now_ms, self.idle_timeout_ms()) {
-            self.sessions.remove(&id);
+            self.sessions().remove(&id);
             return Err(ServerError::Auth(format!(
                 "session expired after {} seconds of inactivity",
                 self.config.limits.session_idle_timeout_sec
@@ -274,7 +282,7 @@ impl SessionRegistry {
     /// happened to be made while it ran.
     pub fn touch(&self, id: &SessionId) {
         let now_ms = self.now_ms();
-        if let Some(session) = self.sessions.get(id) {
+        if let Some(session) = self.sessions().get(id) {
             session.touch(now_ms);
         }
     }
@@ -284,14 +292,14 @@ impl SessionRegistry {
     /// Used by the transfer sweep, which must not keep a session alive merely
     /// by asking about it.
     pub fn contains(&self, id: &SessionId) -> bool {
-        self.sessions.contains_key(id)
+        self.sessions().contains_key(id)
     }
 
     /// Drop a session and everything it holds. Returns its id, so that what
     /// hangs off a session elsewhere can go with it.
     pub fn remove(&self, id: &[u8]) -> Result<SessionId> {
         let session = self.get(id)?;
-        self.sessions.remove(&session.id);
+        self.sessions().remove(&session.id);
         Ok(session.id)
     }
 
@@ -302,18 +310,18 @@ impl SessionRegistry {
 
     fn sweep_expired_at(&self, now_ms: u64) -> usize {
         let timeout_ms = self.idle_timeout_ms();
-        let before = self.sessions.len();
-        self.sessions
-            .retain(|_, session| !session.is_expired(now_ms, timeout_ms));
-        before - self.sessions.len()
+        let mut sessions = self.sessions();
+        let before = sessions.len();
+        sessions.retain(|_, session| !session.is_expired(now_ms, timeout_ms));
+        before - sessions.len()
     }
 
     pub fn len(&self) -> usize {
-        self.sessions.len()
+        self.sessions().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
+        self.sessions().is_empty()
     }
 }
 
