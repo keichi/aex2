@@ -128,8 +128,6 @@ mod tests {
 
     #[test]
     fn an_error_frame_keeps_the_class_the_server_put_on_it() {
-        // Unlike a gRPC status, an ERROR frame states its class outright, so
-        // nothing has to be inferred from a code.
         let err = ClientError::Data {
             class: ErrorClass::Transient,
             message: "read failed".to_string(),

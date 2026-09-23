@@ -1,11 +1,8 @@
 //! What a transfer is, and what comes back from one.
 //!
-//! The plan the control plane returns is the whole description of a transfer:
-//! a length, and either the data itself for something small or the identifiers
-//! the data plane needs. From there the client decides on its own how to cut
-//! the logical byte stream into chunks — the server neither knows nor cares,
-//! because the information that decides a good chunk size (how many
-//! connections, what the round trip and the bandwidth are) is all on this side.
+//! The plan is the whole description of a transfer: a length, and either the
+//! data itself or the identifiers the data plane needs. Chunking is the
+//! client's choice.
 
 use std::time::Duration;
 
@@ -48,7 +45,6 @@ impl std::fmt::Debug for Plan {
 }
 
 impl Plan {
-    /// Read a plan off the wire.
     pub(crate) fn from_proto(
         plan: aex_proto::TransferPlan,
         requested_quality: &QualitySpec,
@@ -136,8 +132,7 @@ pub struct TransferResult {
     pub elapsed: Duration,
     /// 0 for a transfer answered inline.
     pub chunks: u32,
-    /// Connections used. 0 for a transfer answered inline, which never touches
-    /// the data plane at all.
+    /// Connections used; 0 when answered inline.
     pub streams: u32,
     /// Fetches that had to be repeated.
     pub retries: u32,
@@ -226,8 +221,7 @@ mod sealed {
 /// over the elements, which is only sound for a type where every bit pattern is
 /// a value. `bool` is the counterexample — a byte other than 0 or 1 in a Rust
 /// `bool` is undefined behaviour — and `float16` and the complex types have no
-/// std type to be. Those go through [`ArrayData`], and through numpy once the
-/// Python bindings exist.
+/// std type to be. Those go through [`ArrayData`] or numpy.
 pub trait Element: sealed::Sealed + Copy + Default {
     const DTYPE: DType;
 }

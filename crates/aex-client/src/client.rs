@@ -1,8 +1,5 @@
-//! The client.
-//!
-//! The API is blocking, with a tokio runtime kept inside. Callers are analysis
-//! code and, later, Python: neither wants to own a runtime, and the Python
-//! bindings will release the GIL around exactly these blocking calls.
+//! Blocking, with a tokio runtime kept inside: neither analysis code nor the
+//! Python bindings (which release the GIL around these calls) want to own one.
 //!
 //! Reading a selection costs one round trip when it is small enough to come
 //! back with its plan, and two when it is not. The second is the data plane,
@@ -170,7 +167,6 @@ impl std::fmt::Debug for SessionInfo {
     }
 }
 
-/// Renders bytes as hex in debug output.
 struct HexBytes<'a>(&'a [u8]);
 
 impl std::fmt::Debug for HexBytes<'_> {
@@ -182,8 +178,6 @@ impl std::fmt::Debug for HexBytes<'_> {
     }
 }
 
-/// A connected client.
-///
 /// Dropping one does not tell the server: a disconnect on a dead connection
 /// would block, and the session expires on its own idle timeout anyway. Call
 /// [`Client::disconnect`] to release it now.
@@ -284,9 +278,6 @@ impl Client {
             max_fancy_indices: aex_proto::convert::DEFAULT_MAX_FANCY_INDICES,
         };
 
-        // Opened now rather than at the first transfer, so that a data plane
-        // which cannot be reached is reported here, and so that the first large
-        // read does not pay for a handshake.
         let pool = DataPool::connect(
             ConnSettings {
                 host: session.data_endpoint.0.clone(),
@@ -386,12 +377,8 @@ impl Client {
         reply.items.iter().map(item_from_proto).collect()
     }
 
-    /// Read a selection into a buffer the caller owns.
-    ///
-    /// `dst` has to be exactly the length of the selection, which the caller
-    /// learns from the metadata or from a previous read. Taking the buffer
-    /// rather than returning one is the point: it is what lets the bytes go
-    /// from the kernel into a numpy array with nothing in between.
+    /// Read a selection into a buffer the caller owns, exactly the selection's
+    /// length.
     pub fn read_selection_into(
         &self,
         handle: FileHandle,
@@ -404,9 +391,6 @@ impl Client {
     }
 
     /// Read a selection, allocating for it.
-    ///
-    /// The bytes are the logical byte stream: C order, little-endian, exactly
-    /// as they travelled.
     pub fn read_selection(
         &self,
         handle: FileHandle,
@@ -461,9 +445,6 @@ impl Client {
     }
 
     /// Ask the server to resolve a selection, in one round trip.
-    ///
-    /// The plan says what the result will be, so the caller can allocate for
-    /// it before [`Client::fill`].
     pub fn prepare(&self, handle: FileHandle, name: &str, indices: &[Index]) -> Result<Plan> {
         self.prepare_selection(&Selection::exact(handle, name, indices))
     }
@@ -471,8 +452,6 @@ impl Client {
     /// [`Client::prepare`] with a quality to ask for. The plan says what the
     /// server applied.
     pub fn prepare_selection(&self, selection: &Selection<'_>) -> Result<Plan> {
-        // Checked here so that a selection too large to travel does not cost a
-        // round trip to be told so.
         check_fancy_limit(selection.indices, self.session.max_fancy_indices)
             .map_err(|e| ClientError::BadRequest(e.to_string()))?;
 
@@ -574,12 +553,8 @@ impl Client {
         })
     }
 
-    /// Fill `dst` from a plan, preparing again once if the plan has gone.
-    ///
-    /// `dst` has to be exactly `plan.total_bytes` long. The selection is taken
-    /// again because a plan can be evicted while the client is still working
-    /// through its chunks, and then the client just asks for another one;
-    /// twice in a row would mean something other than eviction.
+    /// Fill `dst` (exactly `plan.total_bytes` long) from a plan. A plan evicted
+    /// mid-transfer is prepared again once; twice in a row is not eviction.
     pub fn fill(
         &self,
         plan: &Plan,
@@ -811,7 +786,6 @@ fn split_for_streams(chunk_bytes: u64, total_bytes: u64, streams: u32) -> u64 {
         .min(chunk_bytes)
 }
 
-/// Convert one item off the wire.
 fn item_from_proto(item: &aex_proto::Item) -> Result<(String, Item)> {
     let data = item
         .data
@@ -840,7 +814,6 @@ fn item_from_proto(item: &aex_proto::Item) -> Result<(String, Item)> {
     Ok((item.name.clone(), converted))
 }
 
-/// Convert one attribute off the wire.
 fn attr_from_proto(attr: &aex_proto::Attribute) -> Result<(String, AttrValue)> {
     let value = attr
         .value
@@ -891,7 +864,6 @@ pub(crate) fn nbytes(shape: &[u64], dtype: DType) -> u64 {
         .fold(dtype.itemsize(), |n, &axis| n.saturating_mul(axis))
 }
 
-/// Read a 16-byte identifier out of what the server sent.
 fn as_16_bytes(bytes: &[u8], what: &str) -> Result<[u8; 16]> {
     bytes
         .try_into()

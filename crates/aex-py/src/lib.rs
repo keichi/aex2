@@ -91,7 +91,6 @@ struct Plan(aex_client::Plan);
 
 #[pymethods]
 impl Plan {
-    /// Shape of the result.
     #[getter]
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, &self.0.shape)
@@ -640,9 +639,8 @@ impl Batch<'_, '_> {
 /// Resolve `key` against an array of `shape` and `dtype`. Returns
 /// `(dtype, shape)` of what the selection would yield.
 ///
-/// The server resolves a selection with this same function, so nothing here
-/// has to agree with it by hand; a client and a server that disagreed could
-/// not share a session anyway, since the protocol version has to match.
+/// The server resolves selections with this same function, so the two cannot
+/// disagree.
 #[pyfunction]
 fn resolve(
     shape: Vec<u64>,

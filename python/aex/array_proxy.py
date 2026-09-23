@@ -436,7 +436,6 @@ class QualityView:
     def __init__(self, array: ArrayProxy, quality: dict[str, Any]) -> None:
         self.array = array
         self.quality = quality
-        # What the server applied on the last read; None before one.
         self.applied_quality: dict[str, Any] | None = None
 
     def __getitem__(self, key: Any) -> npt.NDArray[Any]:
@@ -453,11 +452,10 @@ class QualityView:
         return out
 
     def _was_refused(self, applied: dict[str, Any]) -> bool:
-        """Whether the server gave back something other than what was asked.
+        """Whether the server gave back less than asked.
 
-        A codec on its own asks for nothing but a smaller wire, so for that one
-        the codec is the whole answer; anything else is a quality, and falling
-        back to exact is how the server says no.
+        For a codec alone the codec is the answer; for a quality, exact means
+        refused.
         """
         asked_a_quality = any(k != "codec" for k in self.quality)
         if asked_a_quality:
