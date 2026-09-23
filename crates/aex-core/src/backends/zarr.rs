@@ -32,7 +32,6 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Deserialize;
@@ -315,8 +314,6 @@ impl ZarrArray {
         meta: ArrayMeta,
         cache: Arc<DecodeCache>,
     ) -> Result<Self> {
-        static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
-
         let name = meta.data_type.as_str().ok_or_else(|| {
             AexError::UnsupportedZarr(format!("{prefix}: only the core data types are served"))
         })?;
@@ -371,8 +368,8 @@ impl ZarrArray {
             store,
             fill: fill_bytes(dtype, &meta.fill_value)
                 .map_err(|e| AexError::MalformedZarr(format!("{prefix}: {e}")))?,
+            cache_key: cache.new_key(),
             cache,
-            cache_key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
         })
     }
 

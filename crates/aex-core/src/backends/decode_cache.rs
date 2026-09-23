@@ -37,6 +37,9 @@ pub struct DecodeCache {
     capacity: u64,
     lru: Mutex<Lru>,
     counts: Counts,
+    /// Hands out dataset keys, so datasets of different formats sharing this
+    /// cache never read each other's chunks.
+    next_key: AtomicU64,
 }
 
 /// What the cache did, since the server started.
@@ -78,7 +81,13 @@ impl DecodeCache {
             capacity,
             lru: Mutex::default(),
             counts: Counts::default(),
+            next_key: AtomicU64::new(0),
         }
+    }
+
+    /// A key no other dataset using this cache has.
+    pub fn new_key(&self) -> u64 {
+        self.next_key.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn capacity(&self) -> u64 {
