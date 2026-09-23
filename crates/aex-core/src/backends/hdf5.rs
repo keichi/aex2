@@ -17,7 +17,6 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use hdf5::dataset::{FillValue, Layout};
@@ -441,7 +440,6 @@ impl Chunked {
         filters: Vec<Filter>,
         cache: Arc<DecodeCache>,
     ) -> Result<Self> {
-        static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
         let malformed = || {
             AexError::MalformedHdf5(format!(
                 "{name}: chunks of {chunk_shape:?} do not fit an array of {shape:?}"
@@ -459,8 +457,8 @@ impl Chunked {
             grid,
             filters,
             index: OnceLock::new(),
+            cache_key: cache.new_key(),
             cache,
-            cache_key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -744,16 +742,20 @@ mod tests {
     /// process or descriptor holds it by then, and the next attempt succeeds.
     /// Nothing outside the tests waits on it, so the retry lives here.
     fn open(path: impl AsRef<Path>) -> Result<Hdf5File> {
+        open_with(path, Arc::new(DecodeCache::new(1 << 20)))
+    }
+
+    fn open_with(path: impl AsRef<Path>, cache: Arc<DecodeCache>) -> Result<Hdf5File> {
         let path = path.as_ref();
         for _ in 0..20 {
-            match Hdf5File::open(path, Arc::new(DecodeCache::new(1 << 20))) {
+            match Hdf5File::open(path, cache.clone()) {
                 Err(AexError::UnsupportedHdf5(e)) if e.contains("unable to lock file") => {
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
                 other => return other,
             }
         }
-        Hdf5File::open(path, Arc::new(DecodeCache::new(1 << 20)))
+        Hdf5File::open(path, cache)
     }
 
     fn read_all(dataset: &dyn ArrayDataset, indices: &[Index]) -> (SelectionLayout, Vec<u8>) {
@@ -763,7 +765,7 @@ mod tests {
         (layout, out)
     }
 
-    fn dataset(file: &Hdf5File, path: &str) -> Arc<dyn ArrayDataset> {
+    fn dataset(file: &dyn ArrayFile, path: &str) -> Arc<dyn ArrayDataset> {
         match file.get_item(path).unwrap() {
             Item::Dataset(d) => d,
             Item::Group => panic!("{path} is a group"),
@@ -1279,6 +1281,48 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn a_zarr_array_sharing_the_cache_does_not_serve_its_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.zarr");
+        std::fs::create_dir_all(store.join("a/c")).unwrap();
+        std::fs::write(
+            store.join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "group"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            store.join("a/zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "array", "data_type": "uint32",
+                "shape": [4], "chunk_grid": {"name": "regular",
+                "configuration": {"chunk_shape": [4]}},
+                "chunk_key_encoding": {"name": "default"}, "fill_value": 0,
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}]}"#,
+        )
+        .unwrap();
+        std::fs::write(store.join("a/c/0"), bytes_of(&[7u32; 4])).unwrap();
+
+        let path = dir.path().join("t.h5");
+        let values = [1u32, 2, 3, 4];
+        hdf5::File::create(&path)
+            .unwrap()
+            .new_dataset::<u32>()
+            .shape([4])
+            .chunk([4])
+            .deflate(1)
+            .create("d")
+            .unwrap()
+            .write_raw(&values)
+            .unwrap();
+
+        // Both formats' first chunk used to be key (0, 0) in one cache.
+        let cache = Arc::new(DecodeCache::new(1 << 20));
+        let zarr = crate::ZarrFile::open(&store, cache.clone()).unwrap();
+        let file = open_with(&path, cache).unwrap();
+        read_all(&*dataset(&zarr, "a"), &[]);
+        assert_eq!(read_all(&*dataset(&file, "d"), &[]).1, bytes_of(&values));
     }
 
     #[test]
