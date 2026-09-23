@@ -92,6 +92,8 @@ AEX2 側の作り方の問題ではなく、OS の `sendfile` そのものの性
 
 ## 再現方法
 
+`sendfilebench` は削除した。再現するときはコミット `7ff1f07` を checkout する。
+
 ```console
 $ cargo build --release -p aex-bench
 $ for m in pread pread-threaded sendfile; do
