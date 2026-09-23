@@ -1,6 +1,5 @@
 """The client, and proxies for the files and groups it opens."""
 
-import threading
 from collections.abc import Callable, ItemsView, Iterator, Mapping, ValuesView
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import TracebackType
@@ -25,8 +24,8 @@ class Client:
     def __init__(self, url: str) -> None:
         self.url = url
         self._native = _aex.Client(url if "://" in url else f"http://{url}")
-        self._executor: ThreadPoolExecutor | None = None
-        self._lock = threading.Lock()
+        # Starts no thread until the first get_async.
+        self._executor = ThreadPoolExecutor(thread_name_prefix="aex")
 
     def open(self, path: str) -> "FileProxy":
         """Open a file, at a path relative to the server's data root."""
@@ -38,10 +37,7 @@ class Client:
         The calls release the GIL while they wait, so the workers transfer
         while the caller computes.
         """
-        with self._lock:
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(thread_name_prefix="aex")
-            return self._executor.submit(fn, *args)
+        return self._executor.submit(fn, *args)
 
     def stats(self) -> dict[str, Any]:
         """Totals over every transfer this client has made.
@@ -56,10 +52,7 @@ class Client:
 
         Waits for pending get_async transfers first.
         """
-        with self._lock:
-            executor, self._executor = self._executor, None
-        if executor is not None:
-            executor.shutdown()
+        self._executor.shutdown()
         self._native.disconnect()
 
     def __enter__(self) -> Self:
