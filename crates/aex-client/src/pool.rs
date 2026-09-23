@@ -28,6 +28,7 @@ use aex_wire::{
     ScatterBuffer, ScatterSlice, Ticket, READY_LEN,
 };
 
+use crate::client::HexBytes;
 use crate::error::{ClientError, Result};
 
 /// How long one read or write on a data connection may take.
@@ -38,7 +39,7 @@ use crate::error::{ClientError, Result};
 const IO_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What it takes to open a data connection.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnSettings {
     pub host: String,
     pub port: u16,
@@ -46,6 +47,18 @@ pub struct ConnSettings {
     /// Never logged: it is what a connection proves itself with.
     pub session_token: [u8; 16],
     pub connect_timeout: Duration,
+}
+
+impl std::fmt::Debug for ConnSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("session_id", &HexBytes(&self.session_id))
+            .field("session_token", &"<redacted>")
+            .field("connect_timeout", &self.connect_timeout)
+            .finish()
+    }
 }
 
 /// One data connection, past its handshake.

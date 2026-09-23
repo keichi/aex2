@@ -167,7 +167,7 @@ impl std::fmt::Debug for SessionInfo {
     }
 }
 
-struct HexBytes<'a>(&'a [u8]);
+pub(crate) struct HexBytes<'a>(pub(crate) &'a [u8]);
 
 impl std::fmt::Debug for HexBytes<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1065,6 +1065,18 @@ mod tests {
             max_fancy_indices: 262_144,
         };
         let rendered = format!("{session:?}");
+        assert!(rendered.contains("abababab"), "{rendered}");
+        assert!(!rendered.contains("cdcdcdcd"), "{rendered}");
+        assert!(!rendered.contains("205"), "{rendered}");
+
+        let settings = ConnSettings {
+            host: "127.0.0.1".to_string(),
+            port: 50052,
+            session_id: [0xab; 16],
+            session_token: [0xcd; 16],
+            connect_timeout: std::time::Duration::from_secs(1),
+        };
+        let rendered = format!("{settings:?}");
         assert!(rendered.contains("abababab"), "{rendered}");
         assert!(!rendered.contains("cdcdcdcd"), "{rendered}");
         assert!(!rendered.contains("205"), "{rendered}");
