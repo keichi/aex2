@@ -1,5 +1,6 @@
 """The client, and proxies for the files and groups it opens."""
 
+import posixpath
 from collections.abc import Callable, ItemsView, Iterator, Mapping, ValuesView
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import TracebackType
@@ -115,26 +116,14 @@ class GroupProxy(Mapping[str, "ArrayProxy | GroupProxy"]):
             self._attrs = _attrs_from_wire(self._native.get_item(self.handle, self.name)[1])
         return self._attrs
 
-    @staticmethod
-    def _join_names(*names: str) -> str:
-        joined = ""
-        for name in names:
-            if name.startswith("/"):
-                joined = name
-            elif joined.endswith("/"):
-                joined += name
-            else:
-                joined += "/" + name
-        return joined
-
     def __getitem__(self, name: str) -> "ArrayProxy | GroupProxy":
-        path = self._join_names(self.name, name)
+        path = posixpath.join(self.name, name)
         return _proxy(self._client, self.handle, path, *self._native.get_item(self.handle, path))
 
     def _children(self) -> dict[str, "ArrayProxy | GroupProxy"]:
         """Every child, built from one listing: it already carries the metadata."""
         return {
-            name: _proxy(self._client, self.handle, self._join_names(self.name, name), item, attrs)
+            name: _proxy(self._client, self.handle, posixpath.join(self.name, name), item, attrs)
             for name, item, attrs in self._native.list_children(self.handle, self.name)
         }
 
@@ -157,7 +146,7 @@ class GroupProxy(Mapping[str, "ArrayProxy | GroupProxy"]):
         if not isinstance(name, str):
             return False
         try:
-            self._native.get_item(self.handle, self._join_names(self.name, name))
+            self._native.get_item(self.handle, posixpath.join(self.name, name))
         except (AexNotFoundError, AexValueError):
             return False
         return True

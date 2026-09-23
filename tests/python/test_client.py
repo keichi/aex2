@@ -255,22 +255,6 @@ def test_group_proxy_contains(file_proxy):
     assert "array/nonexistent" not in file_proxy
 
 
-def test_group_proxy_join_names_relative():
-    assert GroupProxy._join_names("/g1", "ds1") == "/g1/ds1"
-
-
-def test_group_proxy_join_names_absolute_replaces():
-    assert GroupProxy._join_names("/g1", "/g2") == "/g2"
-
-
-def test_group_proxy_join_names_trailing_slash():
-    assert GroupProxy._join_names("/g1/", "ds1") == "/g1/ds1"
-
-
-def test_group_proxy_join_names_multiple():
-    assert GroupProxy._join_names("/", "g1", "g3", "ds3") == "/g1/g3/ds3"
-
-
 def test_group_proxy_repr(file_proxy):
     text = repr(file_proxy["/"])
     assert "GroupProxy" in text
