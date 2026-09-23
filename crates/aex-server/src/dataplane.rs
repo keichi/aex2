@@ -330,7 +330,7 @@ fn serve_frames(stream: &mut TcpStream, session: &SessionId, context: &Context) 
         let header = match FrameHeader::decode(&bytes) {
             Ok(header) => header,
             Err(e) => {
-                send_connection_error(stream, e.class(), &e)?;
+                send_error(stream, None, e.class(), &e)?;
                 return Err(ServerError::Protocol(e.to_string()));
             }
         };
@@ -369,7 +369,7 @@ fn handle_frame(
         // no transfer at all.
         other => {
             let e = ServerError::Protocol(format!("{other:?} is not a frame a client may send"));
-            send_connection_error(stream, ErrorClass::Protocol, &e)?;
+            send_error(stream, None, ErrorClass::Protocol, &e)?;
             Ok(Disposition::Close)
         }
     }
@@ -388,7 +388,7 @@ fn handle_fetch(
             "a fetch carries a {TICKET_LEN} byte ticket, not {} bytes",
             header.wire_len
         ));
-        send_error(stream, header, ErrorClass::Protocol, &e)?;
+        send_error(stream, Some(header), ErrorClass::Protocol, &e)?;
         return Ok(Disposition::Close);
     }
 
@@ -407,7 +407,7 @@ fn handle_fetch(
             "a fetch of {} bytes is over this server's limit of {max_fetch}",
             header.logical_len
         ));
-        send_error(stream, header, ErrorClass::Request, &e)?;
+        send_error(stream, Some(header), ErrorClass::Request, &e)?;
         return Ok(Disposition::Continue);
     }
 
@@ -415,7 +415,7 @@ fn handle_fetch(
         Ok(entry) => entry,
         Err(e) => {
             let class = e.class();
-            send_error(stream, header, class, &e)?;
+            send_error(stream, Some(header), class, &e)?;
             // A wrong ticket is either a bug or someone guessing at another
             // session's transfers; neither is worth carrying on with.
             return Ok(match class {
@@ -430,7 +430,7 @@ fn handle_fetch(
         .check_range(header.offset, header.logical_len)
     {
         let class = e.class();
-        send_error(stream, header, class, &e)?;
+        send_error(stream, Some(header), class, &e)?;
         return Ok(Disposition::Continue);
     }
 
@@ -446,7 +446,7 @@ fn handle_fetch(
             header.offset,
             header.offset.saturating_add(header.logical_len)
         ));
-        send_error(stream, header, ErrorClass::Request, &e)?;
+        send_error(stream, Some(header), ErrorClass::Request, &e)?;
         return Ok(Disposition::Continue);
     }
 
@@ -475,7 +475,7 @@ fn handle_fetch(
         // Whatever went out before this stands; the client abandons the fetch
         // on the error and asks for the same range again, which is always safe
         // because a fetch names what it wants.
-        send_error(stream, header, e.class(), &e)?;
+        send_error(stream, Some(header), e.class(), &e)?;
     }
 
     Ok(Disposition::Continue)
@@ -514,47 +514,21 @@ fn send_piece(
     Ok(())
 }
 
-/// Report a failure against the fetch that caused it.
+/// Report a failure against the fetch that caused it, or against the
+/// connection when no fetch can be blamed.
 ///
 /// The reply names that fetch — its transfer, offset and length — so that the
 /// client can put exactly that chunk back on its queue rather than starting the
-/// transfer again.
+/// transfer again. A transfer is numbered from 1, so 0 says the trouble is with
+/// the connection itself rather than with anything that was asked for.
 fn send_error(
     stream: &mut TcpStream,
-    fetch: &FrameHeader,
+    fetch: Option<&FrameHeader>,
     class: ErrorClass,
     error: impl std::fmt::Display,
 ) -> Result<()> {
-    send_error_for(
-        stream,
-        fetch.request_id,
-        fetch.offset,
-        fetch.logical_len,
-        class,
-        error,
-    )
-}
-
-/// Report a failure that no fetch can be blamed for.
-///
-/// A transfer is numbered from 1, so 0 says the trouble is with the connection
-/// itself rather than with anything that was asked for.
-fn send_connection_error(
-    stream: &mut TcpStream,
-    class: ErrorClass,
-    error: impl std::fmt::Display,
-) -> Result<()> {
-    send_error_for(stream, 0, 0, 0, class, error)
-}
-
-fn send_error_for(
-    stream: &mut TcpStream,
-    request_id: u32,
-    offset: u64,
-    logical_len: u64,
-    class: ErrorClass,
-    error: impl std::fmt::Display,
-) -> Result<()> {
+    let (request_id, offset, logical_len) =
+        fetch.map_or((0, 0, 0), |h| (h.request_id, h.offset, h.logical_len));
     tracing::debug!(request_id, ?class, "{error}");
     let payload = ErrorPayload::new(class, error.to_string()).encode();
     let header = FrameHeader::error(request_id, offset, logical_len, payload.len() as u64);
