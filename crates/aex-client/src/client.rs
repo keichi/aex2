@@ -559,16 +559,8 @@ impl Client {
 
         let dtype =
             DType::from_i32(reply.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
-        let shape = reply
-            .shape
-            .iter()
-            .map(|&n| {
-                u64::try_from(n)
-                    .map_err(|_| ClientError::Protocol(format!("negative axis length {n}")))
-            })
-            .collect::<Result<Vec<u64>>>()?;
-        let expected = shape.iter().product::<u64>() * dtype.itemsize();
-        if reply.data.len() as u64 != expected {
+        let shape = shape_from_proto(&reply.shape)?;
+        if reply.data.len() as u64 != nbytes(&shape, dtype) {
             return Err(ClientError::Protocol(format!(
                 "a {dtype} result of shape {shape:?} came back as {} bytes",
                 reply.data.len()
@@ -861,7 +853,7 @@ fn attr_from_proto(attr: &aex_proto::Attribute) -> Result<(String, AttrValue)> {
             let shape = shape_from_proto(&array.shape)?;
             // Nothing downstream can recover from a length that disagrees with
             // the type, so it is caught where the bytes arrive.
-            let expected = shape.iter().product::<u64>() * dtype.itemsize();
+            let expected = nbytes(&shape, dtype);
             if array.data.len() as u64 != expected {
                 return Err(ClientError::Protocol(format!(
                     "attribute {:?} is {} bytes, but {shape:?} of {dtype} is {expected}",
@@ -880,7 +872,7 @@ fn attr_from_proto(attr: &aex_proto::Attribute) -> Result<(String, AttrValue)> {
 }
 
 /// The wire carries shapes as int64, as numpy does.
-fn shape_from_proto(shape: &[i64]) -> Result<Vec<u64>> {
+pub(crate) fn shape_from_proto(shape: &[i64]) -> Result<Vec<u64>> {
     shape
         .iter()
         .map(|&n| {
@@ -888,6 +880,14 @@ fn shape_from_proto(shape: &[i64]) -> Result<Vec<u64>> {
                 .map_err(|_| ClientError::Protocol(format!("negative axis length {n} in a shape")))
         })
         .collect()
+}
+
+/// Bytes in an array of `shape` and `dtype`. Saturates rather than overflows,
+/// so a shape from a broken server is a length mismatch and not a panic.
+pub(crate) fn nbytes(shape: &[u64], dtype: DType) -> u64 {
+    shape
+        .iter()
+        .fold(dtype.itemsize(), |n, &axis| n.saturating_mul(axis))
 }
 
 /// Read a 16-byte identifier out of what the server sent.

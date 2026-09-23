@@ -13,6 +13,7 @@ use aex_core::{Codec, DType, QualitySpec};
 use aex_proto::convert::quality_from_proto;
 use aex_wire::{Ticket, TICKET_LEN};
 
+use crate::client::{nbytes, shape_from_proto};
 use crate::error::{ClientError, Result};
 
 /// A resolved selection, ready to fetch.
@@ -54,14 +55,7 @@ impl Plan {
     ) -> Result<Self> {
         let dtype =
             DType::from_i32(plan.dtype).map_err(|e| ClientError::Protocol(e.to_string()))?;
-        let shape = plan
-            .shape
-            .iter()
-            .map(|&n| {
-                u64::try_from(n)
-                    .map_err(|_| ClientError::Protocol(format!("negative axis length {n}")))
-            })
-            .collect::<Result<Vec<u64>>>()?;
+        let shape = shape_from_proto(&plan.shape)?;
 
         // A zero request_id is how the server says the data is attached; only
         // then is there no ticket.
@@ -102,8 +96,7 @@ impl Plan {
 
     /// Reject a plan that does not describe itself consistently.
     fn check(&self) -> Result<()> {
-        let elements: u64 = self.shape.iter().copied().product();
-        let expected = elements.saturating_mul(self.dtype.itemsize());
+        let expected = nbytes(&self.shape, self.dtype);
         if expected != self.total_bytes {
             return Err(ClientError::Protocol(format!(
                 "a plan for {:?} of {} says it is {} bytes, not {expected}",
