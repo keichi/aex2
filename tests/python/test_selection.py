@@ -50,6 +50,8 @@ KEYS = [
     (slice(None, None, 2), 3, [1, 2]),
     (None, Ellipsis, None),
     (Ellipsis, None, 2),
+    # An ellipsis standing for no axes still separates the index arrays.
+    (slice(None), [0, 2], Ellipsis, [1, 3]),
     np.arange(12) % 3 == 0,
     (slice(None), np.arange(7) > 4),
     np.arange(84).reshape(12, 7) % 5 == 0,
