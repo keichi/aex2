@@ -8,7 +8,12 @@ Item = tuple[str, list[int]] | None
 # Text, or (descr, shape, bytes) for numbers.
 AttrValue = str | tuple[str, list[int], bytes]
 
-def resolve(shape: tuple[int, ...], dtype: str, key: tuple[Any, ...]) -> tuple[str, list[int]]: ...
+# Per source axis: ("point", i), ("range", start, len, step) or ("fancy", indices).
+AxisSel = tuple[Any, ...]
+
+def resolve(
+    shape: tuple[int, ...], dtype: str, key: tuple[Any, ...]
+) -> tuple[str, list[int], list[AxisSel]]: ...
 
 class Plan:
     @property

@@ -400,7 +400,7 @@ class _Viewer:
         # Resolved with the function the server would have used. Asking the
         # server would cost a round trip, and leave it holding a plan for a
         # transfer that never comes.
-        dtype, shape = _aex.resolve(array.shape, array.dtype.str, wire_key)
+        dtype, shape, _ = _aex.resolve(array.shape, array.dtype.str, wire_key)
         # A view is the same dataset, so its attributes are the same ones.
         return ArrayProxy(
             array._client,

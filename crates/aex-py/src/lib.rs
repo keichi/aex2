@@ -8,12 +8,12 @@
 use std::sync::{Arc, RwLock};
 
 use aex_client::{
-    resolve_selection, AexError, AttrValue, ClientConfig, ClientError, Codec, DType, Encoding,
-    ErrorClass, FileHandle, FunctionArg, Index, Item, QualitySpec, Selection,
+    resolve_selection, AexError, AttrValue, AxisSel, ClientConfig, ClientError, Codec, DType,
+    Encoding, ErrorClass, FileHandle, FunctionArg, Index, Item, QualitySpec, Selection,
 };
 use half::f16;
 use numpy::{
-    Complex32, Complex64, Element, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods,
+    Complex32, Complex64, Element, PyArray1, PyArrayDescrMethods, PyArrayDyn, PyArrayMethods,
     PyReadonlyArray1, PyUntypedArray, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyTypeError;
@@ -636,21 +636,35 @@ impl Batch<'_, '_> {
     }
 }
 
+type Resolved<'py> = (&'static str, Vec<u64>, Vec<Bound<'py, PyTuple>>);
+
 /// Resolve `key` against an array of `shape` and `dtype`. Returns
-/// `(dtype, shape)` of what the selection would yield.
+/// `(dtype, shape, axes)`: what the selection would yield, and what it takes
+/// from each source axis, as `("point", i)`, `("range", start, len, step)` or
+/// `("fancy", indices)`.
 ///
 /// The server resolves selections with this same function, so the two cannot
 /// disagree.
 #[pyfunction]
-fn resolve(
+fn resolve<'py>(
+    py: Python<'py>,
     shape: Vec<u64>,
     dtype: &str,
-    key: &Bound<'_, PyTuple>,
-) -> PyResult<(&'static str, Vec<u64>)> {
+    key: &Bound<'py, PyTuple>,
+) -> PyResult<Resolved<'py>> {
     let dtype = DType::from_descr(dtype).map_err(core_error)?;
     let indices = indices_from_py(key)?;
     let resolved = resolve_selection(&shape, &indices).map_err(core_error)?;
-    Ok((dtype.descr(), resolved.out_shape))
+    let axes = resolved
+        .axes
+        .into_iter()
+        .map(|sel| match sel {
+            AxisSel::Point(i) => ("point", i).into_pyobject(py),
+            AxisSel::Range { start, len, step } => ("range", start, len, step).into_pyobject(py),
+            AxisSel::Fancy(list) => ("fancy", PyArray1::from_vec(py, list)).into_pyobject(py),
+        })
+        .collect::<PyResult<_>>()?;
+    Ok((dtype.descr(), resolved.out_shape, axes))
 }
 
 #[pymodule]

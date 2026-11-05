@@ -15,7 +15,7 @@ pub mod transfer;
 
 pub use aex_core::selection::resolve as resolve_selection;
 pub use aex_core::{
-    AexError, AttrValue, Codec, DType, Encoding, ErrorClass, Index, QualitySpec, Reduced,
+    AexError, AttrValue, AxisSel, Codec, DType, Encoding, ErrorClass, Index, QualitySpec, Reduced,
 };
 pub use client::{
     Client, DatasetInfo, FileHandle, FunctionArg, Item, Selection, SessionInfo, PROTOCOL_VERSION,
