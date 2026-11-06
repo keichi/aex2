@@ -280,12 +280,22 @@ $ ssh aex2-eval1 'pkill -x aex-server'                    # 止める
    ```console
    $ for h in aex2-eval1 aex2-eval2; do ssh $h 'hostname; pgrep -a "aex|iperf3"; uptime;
        cat aex2/REVISION; rustc -V 2>/dev/null || ~/.cargo/bin/rustc -V; iperf3 -v | head -1;
-       sysctl net.core.wmem_max net.ipv4.tcp_congestion_control'; done
+       sysctl net.core.wmem_max net.ipv4.tcp_congestion_control \
+         net.ipv4.tcp_slow_start_after_idle'; done
    ```
 
    `pgrep` は何も出さないこと。load average は 1 未満。sysctl の既定は
-   `net.core.wmem_max = 212992`、`net.ipv4.tcp_congestion_control = cubic`。
-   変えて測ったら、**終わったら戻す**
+   `net.core.wmem_max = 212992`、`net.ipv4.tcp_congestion_control = cubic`、
+   `net.ipv4.tcp_slow_start_after_idle = 1`。変えて測ったら、**終わったら戻す**。
+   `tcp_bbr` を読み込んだら外す (`sudo modprobe -r tcp_bbr`)
+
+   **遅延のある回線で小さい読み (数 MiB 以下) を測るなら、OS の設定を測らないこと。**
+   既定のままだと、転送の合間にアイドルになったデータ接続のウィンドウが縮み、
+   送信バッファの上限 (4 MiB) が 1 本の接続を抑えるので、+100 ms で 1 〜 8 MiB の読みが
+   約 8 RTT かかる ([転送が遅かった理由](benchmark-cache.md#転送が遅かった理由))。
+   サーバで `tcp_slow_start_after_idle=0` (または BBR) にし、`set_buffers tuned` にする。
+   既定のまま測ったなら、そう書く。数 GiB を流す測定は最初の数 RTT しか払わないので、
+   ほとんど影響を受けない
 2. **同期**: `benchmarks/mdx2/sync.sh`。記録用なら REVISION が `-dirty` でないこと
 3. **ネットワークの基準値**: AEX2 を測る**直前と直後**に iPerf3 を測り、両方を記録する。
    向きは AEX2 と同じ**サーバ → クライアント** (`-R`)。1 本と 16 本の両方を取る
