@@ -169,7 +169,7 @@ tests/python/      v1 から移植した pytest と numpy との差分テスト
 | [Zarr と sharding](benchmark-zarr.md) | VM 間 | チャンクを fetch に合わせるかどうかで 5.4 倍。差は 1 要求が使えるコア数 (14.4 対 3)。確保し直しを潰して +32.7 % |
 | [HDF5 のリモート比較](benchmark-hdf5-remote.md) | VM 間 + netem | 同じ `.h5` を h5py + HTTP と HSDS にも読ませた。HSDS に 2.25 〜 6.68 倍、h5py に 1.3 〜 4.3 倍。よく圧縮できるファイルは 25 ms より遠いと h5py が勝つ。コールドなディスクでは無圧縮だけ差が 1.9 倍に縮む |
 | [zarr-python とのリモート比較](benchmark-zarr-remote.md) | VM 間 + netem | 同じストアを HTTP でも配って比べた。16 プロセスの zarr-python に 1.53 〜 2.01 倍。よく圧縮できるデータは 25 ms より遠いと逆転し、1 Gbit/s の回線なら SZ3 で 7.0 倍取り返す。コールドディスクでは差が 1.25 倍まで縮む |
-| [クライアント側キャッシュ](benchmark-cache.md) | VM 間 + netem | 取得済みの範囲の内側はヒットで 0.04 〜 0.1 ms、遅延に依らない。100 ms で転送の 1,007 〜 10,897 倍。fancy index はヒットでも数 ms |
+| [クライアント側キャッシュ](benchmark-cache.md) | VM 間 + netem | 取得済みの範囲の内側はヒットで 0.04 〜 0.1 ms、遅延に依らない。100 ms で転送の 1,007 〜 10,897 倍。fancy index はヒットでも数 ms。小さい転送が遠距離で 8 RTT かかるのはサーバの OS 設定 (アイドル後のスロースタートと送信バッファの上限) |
 | [誤差保証圧縮 (SZ3)](benchmark-sz.md) | VM 間 + tc | 勝ち負けを決めるのは帯域。1 Gbit/s で 4.6 〜 13.8 倍 |
 | [SZ3 と ZFP の比較](benchmark-zfp.md) | VM 間 + tc | 圧縮率は SZ3、速度は ZFP。2.5 〜 7.4 Gbit/s で入れ替わる |
 | [Linux での転送性能](benchmark-linux.md) | Linux 機 | Linux ではソケットが律速。実ネットワークに近いのはこちら |
