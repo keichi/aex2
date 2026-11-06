@@ -61,10 +61,22 @@ set_buffers() {
     done
 }
 
-# Undo set_rtt and set_buffers, for a sweep's `trap restore EXIT`.
+# Whether an idle connection restarts from a small congestion window: `on`
+# (the kernel default) or `off`. Between transfers the data connections sit
+# idle, so with it on every read far away starts over from a small window.
+set_idle_restart() {
+    local v=1
+    [ "$1" = off ] && v=0
+    for h in $SERVER $CLIENT; do
+        ssh "$h" "sudo sysctl -q -w net.ipv4.tcp_slow_start_after_idle=$v"
+    done
+}
+
+# Undo set_rtt, set_buffers and set_idle_restart, for a sweep's `trap restore EXIT`.
 restore() {
     clear_rtt
     set_buffers default
+    set_idle_restart on
 }
 
 # Cached ssthresh from the previous run would skip slow start.
