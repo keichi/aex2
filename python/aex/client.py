@@ -1,5 +1,6 @@
 """The client, and proxies for the files and groups it opens."""
 
+import operator
 import posixpath
 from collections.abc import Callable, ItemsView, Iterator, Mapping, ValuesView
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -8,6 +9,7 @@ from typing import Any, Self, TypeVar
 
 from . import _aex
 from .array_proxy import ArrayProxy, _attrs_from_wire
+from .cache import Cache
 from .errors import AexNotFoundError, AexValueError
 
 __all__ = ["ArrayProxy", "Client", "FileProxy", "GroupProxy"]
@@ -20,10 +22,19 @@ class Client:
 
     ``url`` is ``host:port``, optionally with a scheme. Transfer settings come
     from the ``AEX_*`` environment variables.
+
+    ``cache_bytes`` keeps that many bytes of results, so that a selection
+    inside one already transferred is cut out of it rather than sent again.
+    0, the default, keeps none. The data is assumed not to change while the
+    file is open.
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, cache_bytes: int = 0) -> None:
+        cache_bytes = operator.index(cache_bytes)
+        if cache_bytes < 0:
+            raise ValueError("cache_bytes must not be negative")
         self.url = url
+        self._cache = Cache(cache_bytes)
         self._native = _aex.Client(url if "://" in url else f"http://{url}")
         # Starts no thread until the first get_async.
         self._executor = ThreadPoolExecutor(thread_name_prefix="aex")
@@ -44,9 +55,9 @@ class Client:
         """Totals over every transfer this client has made.
 
         ``rtt_ms`` is the fastest control plane call so far, an upper bound on
-        the round trip.
+        the round trip. ``cache`` counts what the result cache answered.
         """
-        return self._native.stats()
+        return {**self._native.stats(), "cache": self._cache.stats()}
 
     def close(self) -> None:
         """End the session. The proxies it produced stop working.
@@ -55,6 +66,8 @@ class Client:
         """
         self._executor.shutdown()
         self._native.disconnect()
+        # Let the results go; the proxies cannot read them any more.
+        self._cache = Cache(0)
 
     def __enter__(self) -> Self:
         return self
@@ -163,6 +176,7 @@ class FileProxy(GroupProxy):
 
     def close(self) -> None:
         """Release the file on the server. The proxies it produced stop working."""
+        self._client._cache.drop(self.handle)
         self._native.close_file(self.handle)
 
     def __enter__(self) -> Self:

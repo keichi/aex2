@@ -187,6 +187,9 @@ enum Entry {
     },
     /// Inserts a length-1 axis and consumes nothing.
     New,
+    /// Where the ellipsis was. It contributes nothing, but numpy counts it as
+    /// separating index arrays even when it stands for no axes.
+    Ellipsis,
 }
 
 /// Normalise `indices` against `shape`.
@@ -282,6 +285,7 @@ fn expand(shape: &[u64], indices: &[Index]) -> Result<Vec<Entry>> {
         match index {
             Index::NewAxis => entries.push(Entry::New),
             Index::Ellipsis => {
+                entries.push(Entry::Ellipsis);
                 for _ in 0..implied {
                     entries.push(whole(axis));
                     axis += 1;
@@ -322,6 +326,7 @@ fn out_shape(entries: &[Entry], advanced: Option<&Advanced>, first: Option<usize
     for (position, entry) in entries.iter().enumerate() {
         match entry {
             Entry::New => shape.push(1),
+            Entry::Ellipsis => {}
             Entry::Axis { advanced: true, .. } => {
                 if let Some(advanced) = advanced {
                     if advanced.adjacent && Some(position) == first {
@@ -1651,8 +1656,26 @@ mod tests {
                 vec![Index::full(), Index::Single(0), Index::Fancy(vec![1, 2])],
                 vec![4, 2],
             ),
-            // An ellipsis that stands for an axis separates; one that stands
-            // for nothing does not.
+            // An ellipsis separates, even one that stands for no axes.
+            (
+                &[3, 4, 5],
+                vec![
+                    Index::full(),
+                    Index::Fancy(vec![0, 1]),
+                    Index::Ellipsis,
+                    Index::Fancy(vec![0, 1]),
+                ],
+                vec![2, 3],
+            ),
+            (
+                &[4, 5],
+                vec![
+                    Index::Fancy(vec![0, 1]),
+                    Index::Ellipsis,
+                    Index::Fancy(vec![2, 3]),
+                ],
+                vec![2],
+            ),
             (
                 &[4, 5, 6],
                 vec![
@@ -1848,6 +1871,18 @@ mod tests {
                 ],
                 vec![2, 2],
                 vec![25, 30, 28, 33],
+            ),
+            // An ellipsis standing for no axes still moves the group to the front.
+            (
+                &[2, 3, 4],
+                vec![
+                    Index::full(),
+                    Index::Fancy(vec![0, 2]),
+                    Index::Ellipsis,
+                    Index::Fancy(vec![1, 3]),
+                ],
+                vec![2, 2],
+                vec![1, 13, 11, 23],
             ),
             (
                 &[3, 4, 5],

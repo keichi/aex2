@@ -237,9 +237,22 @@ fn listen(config: &ServerConfig) -> Result<TcpListener> {
 
 #[cfg(target_os = "linux")]
 fn set_congestion(socket: &Socket, name: &str) -> Result<()> {
-    socket
-        .set_tcp_congestion(name.as_bytes())
-        .map_err(|e| ServerError::Config(format!("tcp.congestion {name:?} cannot be applied: {e}")))
+    socket.set_tcp_congestion(name.as_bytes()).map_err(|e| {
+        // The OS error alone does not say that the fix is an administrator's.
+        let hint = match e.kind() {
+            io::ErrorKind::NotFound => {
+                format!("; the kernel has not loaded it, which takes root: modprobe tcp_{name}")
+            }
+            io::ErrorKind::PermissionDenied => {
+                "; it is not in net.ipv4.tcp_allowed_congestion_control, which only root can change"
+                    .to_string()
+            }
+            _ => String::new(),
+        };
+        ServerError::Config(format!(
+            "tcp.congestion {name:?} cannot be applied: {e}{hint}"
+        ))
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -616,6 +629,7 @@ mod tests {
     fn an_unknown_congestion_algorithm_fails_at_startup() {
         let err = listen(&config(|c| c.tcp.congestion = "no-such-cc".into())).unwrap_err();
         assert!(matches!(err, ServerError::Config(_)), "{err}");
+        assert!(err.to_string().contains("modprobe tcp_no-such-cc"), "{err}");
     }
 
     #[test]

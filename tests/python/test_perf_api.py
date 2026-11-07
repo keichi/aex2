@@ -227,4 +227,5 @@ def test_stats_count_what_was_transferred(client, ds_paths):
         "chunks",
         "retries",
         "rtt_ms",
+        "cache",
     }

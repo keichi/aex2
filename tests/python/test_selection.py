@@ -50,6 +50,8 @@ KEYS = [
     (slice(None, None, 2), 3, [1, 2]),
     (None, Ellipsis, None),
     (Ellipsis, None, 2),
+    # An ellipsis standing for no axes still separates the index arrays.
+    (slice(None), [0, 2], Ellipsis, [1, 3]),
     np.arange(12) % 3 == 0,
     (slice(None), np.arange(7) > 4),
     np.arange(84).reshape(12, 7) % 5 == 0,
@@ -83,10 +85,26 @@ def test_selection_matches_numpy(key, source, proxy):
 @pytest.mark.parametrize("key", KEYS, ids=repr)
 def test_resolve_matches_numpy(key):
     """Takes no client: a view resolves its shape without a server."""
-    expected = np.empty(SHAPE, np.int32)[key]
-    descr, shape = _aex.resolve(SHAPE, "<i4", _to_wire(key, SHAPE))
+    source = np.arange(np.prod(SHAPE), dtype=np.int32).reshape(SHAPE)
+    expected = source[key]
+    descr, shape, axes = _aex.resolve(SHAPE, "<i4", _to_wire(key, SHAPE))
     assert tuple(shape) == expected.shape
     assert descr == expected.dtype.str
+    assert len(axes) == len(SHAPE)
+    # Without index arrays the selection is the product of its axes.
+    if all(kind != "fancy" for kind, *_ in axes):
+        coords = [_coords(axis) for axis in axes]
+        np.testing.assert_array_equal(source[np.ix_(*coords)].reshape(expected.shape), expected)
+
+
+def _coords(axis):
+    kind, *args = axis
+    if kind == "point":
+        return [args[0]]
+    if kind == "range":
+        start, length, step = args
+        return start + step * np.arange(length)
+    return args[0]
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ import numpy as np
 import numpy.typing as npt
 
 from . import _aex
+from .cache import Lookup
 from .errors import AexFallbackError, AexFallbackWarning, AexQualityWarning
 
 if TYPE_CHECKING:
@@ -126,6 +127,7 @@ class ArrayProxy:
         shape: tuple[int, ...],
         key: Key | None = None,
         attrs: dict[str, Any] | None = None,
+        source_shape: tuple[int, ...] | None = None,
     ) -> None:
         self._client = client
         self._native = client._native
@@ -135,6 +137,8 @@ class ArrayProxy:
         self.shape = shape
         # The selection of the array this is a view of, in wire form.
         self._key = key
+        # The shape of the dataset itself, which a view's key applies to.
+        self._source_shape = shape if source_shape is None else source_shape
         # Fetched on first use when whoever built this proxy had none.
         self._attrs = attrs
 
@@ -196,21 +200,37 @@ class ArrayProxy:
             return np.asarray(self._fetch_all()[key])
         return self._read(key, None)[0]
 
-    def _read(self, key: Any, quality: dict[str, Any] | None) -> tuple[npt.NDArray[Any], _aex.Plan]:
+    def _read(
+        self, key: Any, quality: dict[str, Any] | None
+    ) -> tuple[npt.NDArray[Any], dict[str, Any]]:
         return self._fetch(_to_wire(key, self.shape), quality)
 
     def _fetch_all(self) -> npt.NDArray[Any]:
         return self._fetch(self._wire_key((Ellipsis,)), None)[0]
 
+    def _lookup(self, wire_key: Key, quality: dict[str, Any] | None) -> Lookup:
+        return self._client._cache.lookup(
+            self.handle, self.name, self._source_shape, self.dtype.str, wire_key, quality
+        )
+
     def _fetch(
         self, wire_key: Key, quality: dict[str, Any] | None
-    ) -> tuple[npt.NDArray[Any], _aex.Plan]:
+    ) -> tuple[npt.NDArray[Any], dict[str, Any]]:
+        """Transfer a selection, or cut it out of one already transferred.
+
+        Returns the result and the quality the server applied to it.
+        """
+        found = self._lookup(wire_key, quality)
+        if found.hit is not None and found.applied is not None:
+            return found.hit, found.applied
         plan = self._native.prepare(self.handle, self.name, wire_key, quality)
         # Shape and dtype are the server's answer, not worked out here.
         out = np.empty(plan.shape, dtype=plan.dtype)
         self._native.fill(plan, self.handle, self.name, wire_key, out)
         out.flags.writeable = False
-        return out, plan
+        applied = plan.applied_quality
+        self._client._cache.store(self.handle, self.name, quality, found.axes, out, applied)
+        return out, applied
 
     def at(
         self,
@@ -269,6 +289,18 @@ class ArrayProxy:
         """
         self._require_base("read_into")
         wire_key = _to_wire(key, self.shape)
+        hit = self._lookup(wire_key, None).hit
+        # Anything the transfer would refuse goes to it, for the same error.
+        if (
+            hit is not None
+            and out.flags.c_contiguous
+            and out.flags.writeable
+            and out.dtype == hit.dtype
+            and out.size == hit.size
+        ):
+            out.reshape(hit.shape)[...] = hit
+            return
+        # Not stored: the buffer is the caller's to change.
         plan = self._native.prepare(self.handle, self.name, wire_key)
         self._native.fill(plan, self.handle, self.name, wire_key, out)
 
@@ -287,19 +319,29 @@ class ArrayProxy:
         read-only.
         """
         self._require_base("gather")
+        cache = self._client._cache
         results: list[npt.NDArray[Any]] = []
         for start in range(0, len(keys), _GATHER_BATCH):
             wire_keys = [_to_wire(key, self.shape) for key in keys[start : start + _GATHER_BATCH]]
-            plans = self._native.prepare_many(self.handle, self.name, wire_keys)
-            for plan in plans:
-                if isinstance(plan, BaseException):
-                    raise plan
-            ready = cast(list[_aex.Plan], plans)
-            outs = [np.empty(plan.shape, dtype=plan.dtype) for plan in ready]
-            self._native.fill_many(ready, self.handle, self.name, wire_keys, outs)
-            for out in outs:
-                out.flags.writeable = False
-            results.extend(outs)
+            found = [self._lookup(wire_key, None) for wire_key in wire_keys]
+            batch = [f.hit for f in found]
+            missing = [i for i, hit in enumerate(batch) if hit is None]
+            if missing:
+                missed_keys = [wire_keys[i] for i in missing]
+                plans = self._native.prepare_many(self.handle, self.name, missed_keys)
+                for plan in plans:
+                    if isinstance(plan, BaseException):
+                        raise plan
+                ready = cast(list[_aex.Plan], plans)
+                outs = [np.empty(plan.shape, dtype=plan.dtype) for plan in ready]
+                self._native.fill_many(ready, self.handle, self.name, missed_keys, outs)
+                for i, plan, out in zip(missing, ready, outs, strict=True):
+                    out.flags.writeable = False
+                    cache.store(
+                        self.handle, self.name, None, found[i].axes, out, plan.applied_quality
+                    )
+                    batch[i] = out
+            results.extend(cast(list[npt.NDArray[Any]], batch))
         return results
 
     def __array__(
@@ -400,7 +442,7 @@ class _Viewer:
         # Resolved with the function the server would have used. Asking the
         # server would cost a round trip, and leave it holding a plan for a
         # transfer that never comes.
-        dtype, shape = _aex.resolve(array.shape, array.dtype.str, wire_key)
+        dtype, shape, _ = _aex.resolve(array.shape, array.dtype.str, wire_key)
         # A view is the same dataset, so its attributes are the same ones.
         return ArrayProxy(
             array._client,
@@ -410,6 +452,7 @@ class _Viewer:
             tuple(shape),
             wire_key,
             array._attrs,
+            array.shape,
         )
 
 
@@ -440,8 +483,7 @@ class QualityView:
 
     def __getitem__(self, key: Any) -> npt.NDArray[Any]:
         """Transfer a selection at this view's quality. The result is read-only."""
-        out, plan = self.array._read(key, self.quality)
-        applied = plan.applied_quality
+        out, applied = self.array._read(key, self.quality)
         if self.applied_quality is None and self._was_refused(applied):
             warnings.warn(
                 f"the server cannot apply {self.quality}; the data is exact",

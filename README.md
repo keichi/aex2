@@ -176,6 +176,19 @@ they are not, turn the knobs in this order.
    connections leave `SO_RCVBUF` to the kernel's auto-tuning, which an explicit
    size would switch off: at a 50 ms round trip, asking for 4 MiB drops
    1,028 MiB/s to 327 MiB/s. Raise the ceiling in `net.ipv4.tcp_rmem` instead
+5. **For small reads far away, fix the server's kernel, not AEX2.** Between
+   transfers the data connections sit idle, and Linux shrinks an idle
+   connection's congestion window, so at a 100 ms round trip a 1 to 8 MiB read
+   takes about 8 round trips instead of 2. Two settings on the server, both
+   root's, bring it down to 2
+   ([measurements](docs/benchmark-cache.md#転送が遅かった理由)):
+   - `net.ipv4.tcp_slow_start_after_idle = 0`, or `[server.tcp] congestion =
+     "bbr"` in the server's configuration, which BBR's idle handling makes
+     equivalent. BBR needs root only to load it (`modprobe tcp_bbr`); after
+     that any user's server can select it
+   - a larger ceiling in `net.ipv4.tcp_wmem`. The default 4 MiB caps what one
+     connection has in flight, and a read up to one chunk (4 MiB) uses one
+     connection
 
 ## Acknowledgments
 
